@@ -12,17 +12,13 @@
    cd ghost-bridge
    npm install
    ```
-2. 可选：设置连接 token（提升安全）
-   ```bash
-   export GHOST_BRIDGE_TOKEN=please-change
-   # 在 extension/background.js 的 CONFIG.token 写同一个值
-   ```
-3. 在 Chrome 打开 `chrome://extensions`，开启“开发者模式”，选择“加载已解压的扩展程序”，指向 `ghost-bridge/extension`
-4. 将工具注册到 Claude CLI（示例）
+
+2. 在 Chrome 打开 `chrome://extensions`，开启“开发者模式”，选择“加载已解压的扩展程序”，指向 `ghost-bridge/extension`
+3. 将工具注册到 Claude CLI（示例）
    ```bash
    claude mcp add ghost-bridge -- node /绝对路径/ghost-bridge/server.js
    ```
-5. 保持 Chrome 打开，终端运行 `claude`，直接调用工具，例如：
+4. 保持 Chrome 打开，终端运行 `claude`，直接调用工具，例如：
    - `get_last_error`：拿最近异常 / console / 网络失败
    - `get_script_source`：按 URL 片段抓压缩脚本并返回定位片段（可 beautify）
    - `find_by_string`：在脚本内搜索字符串，返回上下文
