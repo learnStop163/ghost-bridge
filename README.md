@@ -7,22 +7,35 @@
 - `extension/`：Chrome MV3 扩展，使用 `chrome.debugger` 附加当前激活标签
 
 ## 快速使用（本地）
-1. 安装依赖
+1. （可选）一键安装
+   ```bash
+   chmod +x install.sh
+   ./install.sh
+   ```
+   > 已包含依赖安装 + Claude MCP 注册
+
+2. 手动安装（如不使用脚本）
+   - 安装依赖
    ```bash
    cd ghost-bridge
    npm install
    ```
 
-2. 在 Chrome 打开 `chrome://extensions`，开启“开发者模式”，选择“加载已解压的扩展程序”，指向 `ghost-bridge/extension`
-3. 将工具注册到 Claude CLI（示例）
+3. 在 Chrome 打开 `chrome://extensions`，开启“开发者模式”，选择“加载已解压的扩展程序”，指向 `ghost-bridge/extension`
+4. 将工具注册到 Claude CLI（示例，脚本已做）
    ```bash
    claude mcp add ghost-bridge -- node /绝对路径/ghost-bridge/server.js
    ```
-4. 保持 Chrome 打开，终端运行 `claude`，直接调用工具，例如：
+5. 点击扩展图标切换为 ON（默认 OFF）
+6. 保持 Chrome 打开，终端运行 `claude`，直接调用工具，例如：
    - `get_last_error`：拿最近异常 / console / 网络失败
    - `get_script_source`：按 URL 片段抓压缩脚本并返回定位片段（可 beautify）
    - `find_by_string`：在脚本内搜索字符串，返回上下文
    - `coverage_snapshot`：抓一次执行覆盖率，排前 20 热脚本
+
+## 默认配置
+- 端口：`3301`（`server.js` / `extension/background.js`）
+- token：`1`（仅用于本机 WS 校验，如需修改请保持两端一致）
 
 ## 工具说明
 - **get_last_error**：汇总最近异常/console/网络报错，附带行列与脚本标识
@@ -31,10 +44,12 @@
 - **find_by_string**：在脚本源码里按关键词搜索，返回上下文 200 字符窗口
 - **symbolic_hints**：采集资源列表、全局变量 key、localStorage key、UA 与 URL
 - **eval_script**：只读表达式执行；谨慎使用，避免改写页面状态
+- **get_editable_text**：读取当前页面选区/可编辑区域文本（只读）
+- **apply_text_patch**：将文本写回选区或可编辑区域（需先确认）
 
 ## 设计取舍
 - 不依赖 `--remote-debugging-port`，完全通过扩展获取 CDP，满足“零重启”
-- 默认 `autoDetach=true`，每次命令后释放调试器，降低性能影响；如需连续操作可改为 false
+- 默认 `autoDetach=false` 保持附加，便于持续捕获异常；可通过图标 OFF 立即解除调试
 - 无 sourcemap 时通过片段截取、字符串搜索与覆盖率提供线索；若可访问 sourcemap，可在 server 端追加符号化逻辑
 
 ## 已知限制
