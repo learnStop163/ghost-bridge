@@ -4,7 +4,8 @@ const CONFIG = {
   autoDetach: false, // 默认保持附加，便于持续捕获异常；可通过图标一键暂停
   maxErrors: 40, // 保持有限的事件窗口，避免上下文爆炸
   maxStackFrames: 5,
-  maxRequestsTracked: 400,
+  maxRequestsTracked: 200, // 完整网络请求记录数
+  maxRequestBodySize: 100000, // 最大响应体大小 100KB
 }
 
 let ws = null
@@ -14,7 +15,8 @@ let scriptMap = new Map()
 let scriptSourceCache = new Map()
 let lastErrors = []
 let lastErrorLocation = null
-let requestMap = new Map()
+let requestMap = new Map() // requestId -> 进行中的请求元数据
+let networkRequests = [] // 完整的网络请求记录
 let state = { enabled: false }
 
 function setBadgeState(status) {
@@ -116,58 +118,114 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   }
 
   if (method === "Network.requestWillBeSent") {
-    // 记录 requestId -> url/method 以便失败时回溯
-    requestMap.set(params.requestId, { url: params.request?.url, method: params.request?.method })
+    const req = params.request || {}
+    const entry = {
+      requestId: params.requestId,
+      url: req.url,
+      method: req.method || "GET",
+      requestHeaders: req.headers || {},
+      postData: req.postData,
+      initiator: params.initiator?.type,
+      resourceType: params.type,
+      startTime: params.timestamp,
+      timestamp: Date.now(),
+      status: "pending",
+    }
+    requestMap.set(params.requestId, entry)
+
     // 控制映射大小
-    if (requestMap.size > CONFIG.maxRequestsTracked) {
+    if (requestMap.size > CONFIG.maxRequestsTracked * 2) {
       const firstKey = requestMap.keys().next().value
       requestMap.delete(firstKey)
     }
   }
 
-  if (method === "Network.loadingFinished") {
-    requestMap.delete(params.requestId)
-  }
-
   if (method === "Network.responseReceived") {
     const res = params.response || {}
-    if (res.status >= 400) {
-      const meta = requestMap.get(params.requestId) || {}
-      pushError({
-        type: "network",
-        severity: "error",
-        url: res.url || meta.url,
-        status: res.status,
-        statusText: res.statusText,
-        mimeType: res.mimeType,
-        requestId: params.requestId,
-        method: meta.method,
-        timestamp: Date.now(),
-      })
+    const entry = requestMap.get(params.requestId)
+    if (entry) {
+      entry.status = res.status >= 400 ? "error" : "success"
+      entry.statusCode = res.status
+      entry.statusText = res.statusText
+      entry.mimeType = res.mimeType
+      entry.responseHeaders = res.headers || {}
+      entry.protocol = res.protocol
+      entry.remoteAddress = res.remoteIPAddress
+      entry.fromCache = res.fromDiskCache || res.fromServiceWorker
+      entry.timing = res.timing
+      entry.encodedDataLength = params.encodedDataLength
+
+      // 记录到错误列表（仅失败请求）
+      if (res.status >= 400) {
+        pushError({
+          type: "network",
+          severity: "error",
+          url: res.url || entry.url,
+          status: res.status,
+          statusText: res.statusText,
+          mimeType: res.mimeType,
+          requestId: params.requestId,
+          method: entry.method,
+          timestamp: Date.now(),
+        })
+      }
+    }
+  }
+
+  if (method === "Network.loadingFinished") {
+    const entry = requestMap.get(params.requestId)
+    if (entry) {
+      entry.endTime = params.timestamp
+      entry.encodedDataLength = params.encodedDataLength
+      entry.duration = entry.endTime && entry.startTime
+        ? Math.round((entry.endTime - entry.startTime) * 1000)
+        : null
+      if (entry.status === "pending") entry.status = "success"
+
+      // 移到完成列表
+      pushNetworkRequest(entry)
+      requestMap.delete(params.requestId)
     }
   }
 
   if (method === "Network.loadingFailed") {
-    const meta = requestMap.get(params.requestId) || {}
-    pushError({
-      type: "network",
-      severity: "error",
-      url: params.requestId,
-      requestId: params.requestId,
-      method: meta.method,
-      failedUrl: meta.url,
-      text: params.errorText,
-      timestamp: Date.now(),
-    })
-    requestMap.delete(params.requestId)
+    const entry = requestMap.get(params.requestId)
+    if (entry) {
+      entry.status = "failed"
+      entry.errorText = params.errorText
+      entry.canceled = params.canceled
+      entry.blockedReason = params.blockedReason
+
+      pushError({
+        type: "network",
+        severity: "error",
+        url: entry.url,
+        requestId: params.requestId,
+        method: entry.method,
+        text: params.errorText,
+        timestamp: Date.now(),
+      })
+
+      pushNetworkRequest(entry)
+      requestMap.delete(params.requestId)
+    }
   }
 })
+
+function pushNetworkRequest(entry) {
+  networkRequests.unshift(entry)
+  if (networkRequests.length > CONFIG.maxRequestsTracked) {
+    networkRequests.pop()
+  }
+}
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source.tabId && source.tabId === attachedTabId) {
     attachedTabId = null
     scriptMap = new Map()
     scriptSourceCache = new Map()
+    networkRequests = []
+    requestMap = new Map()
   }
   if (!state.enabled) return
   if (reason === "canceled_by_user") {
@@ -218,6 +276,8 @@ async function ensureAttached() {
     attachedTabId = tab.id
     scriptMap = new Map()
     scriptSourceCache = new Map()
+    networkRequests = []
+    requestMap = new Map()
     await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Runtime.enable")
     await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Log.enable")
     await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Console.enable").catch(() => {})
@@ -439,6 +499,131 @@ async function handleEval(params = {}) {
   return result?.value
 }
 
+// ========== 网络请求分析 ==========
+
+async function handleListNetworkRequests(params = {}) {
+  await ensureAttached()
+
+  const {
+    filter,        // url 关键词过滤
+    method,        // GET/POST/PUT 等
+    status,        // success/error/failed/pending
+    resourceType,  // XHR/Fetch/Script/Stylesheet/Image 等
+    limit = 50,
+  } = params
+
+  let results = [...networkRequests]
+
+  // 包含进行中的请求
+  const pending = [...requestMap.values()].map(r => ({ ...r, status: "pending" }))
+  results = [...pending, ...results]
+
+  // 应用过滤
+  if (filter) {
+    const lowerFilter = filter.toLowerCase()
+    results = results.filter(r => r.url?.toLowerCase().includes(lowerFilter))
+  }
+  if (method) {
+    results = results.filter(r => r.method?.toUpperCase() === method.toUpperCase())
+  }
+  if (status) {
+    results = results.filter(r => r.status === status)
+  }
+  if (resourceType) {
+    const lowerType = resourceType.toLowerCase()
+    results = results.filter(r => r.resourceType?.toLowerCase() === lowerType)
+  }
+
+  // 限制数量
+  results = results.slice(0, limit)
+
+  // 简化输出，不包含 headers 详情
+  return {
+    total: networkRequests.length + requestMap.size,
+    filtered: results.length,
+    requests: results.map(r => ({
+      requestId: r.requestId,
+      url: r.url,
+      method: r.method,
+      status: r.status,
+      statusCode: r.statusCode,
+      resourceType: r.resourceType,
+      mimeType: r.mimeType,
+      duration: r.duration,
+      encodedDataLength: r.encodedDataLength,
+      fromCache: r.fromCache,
+      timestamp: r.timestamp,
+      errorText: r.errorText,
+    })),
+  }
+}
+
+async function handleGetNetworkDetail(params = {}) {
+  const target = await ensureAttached()
+  const { requestId, includeBody = false } = params
+
+  if (!requestId) {
+    throw new Error("需要提供 requestId")
+  }
+
+  // 先从进行中的请求找
+  let entry = requestMap.get(requestId)
+  // 再从已完成的找
+  if (!entry) {
+    entry = networkRequests.find(r => r.requestId === requestId)
+  }
+
+  if (!entry) {
+    throw new Error(`未找到请求: ${requestId}`)
+  }
+
+  const result = { ...entry }
+
+  // 获取响应 body
+  if (includeBody && entry.status !== "pending" && entry.status !== "failed") {
+    try {
+      const { body, base64Encoded } = await chrome.debugger.sendCommand(
+        target,
+        "Network.getResponseBody",
+        { requestId }
+      )
+
+      if (base64Encoded) {
+        // 二进制内容，只返回大小信息
+        result.bodyInfo = {
+          type: "binary",
+          base64Length: body.length,
+          note: "二进制内容，已 base64 编码",
+        }
+        // 如果小于限制，也返回 base64
+        if (body.length < CONFIG.maxRequestBodySize) {
+          result.bodyBase64 = body
+        }
+      } else {
+        // 文本内容
+        if (body.length > CONFIG.maxRequestBodySize) {
+          result.body = body.slice(0, CONFIG.maxRequestBodySize)
+          result.bodyTruncated = true
+          result.bodyTotalLength = body.length
+        } else {
+          result.body = body
+        }
+      }
+    } catch (e) {
+      result.bodyError = e.message
+    }
+  }
+
+  return result
+}
+
+async function handleClearNetworkRequests() {
+  await ensureAttached()
+  const count = networkRequests.length
+  networkRequests = []
+  return { cleared: count }
+}
+
 async function handleCommand(message) {
   const { id, command, params, token } = message
   if (!id || !command) return
@@ -458,6 +643,9 @@ async function handleCommand(message) {
     else if (command === "findByString") result = await handleFindByString(params)
     else if (command === "symbolicHints") result = await handleSymbolicHints()
     else if (command === "eval") result = await handleEval(params)
+    else if (command === "listNetworkRequests") result = await handleListNetworkRequests(params)
+    else if (command === "getNetworkDetail") result = await handleGetNetworkDetail(params)
+    else if (command === "clearNetworkRequests") result = await handleClearNetworkRequests()
     else throw new Error(`未知指令 ${command}`)
 
     ws?.send(JSON.stringify({ id, result }))

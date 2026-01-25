@@ -196,6 +196,39 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["code"],
       },
     },
+    {
+      name: "list_network_requests",
+      description:
+        "列出捕获的网络请求，支持按 URL、方法、状态、类型过滤",
+      inputSchema: {
+        type: "object",
+        properties: {
+          filter: { type: "string", description: "URL 关键词过滤" },
+          method: { type: "string", description: "请求方法：GET/POST/PUT/DELETE 等" },
+          status: { type: "string", description: "状态：success/error/failed/pending" },
+          resourceType: { type: "string", description: "资源类型：XHR/Fetch/Script/Image 等" },
+          limit: { type: "number", description: "返回数量限制，默认 50" },
+        },
+      },
+    },
+    {
+      name: "get_network_detail",
+      description:
+        "获取单个网络请求的详细信息，包括请求头、响应头，可选获取响应体",
+      inputSchema: {
+        type: "object",
+        properties: {
+          requestId: { type: "string", description: "请求 ID（从 list_network_requests 获取）" },
+          includeBody: { type: "boolean", description: "是否包含响应体，默认 false" },
+        },
+        required: ["requestId"],
+      },
+    },
+    {
+      name: "clear_network_requests",
+      description: "清空已捕获的网络请求记录",
+      inputSchema: { type: "object", properties: {} },
+    },
   ],
 }))
 
@@ -263,6 +296,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (name === "eval_script") {
       const res = await askChrome("eval", { code: args.code })
+      return { content: [{ type: "text", text: jsonText(res) }] }
+    }
+
+    if (name === "list_network_requests") {
+      const { filter, method, status, resourceType, limit } = args
+      const res = await askChrome("listNetworkRequests", { filter, method, status, resourceType, limit })
+      return { content: [{ type: "text", text: jsonText(res) }] }
+    }
+
+    if (name === "get_network_detail") {
+      const { requestId, includeBody } = args
+      const res = await askChrome("getNetworkDetail", { requestId, includeBody })
+      return { content: [{ type: "text", text: jsonText(res) }] }
+    }
+
+    if (name === "clear_network_requests") {
+      const res = await askChrome("clearNetworkRequests")
       return { content: [{ type: "text", text: jsonText(res) }] }
     }
 
