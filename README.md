@@ -26,6 +26,15 @@
    ```bash
    claude mcp add ghost-bridge -- node /绝对路径/ghost-bridge/server.js
    ```
+   或者在 Claude 的 MCP 配置中手动添加：
+   ```json
+   "ghost-bridge": {
+     "command": "node",
+     "args": [
+       "/绝对路径/ghost-bridge/server.js"
+     ]
+   }
+   ```
 5. 点击扩展图标切换为 ON（默认 OFF）
 6. 保持 Chrome 打开，终端运行 `claude`，直接调用工具，例如：
    - `get_last_error`：拿最近异常 / console / 网络失败
