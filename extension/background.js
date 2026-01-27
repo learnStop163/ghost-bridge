@@ -1,5 +1,5 @@
 const CONFIG = {
-  wsUrl: "ws://localhost:3301",
+  wsUrl: "ws://localhost:33333",
   token: "1", // 可选：与 server 的 GHOST_BRIDGE_TOKEN 保持一致
   autoDetach: false, // 默认保持附加，便于持续捕获异常；可通过图标一键暂停
   maxErrors: 40, // 保持有限的事件窗口，避免上下文爆炸

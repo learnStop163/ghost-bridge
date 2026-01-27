@@ -5,7 +5,7 @@ import { WebSocketServer } from "ws"
 import beautify from "js-beautify"
 import crypto from "crypto"
 
-const PORT = Number(process.env.GHOST_BRIDGE_PORT || 3301)
+const PORT = Number(process.env.GHOST_BRIDGE_PORT || 33333)
 const WS_TOKEN = "1"
 const RESPONSE_TIMEOUT = 8000
 
