@@ -4,20 +4,59 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { WebSocketServer } from "ws"
 import beautify from "js-beautify"
 import crypto from "crypto"
+import net from "net"
 
-const PORT = Number(process.env.GHOST_BRIDGE_PORT || 33333)
+const BASE_PORT = Number(process.env.GHOST_BRIDGE_PORT || 33333)
+const MAX_PORT_RETRIES = 10
 const WS_TOKEN = "1"
 const RESPONSE_TIMEOUT = 8000
 
 let activeConnection = null
+let actualPort = BASE_PORT
 const pendingRequests = new Map()
 
 function log(msg) {
   console.error(`[ghost-bridge] ${msg}`)
 }
 
-const wss = new WebSocketServer({ port: PORT })
-log(`等待 Chrome 扩展连接，端口 ${PORT}${WS_TOKEN ? "（启用 token 校验）" : ""}`)
+/**
+ * 检测端口是否可用
+ */
+function isPortAvailable(port) {
+  return new Promise((resolve) => {
+    const server = net.createServer()
+    server.once("error", () => resolve(false))
+    server.once("listening", () => {
+      server.close()
+      resolve(true)
+    })
+    server.listen(port)
+  })
+}
+
+/**
+ * 寻找可用端口并启动 WebSocket 服务器
+ */
+async function startWebSocketServer() {
+  for (let i = 0; i < MAX_PORT_RETRIES; i++) {
+    const port = BASE_PORT + i
+    const available = await isPortAvailable(port)
+    if (available) {
+      actualPort = port
+      const wss = new WebSocketServer({ port })
+      if (port !== BASE_PORT) {
+        log(`⚠️ 端口 ${BASE_PORT} 被占用，已切换到端口 ${port}`)
+      }
+      log(`等待 Chrome 扩展连接，端口 ${port}${WS_TOKEN ? "（启用 token 校验）" : ""}`)
+      return wss
+    } else {
+      log(`端口 ${port} 被占用，尝试下一个...`)
+    }
+  }
+  throw new Error(`无法找到可用端口（已尝试 ${BASE_PORT} - ${BASE_PORT + MAX_PORT_RETRIES - 1}）`)
+}
+
+const wss = await startWebSocketServer()
 
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url || "/", "http://localhost")

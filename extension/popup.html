@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      width: 280px;
+      padding: 16px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #1a1a2e;
+      color: #eee;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.1);
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+    .header img {
+      width: 32px;
+      height: 32px;
+    }
+    .header h1 {
+      font-size: 16px;
+      font-weight: 600;
+    }
+    .status-card {
+      background: #16213e;
+      border-radius: 8px;
+      padding: 14px;
+      margin-bottom: 12px;
+    }
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .status-dot.connected { background: #34c759; box-shadow: 0 0 8px #34c759; }
+    .status-dot.connecting { background: #ff9f0a; animation: pulse 1s infinite; }
+    .status-dot.disconnected { background: #666; }
+    .status-dot.error { background: #ff3b30; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    .status-text {
+      font-size: 14px;
+      font-weight: 500;
+    }
+    .status-detail {
+      font-size: 12px;
+      color: #888;
+      margin-top: 8px;
+      padding-left: 20px;
+    }
+    .config-section {
+      background: #16213e;
+      border-radius: 8px;
+      padding: 14px;
+      margin-bottom: 12px;
+    }
+    .config-label {
+      font-size: 12px;
+      color: #888;
+      margin-bottom: 6px;
+    }
+    .config-input {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #333;
+      border-radius: 6px;
+      background: #0f0f23;
+      color: #eee;
+      font-size: 13px;
+      outline: none;
+    }
+    .config-input:focus {
+      border-color: #4a9eff;
+    }
+    .port-display {
+      font-size: 24px;
+      font-weight: 600;
+      color: #4a9eff;
+      text-align: center;
+      padding: 8px;
+    }
+    .scan-port {
+      font-size: 12px;
+      color: #ff9f0a;
+      text-align: center;
+      min-height: 16px;
+    }
+    .btn-row {
+      display: flex;
+      gap: 8px;
+    }
+    .btn {
+      flex: 1;
+      padding: 10px;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-primary {
+      background: #4a9eff;
+      color: #fff;
+    }
+    .btn-primary:hover {
+      background: #3a8eef;
+    }
+    .btn-primary:disabled {
+      background: #333;
+      cursor: not-allowed;
+    }
+    .btn-secondary {
+      background: #333;
+      color: #ccc;
+    }
+    .btn-secondary:hover {
+      background: #444;
+    }
+    .scan-info {
+      font-size: 11px;
+      color: #666;
+      text-align: center;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <img src="icon-32.png" alt="Ghost Bridge">
+    <h1>Ghost Bridge</h1>
+  </div>
+
+  <div class="status-card">
+    <div class="status-row">
+      <div class="status-dot disconnected" id="statusDot"></div>
+      <span class="status-text" id="statusText">检查连接状态...</span>
+    </div>
+    <div class="status-detail" id="statusDetail"></div>
+  </div>
+
+  <div class="config-section">
+    <div class="config-label">服务端口</div>
+    <div class="port-display" id="portDisplay">--</div>
+    <div class="scan-port" id="scanPort"></div>
+  </div>
+
+  <div class="btn-row">
+    <button class="btn btn-primary" id="connectBtn">启用连接</button>
+    <button class="btn btn-secondary" id="disconnectBtn">断开</button>
+  </div>
+
+  <div class="scan-info" id="scanInfo"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

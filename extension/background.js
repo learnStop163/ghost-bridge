@@ -1,5 +1,6 @@
 const CONFIG = {
-  wsUrl: "ws://localhost:33333",
+  basePort: 33333,           // 基础端口
+  maxPortRetries: 10,        // 最大端口重试次数，与 server.js 保持一致
   token: "1", // 可选：与 server 的 GHOST_BRIDGE_TOKEN 保持一致
   autoDetach: false, // 默认保持附加，便于持续捕获异常；可通过图标一键暂停
   maxErrors: 40, // 保持有限的事件窗口，避免上下文爆炸
@@ -656,14 +657,55 @@ async function handleCommand(message) {
   }
 }
 
-function connect() {
+let currentPortIndex = 0  // 当前尝试的端口索引
+let lastSuccessPort = null // 上次成功连接的端口
+let wasConnected = false   // 标记是否曾经成功连接过
+let scanRound = 0          // 当前扫描轮次
+
+function connect(portIndex = 0, isNewRound = false) {
   if (!state.enabled) return
-  const url = new URL(CONFIG.wsUrl)
+  
+  // 如果超出范围，立即从头开始（不等待）
+  if (portIndex >= CONFIG.maxPortRetries) {
+    scanRound++
+    log(`📡 第 ${scanRound} 轮扫描完毕，立即开始第 ${scanRound + 1} 轮...`)
+    // 立即从头开始，只等待 500ms 避免太激进
+    if (reconnectTimer) clearTimeout(reconnectTimer)
+    reconnectTimer = setTimeout(() => connect(0, true), 500)
+    return
+  }
+  
+  // 新一轮扫描开始的提示
+  if (portIndex === 0 && isNewRound) {
+    log(`🔄 开始第 ${scanRound + 1} 轮端口扫描 (${CONFIG.basePort}-${CONFIG.basePort + CONFIG.maxPortRetries - 1})`)
+  }
+  
+  const port = CONFIG.basePort + portIndex
+  currentPortIndex = portIndex
+  
+  const url = new URL(`ws://localhost:${port}`)
   if (CONFIG.token) url.searchParams.set("token", CONFIG.token)
+  
+  // 只在第一轮或成功连接时打印详细日志，避免刷屏
+  if (scanRound === 0 || portIndex === 0) {
+    log(`尝试连接端口 ${port}...`)
+  }
   ws = new WebSocket(url.toString())
   setBadgeState("connecting")
+  
+  // 设置连接超时（1秒，加快扫描速度）
+  const connectionTimeout = setTimeout(() => {
+    if (ws && ws.readyState === WebSocket.CONNECTING) {
+      ws.close()
+    }
+  }, 1000)
+  
   ws.onopen = () => {
-    log("WebSocket 已连接")
+    clearTimeout(connectionTimeout)
+    wasConnected = true
+    lastSuccessPort = port
+    scanRound = 0  // 重置轮次
+    log(`✅ WebSocket 已连接到端口 ${port}`)
     setBadgeState("on")
     // 自动附加当前活动标签，确保能立即捕获异常/console
     ensureAttached().catch((e) => log(`attach 失败：${e.message}`))
@@ -676,23 +718,104 @@ function connect() {
       log(`解析消息失败：${e.message}`)
     }
   }
-  ws.onclose = () => {
-    log("WebSocket 断开，1s 后重连")
+  ws.onclose = (event) => {
+    clearTimeout(connectionTimeout)
+    
+    // 如果是连接阶段就失败了（还没成功连接过），立即尝试下一个端口
+    if (!wasConnected && event.code === 1006) {
+      if (state.enabled) {
+        // 立即尝试下一个端口，不等待
+        setTimeout(() => connect(portIndex + 1), 50)
+      }
+      return
+    }
+    
+    // 曾经连接成功后断开
+    wasConnected = false
+    scanRound = 0
+    log("⚠️ WebSocket 断开，立即重试...")
     setBadgeState("off")
     if (reconnectTimer) clearTimeout(reconnectTimer)
-    if (state.enabled) reconnectTimer = setTimeout(connect, 1000)
+    
+    if (state.enabled) {
+      // 如果有上次成功的端口，优先尝试那个端口
+      const startIndex = lastSuccessPort 
+        ? lastSuccessPort - CONFIG.basePort 
+        : 0
+      // 断开后立即重试，不等待
+      reconnectTimer = setTimeout(() => connect(startIndex), 100)
+    }
   }
   ws.onerror = (err) => {
-    log(`WebSocket 错误 ${err.message || err}`)
-    setBadgeState("err")
+    clearTimeout(connectionTimeout)
+    // 错误不打印，避免刷屏，让 onclose 处理
   }
 }
 
-chrome.action.onClicked.addListener(() => {
-  toggleEnabled().catch((e) => log(`切换失败：${e.message}`))
+// 移除 action.onClicked（有 popup 时不会触发）
+
+// 消息监听器：供 popup 获取状态和控制
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'getStatus') {
+    // 返回当前状态
+    const status = !state.enabled ? 'disconnected' :
+      (ws && ws.readyState === WebSocket.OPEN) ? 'connected' :
+      (ws && ws.readyState === WebSocket.CONNECTING) ? 'connecting' : 'disconnected'
+    
+    // 计算当前正在扫描的端口
+    const currentPort = CONFIG.basePort + currentPortIndex
+    
+    sendResponse({
+      status,
+      enabled: state.enabled,
+      port: lastSuccessPort,
+      currentPort,
+      basePort: CONFIG.basePort,
+      scanRound,
+    })
+    return true
+  }
+  
+  if (message.type === 'connect') {
+    // 更新端口配置（如果提供）
+    if (message.port && message.port !== CONFIG.basePort) {
+      CONFIG.basePort = message.port
+      chrome.storage.local.set({ basePort: message.port })
+    }
+    
+    // 启用连接
+    if (!state.enabled) {
+      state.enabled = true
+      scanRound = 0
+      connect(0, true)
+    }
+    sendResponse({ ok: true })
+    return true
+  }
+  
+  if (message.type === 'disconnect') {
+    state.enabled = false
+    scanRound = 0
+    if (reconnectTimer) clearTimeout(reconnectTimer)
+    if (ws && ws.readyState === WebSocket.OPEN) ws.close()
+    detachAllTargets().catch(() => {})
+    setBadgeState('off')
+    sendResponse({ ok: true })
+    return true
+  }
+  
+  return false
+})
+
+// 启动时从 storage 加载端口配置
+chrome.storage.local.get(['basePort'], (result) => {
+  if (result.basePort) {
+    CONFIG.basePort = result.basePort
+  }
 })
 
 // 默认暂停：设置徽章为 OFF
 setBadgeState("off")
 
-connect()
+// 不自动连接，等待用户在 popup 中点击"启用连接"
+// connect()
