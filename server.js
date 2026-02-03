@@ -8,7 +8,13 @@ import net from "net"
 
 const BASE_PORT = Number(process.env.GHOST_BRIDGE_PORT || 33333)
 const MAX_PORT_RETRIES = 10
-const WS_TOKEN = "1"
+// 使用当月1号0点的时间戳作为 token，确保同月内的服务器和插件自动匹配
+function getMonthlyToken() {
+  const now = new Date()
+  const firstDayOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0)
+  return String(firstDayOfMonth.getTime())
+}
+const WS_TOKEN = process.env.GHOST_BRIDGE_TOKEN || getMonthlyToken()
 const RESPONSE_TIMEOUT = 8000
 
 let activeConnection = null
@@ -68,6 +74,8 @@ wss.on("connection", (ws, req) => {
   }
   log("Chrome 扩展已连接")
   activeConnection = ws
+  // 发送身份确认消息，让插件验证是否连接到正确的服务
+  ws.send(JSON.stringify({ type: "identity", service: "ghost-bridge", token: WS_TOKEN }))
   ws.on("message", handleIncoming)
   ws.on("close", () => {
     log("Chrome 连接已关闭")

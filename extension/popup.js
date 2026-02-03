@@ -19,6 +19,18 @@ const STATUS_MAP = {
     dotClass: 'connecting',
     text: '🔍 正在扫描...',
   },
+  verifying: {
+    dotClass: 'connecting',
+    text: '🔐 验证身份...',
+  },
+  scanning: {
+    dotClass: 'connecting',
+    text: '📡 搜索服务...',
+  },
+  not_found: {
+    dotClass: 'disconnected',
+    text: '🔴 未找到服务',
+  },
   disconnected: {
     dotClass: 'disconnected',
     text: '未连接',
@@ -42,30 +54,36 @@ function updateUI(state) {
     portDisplay.textContent = port
     portDisplay.style.color = '#34c759'  // 绿色
     scanPort.textContent = ''
-  } else if (status === 'connecting' && currentPort) {
+    statusDetail.textContent = 'WebSocket 已建立'
+  } else if ((status === 'connecting' || status === 'verifying' || status === 'scanning') && currentPort) {
     portDisplay.textContent = currentPort
     portDisplay.style.color = '#ff9f0a'  // 橙色
-    scanPort.textContent = `扫描中 ${basePort}-${basePort + 9}（第 ${(scanRound || 0) + 1} 轮）`
+    const roundText = scanRound > 0 ? `（第 ${scanRound + 1} 轮）` : ''
+    scanPort.textContent = `扫描范围 ${basePort}-${basePort + 9}${roundText}`
+    statusDetail.textContent = enabled ? '请确保 Claude Code 已启动' : ''
+  } else if (status === 'not_found') {
+    portDisplay.textContent = '--'
+    portDisplay.style.color = '#ff3b30'  // 红色
+    scanPort.textContent = `已扫描 ${basePort}-${basePort + 9}`
+    statusDetail.textContent = '未检测到 ghost-bridge 服务，请先启动 Claude Code'
   } else {
     portDisplay.textContent = basePort || '--'
     portDisplay.style.color = '#666'
     scanPort.textContent = ''
-  }
-
-  // 状态详情
-  if (status === 'connected' && port) {
-    statusDetail.textContent = `WebSocket 已建立`
-  } else if (status === 'connecting') {
-    statusDetail.textContent = ''
-  } else {
-    statusDetail.textContent = ''
+    statusDetail.textContent = enabled ? '点击「启用连接」开始' : ''
   }
 
   // 按钮状态
   connectBtn.textContent = enabled ? '重新连接' : '启用连接'
   connectBtn.disabled = false
   
-  scanInfo.textContent = ''
+  // 扫描轮次提示
+  if ((status === 'connecting' || status === 'scanning') && scanRound > 2) {
+    scanInfo.textContent = `已扫描 ${scanRound} 轮，服务可能未启动`
+    scanInfo.style.color = '#ff9f0a'
+  } else {
+    scanInfo.textContent = ''
+  }
 }
 
 // 从 background 获取状态

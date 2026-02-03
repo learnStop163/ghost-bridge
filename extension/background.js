@@ -1,7 +1,14 @@
+// 使用当月1号0点的时间戳作为 token，确保同月内的服务器和插件自动匹配
+function getMonthlyToken() {
+  const now = new Date()
+  const firstDayOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0)
+  return String(firstDayOfMonth.getTime())
+}
+
 const CONFIG = {
   basePort: 33333,           // 基础端口
   maxPortRetries: 10,        // 最大端口重试次数，与 server.js 保持一致
-  token: "1", // 可选：与 server 的 GHOST_BRIDGE_TOKEN 保持一致
+  token: getMonthlyToken(), // 使用当月时间戳作为 token
   autoDetach: false, // 默认保持附加，便于持续捕获异常；可通过图标一键暂停
   maxErrors: 40, // 保持有限的事件窗口，避免上下文爆炸
   maxStackFrames: 5,
@@ -661,6 +668,7 @@ let currentPortIndex = 0  // 当前尝试的端口索引
 let lastSuccessPort = null // 上次成功连接的端口
 let wasConnected = false   // 标记是否曾经成功连接过
 let scanRound = 0          // 当前扫描轮次
+let connectionPhase = 'idle' // 连接阶段: idle, scanning, verifying, connected
 
 function connect(portIndex = 0, isNewRound = false) {
   if (!state.enabled) return
@@ -690,6 +698,7 @@ function connect(portIndex = 0, isNewRound = false) {
   if (scanRound === 0 || portIndex === 0) {
     log(`尝试连接端口 ${port}...`)
   }
+  connectionPhase = 'scanning'
   ws = new WebSocket(url.toString())
   setBadgeState("connecting")
   
@@ -700,26 +709,70 @@ function connect(portIndex = 0, isNewRound = false) {
     }
   }, 1000)
   
+  // 身份验证超时（连接后 2 秒内必须收到正确的 identity 消息）
+  let identityVerified = false
+  let identityTimeout = null
+  
   ws.onopen = () => {
     clearTimeout(connectionTimeout)
-    wasConnected = true
-    lastSuccessPort = port
-    scanRound = 0  // 重置轮次
-    log(`✅ WebSocket 已连接到端口 ${port}`)
-    setBadgeState("on")
-    // 自动附加当前活动标签，确保能立即捕获异常/console
-    ensureAttached().catch((e) => log(`attach 失败：${e.message}`))
+    // 不立即标记为成功，等待身份验证
+    connectionPhase = 'verifying'
+    log(`🔗 WebSocket 已连接端口 ${port}，等待身份验证...`)
+    
+    // 设置身份验证超时
+    identityTimeout = setTimeout(() => {
+      if (!identityVerified) {
+        log(`❌ 端口 ${port} 身份验证超时，可能不是 ghost-bridge 服务`)
+        connectionPhase = 'scanning'
+        ws.close()
+        // 超时后主动扫描下一个端口
+        if (state.enabled) {
+          setTimeout(() => connect(portIndex + 1), 50)
+        }
+      }
+    }, 2000)
   }
   ws.onmessage = (event) => {
     try {
       const msg = JSON.parse(event.data)
-      handleCommand(msg)
+      
+      // 处理身份验证消息
+      if (msg.type === "identity") {
+        clearTimeout(identityTimeout)
+        
+        if (msg.service === "ghost-bridge" && msg.token === CONFIG.token) {
+          identityVerified = true
+          wasConnected = true
+          lastSuccessPort = port
+          scanRound = 0
+          connectionPhase = 'connected'
+          log(`✅ 身份验证成功，已连接到 ghost-bridge 服务 (端口 ${port})`)
+          setBadgeState("on")
+          // 自动附加当前活动标签，确保能立即捕获异常/console
+          ensureAttached().catch((e) => log(`attach 失败：${e.message}`))
+        } else {
+          log(`❌ 端口 ${port} 身份验证失败 (service: ${msg.service}, token 匹配: ${msg.token === CONFIG.token})`)
+          connectionPhase = 'scanning'
+          ws.close()
+          // 立即尝试下一个端口
+          if (state.enabled) {
+            setTimeout(() => connect(portIndex + 1), 50)
+          }
+        }
+        return
+      }
+      
+      // 只有验证通过后才处理其他命令
+      if (identityVerified) {
+        handleCommand(msg)
+      }
     } catch (e) {
       log(`解析消息失败：${e.message}`)
     }
   }
   ws.onclose = (event) => {
     clearTimeout(connectionTimeout)
+    clearTimeout(identityTimeout)
     
     // 如果是连接阶段就失败了（还没成功连接过），立即尝试下一个端口
     if (!wasConnected && event.code === 1006) {
@@ -730,9 +783,15 @@ function connect(portIndex = 0, isNewRound = false) {
       return
     }
     
+    // 身份验证失败导致的关闭，不重置 wasConnected（让上面的逻辑处理下一个端口）
+    if (!identityVerified && wasConnected === false) {
+      return
+    }
+    
     // 曾经连接成功后断开
     wasConnected = false
     scanRound = 0
+    connectionPhase = 'scanning'
     log("⚠️ WebSocket 断开，立即重试...")
     setBadgeState("off")
     if (reconnectTimer) clearTimeout(reconnectTimer)
@@ -744,10 +803,13 @@ function connect(portIndex = 0, isNewRound = false) {
         : 0
       // 断开后立即重试，不等待
       reconnectTimer = setTimeout(() => connect(startIndex), 100)
+    } else {
+      connectionPhase = 'idle'
     }
   }
   ws.onerror = (err) => {
     clearTimeout(connectionTimeout)
+    clearTimeout(identityTimeout)
     // 错误不打印，避免刷屏，让 onclose 处理
   }
 }
@@ -757,10 +819,20 @@ function connect(portIndex = 0, isNewRound = false) {
 // 消息监听器：供 popup 获取状态和控制
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'getStatus') {
-    // 返回当前状态
-    const status = !state.enabled ? 'disconnected' :
-      (ws && ws.readyState === WebSocket.OPEN) ? 'connected' :
-      (ws && ws.readyState === WebSocket.CONNECTING) ? 'connecting' : 'disconnected'
+    // 返回当前状态，使用 connectionPhase 提供更准确的状态
+    let status
+    if (!state.enabled) {
+      status = 'disconnected'
+    } else if (connectionPhase === 'connected' && ws && ws.readyState === WebSocket.OPEN) {
+      status = 'connected'
+    } else if (connectionPhase === 'verifying') {
+      status = 'verifying'
+    } else if (connectionPhase === 'scanning' || connectionPhase === 'idle') {
+      // 如果扫描多轮仍未找到，显示 not_found
+      status = scanRound >= 2 ? 'not_found' : 'scanning'
+    } else {
+      status = 'disconnected'
+    }
     
     // 计算当前正在扫描的端口
     const currentPort = CONFIG.basePort + currentPortIndex
@@ -783,12 +855,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       chrome.storage.local.set({ basePort: message.port })
     }
     
-    // 启用连接
-    if (!state.enabled) {
-      state.enabled = true
-      scanRound = 0
-      connect(0, true)
+    // 强制重新连接（无论当前状态如何）
+    // 先关闭现有连接
+    if (reconnectTimer) clearTimeout(reconnectTimer)
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      ws.close()
     }
+    
+    // 重新开始扫描
+    state.enabled = true
+    scanRound = 0
+    connectionPhase = 'scanning'
+    connect(0, true)
+    
     sendResponse({ ok: true })
     return true
   }
@@ -796,6 +875,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'disconnect') {
     state.enabled = false
     scanRound = 0
+    connectionPhase = 'idle'
     if (reconnectTimer) clearTimeout(reconnectTimer)
     if (ws && ws.readyState === WebSocket.OPEN) ws.close()
     detachAllTargets().catch(() => {})
