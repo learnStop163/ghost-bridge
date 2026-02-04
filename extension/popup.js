@@ -3,8 +3,6 @@
 const statusDot = document.getElementById('statusDot')
 const statusText = document.getElementById('statusText')
 const statusDetail = document.getElementById('statusDetail')
-const portDisplay = document.getElementById('portDisplay')
-const scanPort = document.getElementById('scanPort')
 const connectBtn = document.getElementById('connectBtn')
 const disconnectBtn = document.getElementById('disconnectBtn')
 const scanInfo = document.getElementById('scanInfo')
@@ -49,37 +47,25 @@ function updateUI(state) {
   statusDot.className = `status-dot ${config.dotClass}`
   statusText.textContent = config.text
 
-  // 端口显示
+  // 状态详情
   if (status === 'connected' && port) {
-    portDisplay.textContent = port
-    portDisplay.style.color = '#34c759'  // 绿色
-    scanPort.textContent = ''
-    statusDetail.textContent = 'WebSocket 已建立'
+    statusDetail.textContent = `端口 ${port} · WebSocket 已建立`
   } else if ((status === 'connecting' || status === 'verifying' || status === 'scanning') && currentPort) {
-    portDisplay.textContent = currentPort
-    portDisplay.style.color = '#ff9f0a'  // 橙色
     const roundText = scanRound > 0 ? `（第 ${scanRound + 1} 轮）` : ''
-    scanPort.textContent = `扫描范围 ${basePort}-${basePort + 9}${roundText}`
-    statusDetail.textContent = enabled ? '请确保 Claude Code 已启动' : ''
+    statusDetail.textContent = `正在扫描 ${basePort}-${basePort + 9}${roundText}`
   } else if (status === 'not_found') {
-    portDisplay.textContent = '--'
-    portDisplay.style.color = '#ff3b30'  // 红色
-    scanPort.textContent = `已扫描 ${basePort}-${basePort + 9}`
-    statusDetail.textContent = '未检测到 ghost-bridge 服务，请先启动 Claude Code'
+    statusDetail.textContent = '请确保 Claude Code 已启动'
   } else {
-    portDisplay.textContent = basePort || '--'
-    portDisplay.style.color = '#666'
-    scanPort.textContent = ''
-    statusDetail.textContent = enabled ? '点击「启用连接」开始' : ''
+    statusDetail.textContent = ''
   }
 
   // 按钮状态
-  connectBtn.textContent = enabled ? '重新连接' : '启用连接'
+  connectBtn.textContent = enabled ? '重新连接' : '连接'
   connectBtn.disabled = false
-  
+
   // 扫描轮次提示
   if ((status === 'connecting' || status === 'scanning') && scanRound > 2) {
-    scanInfo.textContent = `已扫描 ${scanRound} 轮，服务可能未启动`
+    scanInfo.textContent = `已扫描 ${scanRound} 轮，请确保 Claude Code 已启动`
     scanInfo.style.color = '#ff9f0a'
   } else {
     scanInfo.textContent = ''
@@ -98,7 +84,7 @@ async function fetchStatus() {
   }
 }
 
-// 启用连接
+// 启用连接（自动扫描端口）
 connectBtn.addEventListener('click', async () => {
   try {
     await chrome.runtime.sendMessage({ type: 'connect' })
@@ -121,5 +107,5 @@ disconnectBtn.addEventListener('click', async () => {
 // 初始加载
 fetchStatus()
 
-// 定时刷新状态（200ms 更快刷新以显示扫描动态）
-setInterval(fetchStatus, 200)
+// 定时刷新状态（500ms）
+setInterval(fetchStatus, 500)

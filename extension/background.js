@@ -669,6 +669,131 @@ let lastSuccessPort = null // 上次成功连接的端口
 let wasConnected = false   // 标记是否曾经成功连接过
 let scanRound = 0          // 当前扫描轮次
 let connectionPhase = 'idle' // 连接阶段: idle, scanning, verifying, connected
+let directPortMode = false // 是否为直接连接模式（不扫描）
+
+/**
+ * 直接连接指定端口（不扫描其他端口）
+ */
+function connectDirect(port) {
+  directPortMode = true
+  currentPortIndex = 0
+
+  const url = new URL(`ws://localhost:${port}`)
+  if (CONFIG.token) url.searchParams.set("token", CONFIG.token)
+
+  log(`🎯 直接连接端口 ${port}...`)
+  connectionPhase = 'scanning'
+  ws = new WebSocket(url.toString())
+  setBadgeState("connecting")
+
+  const connectionTimeout = setTimeout(() => {
+    if (ws && ws.readyState === WebSocket.CONNECTING) {
+      ws.close()
+    }
+  }, 3000) // 直接连接给更长的超时
+
+  let identityVerified = false
+  let identityTimeout = null
+
+  ws.onopen = () => {
+    clearTimeout(connectionTimeout)
+    connectionPhase = 'verifying'
+    log(`🔗 WebSocket 已连接端口 ${port}，等待身份验证...`)
+
+    identityTimeout = setTimeout(() => {
+      if (!identityVerified) {
+        log(`❌ 端口 ${port} 身份验证超时，回退到扫描模式...`)
+        directPortMode = false
+        ws.close()
+        // 回退到扫描模式
+        if (state.enabled) {
+          scanRound = 0
+          connectionPhase = 'scanning'
+          setTimeout(() => connect(0, true), 100)
+        } else {
+          connectionPhase = 'idle'
+        }
+      }
+    }, 3000)
+  }
+
+  ws.onmessage = (event) => {
+    try {
+      const msg = JSON.parse(event.data)
+
+      if (msg.type === "identity") {
+        clearTimeout(identityTimeout)
+
+        if (msg.service === "ghost-bridge" && msg.token === CONFIG.token) {
+          identityVerified = true
+          wasConnected = true
+          lastSuccessPort = port
+          scanRound = 0
+          connectionPhase = 'connected'
+          directPortMode = false
+          log(`✅ 已连接到 ghost-bridge 服务 (端口 ${port})`)
+          setBadgeState("on")
+          ensureAttached().catch((e) => log(`attach 失败：${e.message}`))
+        } else {
+          log(`❌ 端口 ${port} 身份验证失败，回退到扫描模式...`)
+          directPortMode = false
+          ws.close()
+          // 回退到扫描模式
+          if (state.enabled) {
+            scanRound = 0
+            connectionPhase = 'scanning'
+            setTimeout(() => connect(0, true), 100)
+          } else {
+            connectionPhase = 'idle'
+          }
+        }
+        return
+      }
+
+      if (identityVerified) {
+        handleCommand(msg)
+      }
+    } catch (e) {
+      log(`解析消息失败：${e.message}`)
+    }
+  }
+
+  ws.onclose = (event) => {
+    clearTimeout(connectionTimeout)
+    clearTimeout(identityTimeout)
+
+    if (directPortMode) {
+      log(`❌ 无法连接到端口 ${port}，回退到扫描模式...`)
+      directPortMode = false
+      // 回退到扫描模式，尝试其他端口
+      if (state.enabled) {
+        scanRound = 0
+        connectionPhase = 'scanning'
+        // 立即开始扫描
+        setTimeout(() => connect(0, true), 100)
+      } else {
+        connectionPhase = 'idle'
+        setBadgeState("off")
+      }
+      return
+    }
+
+    if (wasConnected) {
+      wasConnected = false
+      log("⚠️ 连接断开，尝试重连...")
+      setBadgeState("off")
+      if (reconnectTimer) clearTimeout(reconnectTimer)
+      if (state.enabled) {
+        reconnectTimer = setTimeout(() => connectDirect(port), 2000)
+      }
+    }
+  }
+
+  ws.onerror = (err) => {
+    clearTimeout(connectionTimeout)
+    clearTimeout(identityTimeout)
+  }
+}
 
 function connect(portIndex = 0, isNewRound = false) {
   if (!state.enabled) return
@@ -849,25 +974,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   
   if (message.type === 'connect') {
-    // 更新端口配置（如果提供）
-    if (message.port && message.port !== CONFIG.basePort) {
-      CONFIG.basePort = message.port
-      chrome.storage.local.set({ basePort: message.port })
-    }
-    
-    // 强制重新连接（无论当前状态如何）
     // 先关闭现有连接
     if (reconnectTimer) clearTimeout(reconnectTimer)
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
       ws.close()
     }
-    
-    // 重新开始扫描
-    state.enabled = true
-    scanRound = 0
-    connectionPhase = 'scanning'
-    connect(0, true)
-    
+
+    // 如果指定了端口，直接连接该端口（不扫描）
+    if (message.port) {
+      CONFIG.basePort = message.port
+      chrome.storage.local.set({ basePort: message.port })
+      state.enabled = true
+      scanRound = 0
+      connectionPhase = 'scanning'
+      // 直接连接指定端口，maxPortRetries 设为 1 表示只尝试这一个端口
+      connectDirect(message.port)
+    } else {
+      // 没有指定端口，从 basePort 开始扫描
+      state.enabled = true
+      scanRound = 0
+      connectionPhase = 'scanning'
+      connect(0, true)
+    }
+
     sendResponse({ ok: true })
     return true
   }

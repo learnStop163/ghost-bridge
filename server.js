@@ -1,10 +1,13 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js"
-import { WebSocketServer } from "ws"
+import { WebSocketServer, WebSocket } from "ws"
 import beautify from "js-beautify"
 import crypto from "crypto"
 import net from "net"
+import fs from "fs"
+import os from "os"
+import path from "path"
 
 const BASE_PORT = Number(process.env.GHOST_BRIDGE_PORT || 33333)
 const MAX_PORT_RETRIES = 10
@@ -16,13 +19,83 @@ function getMonthlyToken() {
 }
 const WS_TOKEN = process.env.GHOST_BRIDGE_TOKEN || getMonthlyToken()
 const RESPONSE_TIMEOUT = 8000
+const PORT_INFO_FILE = path.join(os.tmpdir(), "ghost-bridge-port.json")
 
-let activeConnection = null
+let chromeConnection = null   // Chrome 扩展的连接
+let activeConnection = null   // 当前用于发送请求的连接（主实例用 chromeConnection，非主实例用到主实例的连接）
 let actualPort = BASE_PORT
+let isMainInstance = false    // 是否是主实例（启动了 WebSocket 服务器）
 const pendingRequests = new Map()
+const mcpClients = new Set()  // 连接到主实例的其他 MCP 客户端
 
 function log(msg) {
   console.error(`[ghost-bridge] ${msg}`)
+}
+
+/**
+ * 检查进程是否存在
+ */
+function isProcessRunning(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 检查是否已有服务在运行
+ */
+function getExistingService() {
+  try {
+    if (!fs.existsSync(PORT_INFO_FILE)) return null
+    const info = JSON.parse(fs.readFileSync(PORT_INFO_FILE, "utf-8"))
+    if (!info.pid || !info.port) return null
+    // 检查进程是否还在运行
+    if (!isProcessRunning(info.pid)) {
+      log(`旧服务 PID ${info.pid} 已不存在，清理旧信息`)
+      fs.unlinkSync(PORT_INFO_FILE)
+      return null
+    }
+    return info
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 验证现有服务是否是 ghost-bridge
+ */
+function verifyExistingService(port) {
+  return new Promise((resolve) => {
+    const url = new URL(`ws://localhost:${port}`)
+    if (WS_TOKEN) url.searchParams.set("token", WS_TOKEN)
+
+    const ws = new WebSocket(url.toString())
+    const timeout = setTimeout(() => {
+      ws.close()
+      resolve(false)
+    }, 2000)
+
+    ws.on("message", (data) => {
+      try {
+        const msg = JSON.parse(data.toString())
+        if (msg.type === "identity" && msg.service === "ghost-bridge") {
+          clearTimeout(timeout)
+          ws.close()
+          resolve(true)
+        }
+      } catch {}
+    })
+    ws.on("error", () => {
+      clearTimeout(timeout)
+      resolve(false)
+    })
+    ws.on("close", () => {
+      clearTimeout(timeout)
+    })
+  })
 }
 
 /**
@@ -53,7 +126,7 @@ async function startWebSocketServer() {
       if (port !== BASE_PORT) {
         log(`⚠️ 端口 ${BASE_PORT} 被占用，已切换到端口 ${port}`)
       }
-      log(`等待 Chrome 扩展连接，端口 ${port}${WS_TOKEN ? "（启用 token 校验）" : ""}`)
+      log(`🚀 WebSocket 服务已启动，端口 ${port}${WS_TOKEN ? "（启用 token 校验）" : ""}`)
       return wss
     } else {
       log(`端口 ${port} 被占用，尝试下一个...`)
@@ -62,27 +135,197 @@ async function startWebSocketServer() {
   throw new Error(`无法找到可用端口（已尝试 ${BASE_PORT} - ${BASE_PORT + MAX_PORT_RETRIES - 1}）`)
 }
 
-const wss = await startWebSocketServer()
-
-wss.on("connection", (ws, req) => {
-  const url = new URL(req.url || "/", "http://localhost")
-  const token = url.searchParams.get("token") || ""
-  if (WS_TOKEN && token !== WS_TOKEN) {
-    log("拒绝连接：token 不匹配")
-    ws.close(1008, "Bad token")
-    return
+/**
+ * 初始化 WebSocket 服务（单例模式）
+ */
+async function initWebSocketService() {
+  // 检查是否已有服务在运行
+  const existing = getExistingService()
+  if (existing) {
+    log(`检测到现有服务 (PID: ${existing.pid}, 端口: ${existing.port})，验证中...`)
+    const valid = await verifyExistingService(existing.port)
+    if (valid) {
+      actualPort = existing.port
+      isMainInstance = false
+      log(`✅ 复用现有服务，端口 ${actualPort}`)
+      return null // 不启动新的 WebSocket 服务器
+    } else {
+      log(`❌ 现有服务验证失败，启动新服务...`)
+      try { fs.unlinkSync(PORT_INFO_FILE) } catch {}
+    }
   }
-  log("Chrome 扩展已连接")
-  activeConnection = ws
-  // 发送身份确认消息，让插件验证是否连接到正确的服务
-  ws.send(JSON.stringify({ type: "identity", service: "ghost-bridge", token: WS_TOKEN }))
-  ws.on("message", handleIncoming)
-  ws.on("close", () => {
-    log("Chrome 连接已关闭")
-    activeConnection = null
-    failAllPending("Chrome 连接断开")
+
+  // 启动新的 WebSocket 服务器
+  const wss = await startWebSocketServer()
+  isMainInstance = true
+
+  // 写入端口信息
+  fs.writeFileSync(
+    PORT_INFO_FILE,
+    JSON.stringify({
+      port: actualPort,
+      wsUrl: `ws://localhost:${actualPort}`,
+      pid: process.pid,
+      startedAt: new Date().toISOString()
+    }, null, 2)
+  )
+  log(`📝 端口信息已写入: ${PORT_INFO_FILE}`)
+
+  return wss
+}
+
+const wss = await initWebSocketService()
+
+// 如果是主实例，设置 WebSocket 服务器的连接处理
+if (wss) {
+  wss.on("connection", (ws, req) => {
+    const url = new URL(req.url || "/", "http://localhost")
+    const token = url.searchParams.get("token") || ""
+    const role = url.searchParams.get("role") || ""
+
+    if (WS_TOKEN && token !== WS_TOKEN) {
+      log("拒绝连接：token 不匹配")
+      ws.close(1008, "Bad token")
+      return
+    }
+
+    if (role === "mcp-client") {
+      // 其他 MCP 实例的连接
+      log("📡 MCP 客户端已连接")
+      mcpClients.add(ws)
+      ws.send(JSON.stringify({ type: "identity", service: "ghost-bridge", token: WS_TOKEN }))
+
+      ws.on("message", (data) => {
+        try {
+          const msg = JSON.parse(data.toString())
+
+          // 内部命令：查询主实例状态
+          if (msg.command === "_getMainStatus") {
+            ws.send(JSON.stringify({
+              id: msg.id,
+              result: {
+                chromeConnected: !!chromeConnection,
+                mcpClientsCount: mcpClients.size,
+                port: actualPort
+              }
+            }))
+            return
+          }
+
+          // MCP 客户端的请求需要转发到 Chrome
+          if (!chromeConnection) {
+            if (msg.id) {
+              ws.send(JSON.stringify({ id: msg.id, error: "Chrome 未连接" }))
+            }
+            return
+          }
+          // 记录请求来源，以便响应时转发回去
+          if (msg.id) {
+            pendingRequests.set(msg.id, { source: ws })
+          }
+          chromeConnection.send(data)
+        } catch {}
+      })
+
+      ws.on("close", () => {
+        log("📡 MCP 客户端已断开")
+        mcpClients.delete(ws)
+      })
+    } else {
+      // Chrome 扩展的连接
+      // 如果已有旧的 Chrome 连接，先关闭它
+      if (chromeConnection && chromeConnection !== ws && chromeConnection.readyState === WebSocket.OPEN) {
+        log("🔄 关闭旧的 Chrome 连接，切换到新连接")
+        try {
+          chromeConnection.close(1000, "Replaced by new connection")
+        } catch (e) {
+          log(`关闭旧连接失败: ${e.message}`)
+        }
+      }
+      log("🌐 Chrome 扩展已连接")
+      chromeConnection = ws
+      activeConnection = ws
+      ws.send(JSON.stringify({ type: "identity", service: "ghost-bridge", token: WS_TOKEN }))
+
+      ws.on("message", (data) => {
+        // 检查是否需要转发响应到 MCP 客户端
+        try {
+          const msg = JSON.parse(data.toString())
+          if (msg.id && pendingRequests.has(msg.id)) {
+            const pending = pendingRequests.get(msg.id)
+            // 区分：来自其他 MCP 客户端的请求 vs 本地请求
+            if (pending.source && pending.source.readyState === WebSocket.OPEN) {
+              // 来自其他 MCP 客户端，转发响应
+              pendingRequests.delete(msg.id)
+              pending.source.send(data)
+              return
+            }
+            // 本地请求，直接处理（不要在这里删除）
+          }
+        } catch {}
+        // 本地处理
+        handleIncoming(data)
+      })
+
+      ws.on("close", () => {
+        log("🌐 Chrome 连接已关闭")
+        chromeConnection = null
+        activeConnection = null
+        failAllPending("Chrome 连接断开")
+      })
+    }
   })
-})
+} else {
+  // 非主实例：作为客户端连接到主实例
+  log(`📡 作为客户端连接到主实例 (端口 ${actualPort})...`)
+  connectToMainInstance()
+}
+
+/**
+ * 连接到主实例的 WebSocket 服务器
+ */
+function connectToMainInstance() {
+  const url = new URL(`ws://localhost:${actualPort}`)
+  url.searchParams.set("token", WS_TOKEN)
+  url.searchParams.set("role", "mcp-client") // 标识为 MCP 客户端
+
+  const ws = new WebSocket(url.toString())
+
+  ws.on("open", () => {
+    log(`✅ 已连接到主实例 (端口 ${actualPort})`)
+  })
+
+  ws.on("message", (data) => {
+    try {
+      const msg = JSON.parse(data.toString())
+      // 处理身份验证
+      if (msg.type === "identity" && msg.service === "ghost-bridge") {
+        activeConnection = ws
+        log("🔗 身份验证成功，可以使用调试功能")
+        return
+      }
+      // 处理响应
+      handleIncoming(data)
+    } catch {}
+  })
+
+  ws.on("close", () => {
+    log("⚠️ 与主实例的连接已断开")
+    activeConnection = null
+    failAllPending("与主实例的连接已断开")
+    // 尝试重连
+    setTimeout(() => {
+      if (!activeConnection) {
+        log("🔄 尝试重新连接到主实例...")
+        connectToMainInstance()
+      }
+    }, 3000)
+  })
+
+  ws.on("error", (err) => {
+    log(`❌ 连接主实例失败: ${err.message}`)
+  })
+}
 
 function failAllPending(message) {
   pendingRequests.forEach(({ reject, timer }) => {
@@ -106,6 +349,32 @@ function handleIncoming(data) {
   pendingRequests.delete(id)
   if (error) reject(new Error(error))
   else resolve(result)
+}
+
+/**
+ * 向主实例发送内部命令（仅非主实例使用）
+ */
+async function askMainInstance(command, params = {}) {
+  if (!activeConnection) throw new Error("未连接到主实例")
+  const id = crypto.randomUUID()
+  const payload = { id, command, params }
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingRequests.delete(id)
+      reject(new Error(`查询主实例超时：${command}`))
+    }, 3000)
+
+    pendingRequests.set(id, { resolve, reject, timer })
+
+    activeConnection.send(JSON.stringify(payload), (err) => {
+      if (err) {
+        clearTimeout(timer)
+        pendingRequests.delete(id)
+        reject(err)
+      }
+    })
+  })
 }
 
 async function askChrome(command, params = {}, options = {}) {
@@ -184,6 +453,11 @@ const server = new Server(
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
+    {
+      name: "get_server_info",
+      description: "获取 ghost-bridge 服务器状态，包括当前 WebSocket 端口、连接状态等",
+      inputSchema: { type: "object", properties: {} },
+    },
     {
       name: "get_last_error",
       description: "获取当前标签最近的异常/报错堆栈与元数据（无 sourcemap 友好）",
@@ -283,6 +557,47 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const name = request.params.name
   const args = request.params.arguments || {}
   try {
+    if (name === "get_server_info") {
+      let chromeOk, clientsCount
+
+      if (isMainInstance) {
+        chromeOk = !!chromeConnection
+        clientsCount = mcpClients.size
+      } else {
+        // 非主实例：查询主实例的状态
+        try {
+          const mainStatus = await askMainInstance("_getMainStatus")
+          chromeOk = mainStatus.chromeConnected
+          clientsCount = mainStatus.mcpClientsCount
+        } catch {
+          chromeOk = false
+          clientsCount = "N/A"
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: jsonText({
+              service: "ghost-bridge",
+              version: "0.1.0",
+              role: isMainInstance ? "主实例 (WebSocket Server)" : "客户端 (连接到主实例)",
+              wsPort: actualPort,
+              wsUrl: `ws://localhost:${actualPort}`,
+              pid: process.pid,
+              chromeConnected: chromeOk,
+              mcpClientsCount: clientsCount,
+              portInfoFile: PORT_INFO_FILE,
+              note: chromeOk
+                ? "✅ Chrome 扩展已连接，可以使用调试功能"
+                : `❌ Chrome 扩展未连接，请在浏览器中启用 Ghost Bridge 扩展并连接到端口 ${actualPort}`,
+            }),
+          },
+        ],
+      }
+    }
+
     if (name === "get_last_error") {
       const data = await askChrome("getLastError")
       return { content: [{ type: "text", text: jsonText(data) }] }
@@ -371,4 +686,76 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 const transport = new StdioServerTransport()
 await server.connect(transport)
-log("MCP server 已启动")
+
+// 启动完成日志
+const roleText = isMainInstance ? "主实例" : "客户端"
+log(`✅ MCP server 已启动 | 角色: ${roleText} | 端口: ${actualPort} | PID: ${process.pid}`)
+log(`📄 端口信息文件: ${PORT_INFO_FILE}`)
+log(`💡 使用 get_server_info 工具查看详细状态`)
+
+// ========== 进程退出清理 ==========
+function cleanup() {
+  log("🧹 正在清理...")
+
+  // 主实例退出时删除端口信息文件
+  if (isMainInstance) {
+    try {
+      // 只有当文件中的 PID 是当前进程时才删除
+      if (fs.existsSync(PORT_INFO_FILE)) {
+        const info = JSON.parse(fs.readFileSync(PORT_INFO_FILE, "utf-8"))
+        if (info.pid === process.pid) {
+          fs.unlinkSync(PORT_INFO_FILE)
+          log("📝 已删除端口信息文件")
+        }
+      }
+    } catch (e) {
+      log(`清理端口信息文件失败: ${e.message}`)
+    }
+
+    // 关闭 WebSocket 服务器
+    if (wss) {
+      wss.close(() => {
+        log("🔌 WebSocket 服务器已关闭")
+      })
+    }
+  }
+
+  // 关闭所有连接
+  if (activeConnection) {
+    activeConnection.close()
+  }
+}
+
+// 监听各种退出信号
+process.on("SIGINT", () => {
+  log("收到 SIGINT 信号")
+  cleanup()
+  process.exit(0)
+})
+
+process.on("SIGTERM", () => {
+  log("收到 SIGTERM 信号")
+  cleanup()
+  process.exit(0)
+})
+
+process.on("exit", () => {
+  // exit 事件中只能执行同步操作
+  if (isMainInstance) {
+    try {
+      if (fs.existsSync(PORT_INFO_FILE)) {
+        const info = JSON.parse(fs.readFileSync(PORT_INFO_FILE, "utf-8"))
+        if (info.pid === process.pid) {
+          fs.unlinkSync(PORT_INFO_FILE)
+        }
+      }
+    } catch {}
+  }
+})
+
+// 处理未捕获的异常
+process.on("uncaughtException", (err) => {
+  log(`未捕获的异常: ${err.message}`)
+  cleanup()
+  process.exit(1)
+})

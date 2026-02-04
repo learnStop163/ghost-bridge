@@ -91,19 +91,7 @@
     .config-input:focus {
       border-color: #4a9eff;
     }
-    .port-display {
-      font-size: 24px;
-      font-weight: 600;
-      color: #4a9eff;
-      text-align: center;
-      padding: 8px;
-    }
-    .scan-port {
-      font-size: 12px;
-      color: #ff9f0a;
-      text-align: center;
-      min-height: 16px;
-    }
+
     .btn-row {
       display: flex;
       gap: 8px;
@@ -158,14 +146,10 @@
     <div class="status-detail" id="statusDetail"></div>
   </div>
 
-  <div class="config-section">
-    <div class="config-label">服务端口</div>
-    <div class="port-display" id="portDisplay">--</div>
-    <div class="scan-port" id="scanPort"></div>
-  </div>
+
 
   <div class="btn-row">
-    <button class="btn btn-primary" id="connectBtn">启用连接</button>
+    <button class="btn btn-primary" id="connectBtn">连接</button>
     <button class="btn btn-secondary" id="disconnectBtn">断开</button>
   </div>
 
