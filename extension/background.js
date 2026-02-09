@@ -6,58 +6,39 @@ function getMonthlyToken() {
 }
 
 const CONFIG = {
-  basePort: 33333,           // 基础端口
-  maxPortRetries: 10,        // 最大端口重试次数，与 server.js 保持一致
-  token: getMonthlyToken(), // 使用当月时间戳作为 token
-  autoDetach: false, // 默认保持附加，便于持续捕获异常；可通过图标一键暂停
-  maxErrors: 40, // 保持有限的事件窗口，避免上下文爆炸
+  basePort: 33333,
+  maxPortRetries: 10,
+  token: getMonthlyToken(),
+  autoDetach: false,
+  maxErrors: 40,
   maxStackFrames: 5,
-  maxRequestsTracked: 200, // 完整网络请求记录数
-  maxRequestBodySize: 100000, // 最大响应体大小 100KB
+  maxRequestsTracked: 200,
+  maxRequestBodySize: 100000,
 }
 
-let ws = null
-let reconnectTimer = null
 let attachedTabId = null
 let scriptMap = new Map()
 let scriptSourceCache = new Map()
 let lastErrors = []
 let lastErrorLocation = null
-let requestMap = new Map() // requestId -> 进行中的请求元数据
-let networkRequests = [] // 完整的网络请求记录
-let state = { enabled: false }
+let requestMap = new Map()
+let networkRequests = []
+let state = { enabled: false, connected: false, port: null, currentPort: null, scanRound: 0 }
+
+// 待处理的请求（等待 offscreen 响应）
+const pendingRequests = new Map()
 
 function setBadgeState(status) {
-  // 统一徽章状态：connecting/ on / off / err / att(附加失败)
   const map = {
     connecting: { text: "…", color: "#999" },
     on: { text: "ON", color: "#34c759" },
     off: { text: "OFF", color: "#999" },
     err: { text: "ERR", color: "#ff3b30" },
-    att: { text: "ATT", color: "#ff9f0a" }, // attach denied/失败
+    att: { text: "ATT", color: "#ff9f0a" },
   }
   const cfg = map[status] || map.off
   chrome.action.setBadgeText({ text: cfg.text })
   chrome.action.setBadgeBackgroundColor({ color: cfg.color })
-}
-
-async function toggleEnabled() {
-  state.enabled = !state.enabled
-  if (state.enabled) {
-    log("已开启 Ghost Bridge")
-    setBadgeState("connecting")
-    if (!ws || ws.readyState === WebSocket.CLOSED) {
-      connect()
-    } else if (ws.readyState === WebSocket.OPEN) {
-      ensureAttached().catch((e) => log(`attach 失败：${e.message}`))
-    }
-  } else {
-    log("已暂停 Ghost Bridge")
-    setBadgeState("off")
-    if (reconnectTimer) clearTimeout(reconnectTimer)
-    if (ws && ws.readyState === WebSocket.OPEN) ws.close()
-    await detachAllTargets()
-  }
 }
 
 function sleep(ms) {
@@ -67,6 +48,51 @@ function sleep(ms) {
 function log(msg) {
   console.log(`[ghost-bridge] ${msg}`)
 }
+
+// ========== Offscreen Document 管理 ==========
+
+let offscreenCreating = null
+
+async function setupOffscreenDocument() {
+  const offscreenUrl = chrome.runtime.getURL('offscreen.html')
+
+  // 检查是否已存在
+  const existingContexts = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT'],
+    documentUrls: [offscreenUrl]
+  }).catch(() => [])
+
+  if (existingContexts.length > 0) {
+    return
+  }
+
+  // 防止并发创建
+  if (offscreenCreating) {
+    await offscreenCreating
+    return
+  }
+
+  offscreenCreating = chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['WORKERS'],  // 使用 WORKERS 作为理由
+    justification: 'Maintain WebSocket connection to ghost-bridge server'
+  })
+
+  await offscreenCreating
+  offscreenCreating = null
+  log('Offscreen document 已创建')
+}
+
+async function closeOffscreenDocument() {
+  try {
+    await chrome.offscreen.closeDocument()
+    log('Offscreen document 已关闭')
+  } catch {
+    // 可能已关闭
+  }
+}
+
+// ========== Chrome Debugger 事件处理 ==========
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (source.tabId !== attachedTabId) return
@@ -125,6 +151,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     })
   }
 
+  // 网络事件处理
   if (method === "Network.requestWillBeSent") {
     const req = params.request || {}
     const entry = {
@@ -140,8 +167,6 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       status: "pending",
     }
     requestMap.set(params.requestId, entry)
-
-    // 控制映射大小
     if (requestMap.size > CONFIG.maxRequestsTracked * 2) {
       const firstKey = requestMap.keys().next().value
       requestMap.delete(firstKey)
@@ -162,8 +187,6 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       entry.fromCache = res.fromDiskCache || res.fromServiceWorker
       entry.timing = res.timing
       entry.encodedDataLength = params.encodedDataLength
-
-      // 记录到错误列表（仅失败请求）
       if (res.status >= 400) {
         pushError({
           type: "network",
@@ -189,8 +212,6 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         ? Math.round((entry.endTime - entry.startTime) * 1000)
         : null
       if (entry.status === "pending") entry.status = "success"
-
-      // 移到完成列表
       pushNetworkRequest(entry)
       requestMap.delete(params.requestId)
     }
@@ -203,7 +224,6 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       entry.errorText = params.errorText
       entry.canceled = params.canceled
       entry.blockedReason = params.blockedReason
-
       pushError({
         type: "network",
         severity: "error",
@@ -213,7 +233,6 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         text: params.errorText,
         timestamp: Date.now(),
       })
-
       pushNetworkRequest(entry)
       requestMap.delete(params.requestId)
     }
@@ -249,7 +268,6 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 function pushError(entry) {
   lastErrors.unshift(entry)
   if (lastErrors.length > CONFIG.maxErrors) {
-    // 优先丢弃低严重度，保留 error
     const dropIdx = lastErrors
       .map((e, i) => ({ sev: e.severity || "info", i }))
       .reverse()
@@ -268,6 +286,8 @@ function compactStack(stackTrace) {
     column: f.columnNumber,
   }))
 }
+
+// ========== Debugger 操作 ==========
 
 async function ensureAttached() {
   if (!state.enabled) throw new Error("扩展已暂停，点击图标开启后再试")
@@ -319,29 +339,22 @@ async function detachAllTargets() {
         } else {
           await chrome.debugger.detach({ targetId: t.id })
         }
-      } catch (e) {
-        log(`detach target ${t.id} 失败：${e.message}`)
-      }
+      } catch {}
     }
-    // 兜底：尝试对所有标签页 detach，避免 service worker 重启后状态丢失
     const tabs = await chrome.tabs.query({})
     for (const tab of tabs) {
       if (!tab.id) continue
       try {
         await chrome.debugger.detach({ tabId: tab.id })
-      } catch {
-        // ignore
-      }
+      } catch {}
     }
-  } catch (e) {
-    log(`getTargets 失败：${e.message}`)
-  } finally {
-    attachedTabId = null
-  }
+  } catch {}
+  attachedTabId = null
 }
 
+// ========== 命令处理 ==========
+
 async function handleGetLastError() {
-  // 确保已附加，否则收不到异常事件
   await ensureAttached()
   const events = lastErrors.slice(0, CONFIG.maxErrors)
   const counts = events.reduce(
@@ -430,11 +443,7 @@ function findContexts(source, query, maxMatches) {
   while (idx !== -1 && matches.length < maxMatches) {
     const start = Math.max(0, idx - 200)
     const end = Math.min(source.length, idx + q.length + 200)
-    matches.push({
-      start,
-      end,
-      context: source.slice(start, end),
-    })
+    matches.push({ start, end, context: source.slice(start, end) })
     idx = lower.indexOf(q, idx + q.length)
   }
   return matches
@@ -457,11 +466,7 @@ async function handleFindByString(params = {}) {
     const source = scriptSourceCache.get(id)
     const matches = findContexts(source, query, maxMatches - results.length)
     if (matches.length) {
-      results.push({
-        url: meta.url,
-        scriptId: id,
-        matches,
-      })
+      results.push({ url: meta.url, scriptId: id, matches })
     }
     if (results.length >= maxMatches) break
   }
@@ -474,22 +479,16 @@ async function handleSymbolicHints() {
   const expression = `(function(){
     try {
       const resources = performance.getEntriesByType('resource').slice(-20).map(e => ({
-        name: e.name,
-        type: e.initiatorType || '',
-        size: e.transferSize || 0
+        name: e.name, type: e.initiatorType || '', size: e.transferSize || 0
       }));
       const globals = Object.keys(window).filter(k => k.length < 30).slice(0, 60);
       const ls = Object.keys(localStorage || {}).slice(0, 20);
       return {
         location: window.location.href,
         ua: navigator.userAgent,
-        resources,
-        globals,
-        localStorageKeys: ls
+        resources, globals, localStorageKeys: ls
       };
-    } catch (e) {
-      return { error: e.message };
-    }
+    } catch (e) { return { error: e.message }; }
   })()`
   const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
     expression,
@@ -507,45 +506,27 @@ async function handleEval(params = {}) {
   return result?.value
 }
 
-// ========== 网络请求分析 ==========
-
 async function handleListNetworkRequests(params = {}) {
   await ensureAttached()
-
-  const {
-    filter,        // url 关键词过滤
-    method,        // GET/POST/PUT 等
-    status,        // success/error/failed/pending
-    resourceType,  // XHR/Fetch/Script/Stylesheet/Image 等
-    limit = 50,
-  } = params
+  const { filter, method, status, resourceType, limit = 50 } = params
 
   let results = [...networkRequests]
-
-  // 包含进行中的请求
   const pending = [...requestMap.values()].map(r => ({ ...r, status: "pending" }))
   results = [...pending, ...results]
 
-  // 应用过滤
   if (filter) {
     const lowerFilter = filter.toLowerCase()
     results = results.filter(r => r.url?.toLowerCase().includes(lowerFilter))
   }
-  if (method) {
-    results = results.filter(r => r.method?.toUpperCase() === method.toUpperCase())
-  }
-  if (status) {
-    results = results.filter(r => r.status === status)
-  }
+  if (method) results = results.filter(r => r.method?.toUpperCase() === method.toUpperCase())
+  if (status) results = results.filter(r => r.status === status)
   if (resourceType) {
     const lowerType = resourceType.toLowerCase()
     results = results.filter(r => r.resourceType?.toLowerCase() === lowerType)
   }
 
-  // 限制数量
   results = results.slice(0, limit)
 
-  // 简化输出，不包含 headers 详情
   return {
     total: networkRequests.length + requestMap.size,
     filtered: results.length,
@@ -569,46 +550,23 @@ async function handleListNetworkRequests(params = {}) {
 async function handleGetNetworkDetail(params = {}) {
   const target = await ensureAttached()
   const { requestId, includeBody = false } = params
+  if (!requestId) throw new Error("需要提供 requestId")
 
-  if (!requestId) {
-    throw new Error("需要提供 requestId")
-  }
-
-  // 先从进行中的请求找
   let entry = requestMap.get(requestId)
-  // 再从已完成的找
-  if (!entry) {
-    entry = networkRequests.find(r => r.requestId === requestId)
-  }
-
-  if (!entry) {
-    throw new Error(`未找到请求: ${requestId}`)
-  }
+  if (!entry) entry = networkRequests.find(r => r.requestId === requestId)
+  if (!entry) throw new Error(`未找到请求: ${requestId}`)
 
   const result = { ...entry }
 
-  // 获取响应 body
   if (includeBody && entry.status !== "pending" && entry.status !== "failed") {
     try {
       const { body, base64Encoded } = await chrome.debugger.sendCommand(
-        target,
-        "Network.getResponseBody",
-        { requestId }
+        target, "Network.getResponseBody", { requestId }
       )
-
       if (base64Encoded) {
-        // 二进制内容，只返回大小信息
-        result.bodyInfo = {
-          type: "binary",
-          base64Length: body.length,
-          note: "二进制内容，已 base64 编码",
-        }
-        // 如果小于限制，也返回 base64
-        if (body.length < CONFIG.maxRequestBodySize) {
-          result.bodyBase64 = body
-        }
+        result.bodyInfo = { type: "binary", base64Length: body.length, note: "二进制内容，已 base64 编码" }
+        if (body.length < CONFIG.maxRequestBodySize) result.bodyBase64 = body
       } else {
-        // 文本内容
         if (body.length > CONFIG.maxRequestBodySize) {
           result.body = body.slice(0, CONFIG.maxRequestBodySize)
           result.bodyTruncated = true
@@ -632,15 +590,187 @@ async function handleClearNetworkRequests() {
   return { cleared: count }
 }
 
+async function handleCaptureScreenshot(params = {}) {
+  const target = await ensureAttached()
+  const { format = 'png', quality, fullPage = false, clip } = params
+
+  await chrome.debugger.sendCommand(target, 'Page.enable')
+
+  let captureParams = {
+    format,
+    ...(quality !== undefined && format === 'jpeg' ? { quality } : {}),
+  }
+
+  if (clip) {
+    captureParams.clip = { x: clip.x || 0, y: clip.y || 0, width: clip.width, height: clip.height, scale: clip.scale || 1 }
+  } else if (fullPage) {
+    const { result } = await chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
+      expression: `(function() {
+        return {
+          width: Math.max(document.body.scrollWidth, document.documentElement.scrollWidth, document.body.offsetWidth, document.documentElement.offsetWidth, document.body.clientWidth, document.documentElement.clientWidth),
+          height: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight, document.body.offsetHeight, document.documentElement.offsetHeight, document.body.clientHeight, document.documentElement.clientHeight)
+        };
+      })()`,
+      returnByValue: true,
+    })
+
+    const pageSize = result?.value
+    if (pageSize && pageSize.width && pageSize.height) {
+      const maxWidth = Math.min(pageSize.width, 4096)
+      const maxHeight = Math.min(pageSize.height, 16384)
+
+      captureParams.clip = { x: 0, y: 0, width: maxWidth, height: maxHeight, scale: 1 }
+
+      const { result: viewportResult } = await chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
+        expression: `({ width: window.innerWidth, height: window.innerHeight })`,
+        returnByValue: true,
+      })
+      const originalViewport = viewportResult?.value
+
+      await chrome.debugger.sendCommand(target, 'Emulation.setDeviceMetricsOverride', {
+        width: maxWidth, height: maxHeight, deviceScaleFactor: 1, mobile: false,
+      })
+
+      try {
+        const { data } = await chrome.debugger.sendCommand(target, 'Page.captureScreenshot', captureParams)
+        if (originalViewport) {
+          await chrome.debugger.sendCommand(target, 'Emulation.setDeviceMetricsOverride', {
+            width: originalViewport.width, height: originalViewport.height, deviceScaleFactor: 1, mobile: false,
+          })
+        }
+        await chrome.debugger.sendCommand(target, 'Emulation.clearDeviceMetricsOverride').catch(() => {})
+        return {
+          imageData: data, format, fullPage: true, width: maxWidth, height: maxHeight,
+          note: pageSize.height > maxHeight ? `页面高度 ${pageSize.height}px 超过限制，已截取前 ${maxHeight}px` : undefined,
+        }
+      } catch (e) {
+        await chrome.debugger.sendCommand(target, 'Emulation.clearDeviceMetricsOverride').catch(() => {})
+        throw e
+      }
+    }
+  }
+
+  const { data } = await chrome.debugger.sendCommand(target, 'Page.captureScreenshot', captureParams)
+  const { result: sizeResult } = await chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
+    expression: `({ width: window.innerWidth, height: window.innerHeight })`,
+    returnByValue: true,
+  })
+
+  return { imageData: data, format, fullPage: false, width: sizeResult?.value?.width, height: sizeResult?.value?.height }
+}
+
+async function handleGetPageContent(params = {}) {
+  const target = await ensureAttached()
+  const { mode = "text", selector, maxLength = 50000, includeMetadata = true } = params
+
+  const selectorStr = selector ? JSON.stringify(selector) : 'null'
+  const modeStr = JSON.stringify(mode)
+
+  const expression = `(function() {
+    try {
+      const result = {};
+      if (document.readyState === 'loading') {
+        return { error: '页面尚未加载完成，请稍后重试', readyState: document.readyState };
+      }
+      let targetElement = document.body;
+      const selector = ${selectorStr};
+      if (selector) {
+        try {
+          targetElement = document.querySelector(selector);
+          if (!targetElement) {
+            return { error: '选择器未匹配到任何元素', selector: selector, suggestion: '请检查选择器是否正确' };
+          }
+          result.selector = selector;
+          result.matchedTag = targetElement.tagName.toLowerCase();
+        } catch (e) {
+          return { error: '无效的 CSS 选择器: ' + e.message, selector: selector };
+        }
+      }
+      const includeMetadata = ${includeMetadata};
+      if (includeMetadata) {
+        result.metadata = {
+          title: document.title || '',
+          url: window.location.href,
+          description: document.querySelector('meta[name="description"]')?.content || '',
+          keywords: document.querySelector('meta[name="keywords"]')?.content || '',
+          charset: document.characterSet,
+          language: document.documentElement.lang || '',
+        };
+      }
+      const mode = ${modeStr};
+      const maxLength = ${maxLength};
+      if (mode === 'text') {
+        let text = targetElement.innerText || targetElement.textContent || '';
+        text = text.replace(/\\n{3,}/g, '\\n\\n').trim();
+        result.contentLength = text.length;
+        if (text.length > maxLength) {
+          result.content = text.slice(0, maxLength);
+          result.truncated = true;
+        } else {
+          result.content = text;
+          result.truncated = false;
+        }
+      } else if (mode === 'html') {
+        let html = targetElement.outerHTML || '';
+        result.contentLength = html.length;
+        if (html.length > maxLength) {
+          result.content = html.slice(0, maxLength);
+          result.truncated = true;
+          result.note = 'HTML 已截断，可能不完整';
+        } else {
+          result.content = html;
+          result.truncated = false;
+        }
+      } else if (mode === 'structured') {
+        const structured = {};
+        const headings = targetElement.querySelectorAll('h1,h2,h3,h4,h5,h6');
+        structured.headings = Array.from(headings).slice(0, 50).map(h => ({ level: parseInt(h.tagName[1]), text: h.innerText.trim().slice(0, 200) }));
+        const links = targetElement.querySelectorAll('a[href]');
+        structured.links = Array.from(links).slice(0, 100).map(a => ({ text: (a.innerText || '').trim().slice(0, 100), href: a.href })).filter(l => l.href && !l.href.startsWith('javascript:'));
+        const buttons = targetElement.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]');
+        structured.buttons = Array.from(buttons).slice(0, 50).map(b => ({ text: (b.innerText || b.value || b.getAttribute('aria-label') || '').trim().slice(0, 100), type: b.type || 'button', disabled: b.disabled || false }));
+        const forms = targetElement.querySelectorAll('form');
+        structured.forms = Array.from(forms).slice(0, 20).map(f => {
+          const fields = Array.from(f.querySelectorAll('input, select, textarea')).slice(0, 30);
+          return { action: f.action || '', method: (f.method || 'GET').toUpperCase(), fieldCount: fields.length, fields: fields.map(field => ({ tag: field.tagName.toLowerCase(), type: field.type || '', name: field.name || '', placeholder: field.placeholder || '', required: field.required || false })) };
+        });
+        const images = targetElement.querySelectorAll('img');
+        structured.images = Array.from(images).slice(0, 50).map(img => ({ alt: img.alt || '', src: img.src ? img.src.slice(0, 200) : '' })).filter(img => img.src);
+        const tables = targetElement.querySelectorAll('table');
+        structured.tables = Array.from(tables).slice(0, 10).map(table => {
+          const headers = Array.from(table.querySelectorAll('th')).map(th => th.innerText.trim().slice(0, 50));
+          const rows = table.querySelectorAll('tr');
+          return { headers: headers.slice(0, 20), rowCount: rows.length };
+        });
+        result.structured = structured;
+        result.counts = { headings: structured.headings.length, links: structured.links.length, buttons: structured.buttons.length, forms: structured.forms.length, images: structured.images.length, tables: structured.tables.length };
+      }
+      result.mode = mode;
+      return result;
+    } catch (e) {
+      return { error: e.message };
+    }
+  })()`
+
+  const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+    expression,
+    returnByValue: true,
+  })
+
+  if (result?.value?.error) throw new Error(result.value.error)
+  return result?.value
+}
+
+// 处理来自服务器的命令
 async function handleCommand(message) {
   const { id, command, params, token } = message
   if (!id || !command) return
   if (!state.enabled) {
-    ws?.send(JSON.stringify({ id, error: "扩展已暂停，点击图标重新开启" }))
+    sendToServer({ id, error: "扩展已暂停，点击图标重新开启" })
     return
   }
   if (CONFIG.token && CONFIG.token !== token) {
-    ws?.send(JSON.stringify({ id, error: "token 校验失败" }))
+    sendToServer({ id, error: "token 校验失败" })
     return
   }
   try {
@@ -654,365 +784,163 @@ async function handleCommand(message) {
     else if (command === "listNetworkRequests") result = await handleListNetworkRequests(params)
     else if (command === "getNetworkDetail") result = await handleGetNetworkDetail(params)
     else if (command === "clearNetworkRequests") result = await handleClearNetworkRequests()
+    else if (command === "captureScreenshot") result = await handleCaptureScreenshot(params)
+    else if (command === "getPageContent") result = await handleGetPageContent(params)
     else throw new Error(`未知指令 ${command}`)
 
-    ws?.send(JSON.stringify({ id, result }))
+    sendToServer({ id, result })
   } catch (e) {
-    ws?.send(JSON.stringify({ id, error: e.message }))
+    sendToServer({ id, error: e.message })
   } finally {
     await maybeDetach()
   }
 }
 
-let currentPortIndex = 0  // 当前尝试的端口索引
-let lastSuccessPort = null // 上次成功连接的端口
-let wasConnected = false   // 标记是否曾经成功连接过
-let scanRound = 0          // 当前扫描轮次
-let connectionPhase = 'idle' // 连接阶段: idle, scanning, verifying, connected
-let directPortMode = false // 是否为直接连接模式（不扫描）
-
-/**
- * 直接连接指定端口（不扫描其他端口）
- */
-function connectDirect(port) {
-  directPortMode = true
-  currentPortIndex = 0
-
-  const url = new URL(`ws://localhost:${port}`)
-  if (CONFIG.token) url.searchParams.set("token", CONFIG.token)
-
-  log(`🎯 直接连接端口 ${port}...`)
-  connectionPhase = 'scanning'
-  ws = new WebSocket(url.toString())
-  setBadgeState("connecting")
-
-  const connectionTimeout = setTimeout(() => {
-    if (ws && ws.readyState === WebSocket.CONNECTING) {
-      ws.close()
-    }
-  }, 3000) // 直接连接给更长的超时
-
-  let identityVerified = false
-  let identityTimeout = null
-
-  ws.onopen = () => {
-    clearTimeout(connectionTimeout)
-    connectionPhase = 'verifying'
-    log(`🔗 WebSocket 已连接端口 ${port}，等待身份验证...`)
-
-    identityTimeout = setTimeout(() => {
-      if (!identityVerified) {
-        log(`❌ 端口 ${port} 身份验证超时，回退到扫描模式...`)
-        directPortMode = false
-        ws.close()
-        // 回退到扫描模式
-        if (state.enabled) {
-          scanRound = 0
-          connectionPhase = 'scanning'
-          setTimeout(() => connect(0, true), 100)
-        } else {
-          connectionPhase = 'idle'
-        }
-      }
-    }, 3000)
-  }
-
-  ws.onmessage = (event) => {
-    try {
-      const msg = JSON.parse(event.data)
-
-      if (msg.type === "identity") {
-        clearTimeout(identityTimeout)
-
-        if (msg.service === "ghost-bridge" && msg.token === CONFIG.token) {
-          identityVerified = true
-          wasConnected = true
-          lastSuccessPort = port
-          scanRound = 0
-          connectionPhase = 'connected'
-          directPortMode = false
-          log(`✅ 已连接到 ghost-bridge 服务 (端口 ${port})`)
-          setBadgeState("on")
-          ensureAttached().catch((e) => log(`attach 失败：${e.message}`))
-        } else {
-          log(`❌ 端口 ${port} 身份验证失败，回退到扫描模式...`)
-          directPortMode = false
-          ws.close()
-          // 回退到扫描模式
-          if (state.enabled) {
-            scanRound = 0
-            connectionPhase = 'scanning'
-            setTimeout(() => connect(0, true), 100)
-          } else {
-            connectionPhase = 'idle'
-          }
-        }
-        return
-      }
-
-      if (identityVerified) {
-        handleCommand(msg)
-      }
-    } catch (e) {
-      log(`解析消息失败：${e.message}`)
-    }
-  }
-
-  ws.onclose = (event) => {
-    clearTimeout(connectionTimeout)
-    clearTimeout(identityTimeout)
-
-    if (directPortMode) {
-      log(`❌ 无法连接到端口 ${port}，回退到扫描模式...`)
-      directPortMode = false
-      // 回退到扫描模式，尝试其他端口
-      if (state.enabled) {
-        scanRound = 0
-        connectionPhase = 'scanning'
-        // 立即开始扫描
-        setTimeout(() => connect(0, true), 100)
-      } else {
-        connectionPhase = 'idle'
-        setBadgeState("off")
-      }
-      return
-    }
-
-    if (wasConnected) {
-      wasConnected = false
-      log("⚠️ 连接断开，尝试重连...")
-      setBadgeState("off")
-      if (reconnectTimer) clearTimeout(reconnectTimer)
-      if (state.enabled) {
-        reconnectTimer = setTimeout(() => connectDirect(port), 2000)
-      }
-    }
-  }
-
-  ws.onerror = (err) => {
-    clearTimeout(connectionTimeout)
-    clearTimeout(identityTimeout)
-  }
+// 发送消息到服务器（通过 offscreen）
+function sendToServer(data) {
+  chrome.runtime.sendMessage({ type: 'send', data }).catch(() => {})
 }
 
-function connect(portIndex = 0, isNewRound = false) {
-  if (!state.enabled) return
-  
-  // 如果超出范围，立即从头开始（不等待）
-  if (portIndex >= CONFIG.maxPortRetries) {
-    scanRound++
-    log(`📡 第 ${scanRound} 轮扫描完毕，立即开始第 ${scanRound + 1} 轮...`)
-    // 立即从头开始，只等待 500ms 避免太激进
-    if (reconnectTimer) clearTimeout(reconnectTimer)
-    reconnectTimer = setTimeout(() => connect(0, true), 500)
+// ========== 消息监听 ==========
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // 判断消息来源
+  const senderUrl = sender.url || ''
+  const isFromOffscreen = senderUrl.includes('offscreen.html')
+  const isFromBackground = !sender.url // background 发的消息没有 url
+
+  // background 自己发出的消息不处理（避免循环）
+  if (isFromBackground) {
     return
   }
-  
-  // 新一轮扫描开始的提示
-  if (portIndex === 0 && isNewRound) {
-    log(`🔄 开始第 ${scanRound + 1} 轮端口扫描 (${CONFIG.basePort}-${CONFIG.basePort + CONFIG.maxPortRetries - 1})`)
+
+  // 主动推送状态给 popup
+function broadcastStatus() {
+  let status
+  if (!state.enabled) {
+    status = 'disconnected'
+  } else if (state.connected) {
+    status = 'connected'
+  } else if (state.scanRound >= 2) {
+    status = 'not_found'
+  } else {
+    status = 'scanning'
   }
-  
-  const port = CONFIG.basePort + portIndex
-  currentPortIndex = portIndex
-  
-  const url = new URL(`ws://localhost:${port}`)
-  if (CONFIG.token) url.searchParams.set("token", CONFIG.token)
-  
-  // 只在第一轮或成功连接时打印详细日志，避免刷屏
-  if (scanRound === 0 || portIndex === 0) {
-    log(`尝试连接端口 ${port}...`)
-  }
-  connectionPhase = 'scanning'
-  ws = new WebSocket(url.toString())
-  setBadgeState("connecting")
-  
-  // 设置连接超时（1秒，加快扫描速度）
-  const connectionTimeout = setTimeout(() => {
-    if (ws && ws.readyState === WebSocket.CONNECTING) {
-      ws.close()
+  chrome.runtime.sendMessage({
+    type: 'statusUpdate',
+    state: {
+      status,
+      enabled: state.enabled,
+      port: state.port,
+      currentPort: state.currentPort,
+      basePort: CONFIG.basePort,
+      scanRound: state.scanRound,
     }
-  }, 1000)
-  
-  // 身份验证超时（连接后 2 秒内必须收到正确的 identity 消息）
-  let identityVerified = false
-  let identityTimeout = null
-  
-  ws.onopen = () => {
-    clearTimeout(connectionTimeout)
-    // 不立即标记为成功，等待身份验证
-    connectionPhase = 'verifying'
-    log(`🔗 WebSocket 已连接端口 ${port}，等待身份验证...`)
-    
-    // 设置身份验证超时
-    identityTimeout = setTimeout(() => {
-      if (!identityVerified) {
-        log(`❌ 端口 ${port} 身份验证超时，可能不是 ghost-bridge 服务`)
-        connectionPhase = 'scanning'
-        ws.close()
-        // 超时后主动扫描下一个端口
-        if (state.enabled) {
-          setTimeout(() => connect(portIndex + 1), 50)
-        }
-      }
-    }, 2000)
-  }
-  ws.onmessage = (event) => {
-    try {
-      const msg = JSON.parse(event.data)
-      
-      // 处理身份验证消息
-      if (msg.type === "identity") {
-        clearTimeout(identityTimeout)
-        
-        if (msg.service === "ghost-bridge" && msg.token === CONFIG.token) {
-          identityVerified = true
-          wasConnected = true
-          lastSuccessPort = port
-          scanRound = 0
-          connectionPhase = 'connected'
-          log(`✅ 身份验证成功，已连接到 ghost-bridge 服务 (端口 ${port})`)
-          setBadgeState("on")
-          // 自动附加当前活动标签，确保能立即捕获异常/console
-          ensureAttached().catch((e) => log(`attach 失败：${e.message}`))
-        } else {
-          log(`❌ 端口 ${port} 身份验证失败 (service: ${msg.service}, token 匹配: ${msg.token === CONFIG.token})`)
-          connectionPhase = 'scanning'
-          ws.close()
-          // 立即尝试下一个端口
-          if (state.enabled) {
-            setTimeout(() => connect(portIndex + 1), 50)
-          }
-        }
-        return
-      }
-      
-      // 只有验证通过后才处理其他命令
-      if (identityVerified) {
-        handleCommand(msg)
-      }
-    } catch (e) {
-      log(`解析消息失败：${e.message}`)
-    }
-  }
-  ws.onclose = (event) => {
-    clearTimeout(connectionTimeout)
-    clearTimeout(identityTimeout)
-    
-    // 如果是连接阶段就失败了（还没成功连接过），立即尝试下一个端口
-    if (!wasConnected && event.code === 1006) {
-      if (state.enabled) {
-        // 立即尝试下一个端口，不等待
-        setTimeout(() => connect(portIndex + 1), 50)
-      }
-      return
-    }
-    
-    // 身份验证失败导致的关闭，不重置 wasConnected（让上面的逻辑处理下一个端口）
-    if (!identityVerified && wasConnected === false) {
-      return
-    }
-    
-    // 曾经连接成功后断开
-    wasConnected = false
-    scanRound = 0
-    connectionPhase = 'scanning'
-    log("⚠️ WebSocket 断开，立即重试...")
-    setBadgeState("off")
-    if (reconnectTimer) clearTimeout(reconnectTimer)
-    
-    if (state.enabled) {
-      // 如果有上次成功的端口，优先尝试那个端口
-      const startIndex = lastSuccessPort 
-        ? lastSuccessPort - CONFIG.basePort 
-        : 0
-      // 断开后立即重试，不等待
-      reconnectTimer = setTimeout(() => connect(startIndex), 100)
-    } else {
-      connectionPhase = 'idle'
-    }
-  }
-  ws.onerror = (err) => {
-    clearTimeout(connectionTimeout)
-    clearTimeout(identityTimeout)
-    // 错误不打印，避免刷屏，让 onclose 处理
-  }
+  }).catch(() => {}) // popup 可能未打开，忽略错误
 }
 
-// 移除 action.onClicked（有 popup 时不会触发）
+// 来自 offscreen 的状态更新
+  if (message.type === 'status' && isFromOffscreen) {
+    if (message.status === 'connected') {
+      state.connected = true
+      state.port = message.port
+      setBadgeState('on')
+      log(`✅ 已连接到 ghost-bridge 服务 (端口 ${message.port})`)
+      ensureAttached().catch((e) => log(`attach 失败：${e.message}`))
+    } else if (message.status === 'disconnected') {
+      state.connected = false
+      state.port = null
+      if (state.enabled) setBadgeState('connecting')
+    } else if (message.status === 'scanning') {
+      state.currentPort = message.currentPort
+      setBadgeState('connecting')
+    } else if (message.status === 'not_found') {
+      state.scanRound++
+      setBadgeState('connecting')
+    }
+    broadcastStatus() // 状态变化时主动推送
+    return
+  }
 
-// 消息监听器：供 popup 获取状态和控制
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // 来自 offscreen 的日志
+  if (message.type === 'log' && isFromOffscreen) {
+    console.log(`[offscreen] ${message.msg}`)
+    return
+  }
+
+  // 来自 offscreen 的命令（从服务器转发）
+  if (message.type === 'command' && isFromOffscreen) {
+    handleCommand(message.data)
+    return
+  }
+
+  // send 消息是 background 发给 offscreen 的，这里不处理
+  if (message.type === 'send') {
+    return
+  }
+
+  // 来自 popup 的状态查询
   if (message.type === 'getStatus') {
-    // 返回当前状态，使用 connectionPhase 提供更准确的状态
     let status
     if (!state.enabled) {
       status = 'disconnected'
-    } else if (connectionPhase === 'connected' && ws && ws.readyState === WebSocket.OPEN) {
+    } else if (state.connected) {
       status = 'connected'
-    } else if (connectionPhase === 'verifying') {
-      status = 'verifying'
-    } else if (connectionPhase === 'scanning' || connectionPhase === 'idle') {
-      // 如果扫描多轮仍未找到，显示 not_found
-      status = scanRound >= 2 ? 'not_found' : 'scanning'
+    } else if (state.scanRound >= 2) {
+      status = 'not_found'
     } else {
-      status = 'disconnected'
+      status = 'scanning'
     }
-    
-    // 计算当前正在扫描的端口
-    const currentPort = CONFIG.basePort + currentPortIndex
-    
     sendResponse({
       status,
       enabled: state.enabled,
-      port: lastSuccessPort,
-      currentPort,
+      port: state.port,
+      currentPort: state.currentPort,
       basePort: CONFIG.basePort,
-      scanRound,
+      scanRound: state.scanRound,
     })
     return true
   }
-  
-  if (message.type === 'connect') {
-    // 先关闭现有连接
-    if (reconnectTimer) clearTimeout(reconnectTimer)
-    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-      ws.close()
-    }
 
-    // 如果指定了端口，直接连接该端口（不扫描）
+  // 来自 popup 的连接请求
+  if (message.type === 'connect') {
     if (message.port) {
       CONFIG.basePort = message.port
       chrome.storage.local.set({ basePort: message.port })
-      state.enabled = true
-      scanRound = 0
-      connectionPhase = 'scanning'
-      // 直接连接指定端口，maxPortRetries 设为 1 表示只尝试这一个端口
-      connectDirect(message.port)
-    } else {
-      // 没有指定端口，从 basePort 开始扫描
-      state.enabled = true
-      scanRound = 0
-      connectionPhase = 'scanning'
-      connect(0, true)
     }
+    state.enabled = true
+    state.scanRound = 0
+    setBadgeState('connecting')
+
+    // 启动 offscreen 并开始连接
+    setupOffscreenDocument().then(() => {
+      chrome.runtime.sendMessage({
+        type: 'connect',
+        basePort: CONFIG.basePort,
+        token: CONFIG.token,
+        maxPortRetries: CONFIG.maxPortRetries,
+      }).catch(() => {})
+    })
 
     sendResponse({ ok: true })
     return true
   }
-  
+
+  // 来自 popup 的断开请求
   if (message.type === 'disconnect') {
     state.enabled = false
-    scanRound = 0
-    connectionPhase = 'idle'
-    if (reconnectTimer) clearTimeout(reconnectTimer)
-    if (ws && ws.readyState === WebSocket.OPEN) ws.close()
-    detachAllTargets().catch(() => {})
+    state.connected = false
+    state.scanRound = 0
     setBadgeState('off')
+    detachAllTargets().catch(() => {})
+
+    // 通知 offscreen 断开
+    chrome.runtime.sendMessage({ type: 'disconnect' }).catch(() => {})
+
     sendResponse({ ok: true })
     return true
   }
-  
+
   return false
 })
 
@@ -1023,8 +951,6 @@ chrome.storage.local.get(['basePort'], (result) => {
   }
 })
 
-// 默认暂停：设置徽章为 OFF
+// 默认暂停
 setBadgeState("off")
-
-// 不自动连接，等待用户在 popup 中点击"启用连接"
-// connect()
+log("Ghost Bridge background 已加载")

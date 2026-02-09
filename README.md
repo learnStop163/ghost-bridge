@@ -6,43 +6,42 @@
 - `server.js`：MCP server，通过 stdio 被 Claude CLI 拉起，与扩展用 WebSocket 通信
 - `extension/`：Chrome MV3 扩展，使用 `chrome.debugger` 附加当前激活标签
 
-## 快速使用（本地）
-1. （可选）一键安装
-   ```bash
-   chmod +x install.sh
-   ./install.sh
-   ```
-   > 已包含依赖安装 + Claude MCP 注册
+# Ghost Bridge（Claude MCP 无重启调试桥）
 
-2. 手动安装（如不使用脚本）
-   - 安装依赖
-   ```bash
-   cd ghost-bridge
-   npm install
-   ```
+> 目标：在日常 Chrome 内零启动参数附加 DevTools，面向线上压缩代码（无 sourcemap）快速定位。
 
-3. 在 Chrome 打开 `chrome://extensions`，开启“开发者模式”，选择“加载已解压的扩展程序”，指向 `ghost-bridge/extension`
-4. 将工具注册到 Claude CLI（示例，脚本已做）
-   ```bash
-   claude mcp add ghost-bridge -- node /绝对路径/ghost-bridge/server.js
-   ```
-   或者在 Claude 的 MCP 配置中手动添加：
-   ```json
-   "ghost-bridge": {
-     "command": "node",
-     "args": [
-       "/绝对路径/ghost-bridge/server.js"
-     ]
-   }
-   ```
-5. 点击扩展图标切换为 ON（默认 OFF）
-6. 保持 Chrome 打开，终端运行 `claude`，直接调用工具，例如：
-   - `get_last_error`：拿最近异常 / console / 网络失败
-   - `get_script_source`：按 URL 片段抓压缩脚本并返回定位片段（可 beautify）
-   - `find_by_string`：在脚本内搜索字符串，返回上下文
-   - `coverage_snapshot`：抓一次执行覆盖率，排前 20 热脚本
-   - `list_network_requests`：列出捕获的网络请求，支持过滤
-   - `get_network_detail`：获取请求详情，包括响应体
+## 快速使用
+
+### 1. 安装與初始化
+
+```bash
+# 全局安装
+npm install -g ghost-bridge
+
+# 自动配置 Claude MCP 并准备扩展
+ghost-bridge init
+```
+
+### 2. 加载 Chrome 扩展
+
+1. 打开 Chrome，访问 `chrome://extensions`
+2. 开启右上角的“开发者模式”
+3. 点击“加载已解压的扩展程序”
+4. 选择目录：`~/.ghost-bridge/extension`
+   > 提示：运行 `ghost-bridge extension --open` 可直接打开该目录
+
+### 3. 开始使用
+
+启动 Claude Desktop 或 Claude CLI，Ghost Bridge 工具即可直接通过 MCP 调用。无需额外启动任何服务（MCP 会自动管理）。
+
+---
+
+## 常用命令
+
+- `ghost-bridge init`: 配置 MCP 并复制扩展文件
+- `ghost-bridge status`: 检查配置状态
+- `ghost-bridge extension`: 显示扩展安装路径
+- `ghost-bridge start`: 手动启动 MCP 服务（通常不需要）
 
 ## 默认配置
 - 端口：`3301`（`server.js` / `extension/background.js`）

@@ -184,10 +184,11 @@ if (wss) {
     const role = url.searchParams.get("role") || ""
 
     if (WS_TOKEN && token !== WS_TOKEN) {
-      log("拒绝连接：token 不匹配")
+      log(`拒绝连接：token 不匹配 (收到: ${token}, 期望: ${WS_TOKEN})`)
       ws.close(1008, "Bad token")
       return
     }
+    log(`连接验证通过 (token: ${token})`)
 
     if (role === "mcp-client") {
       // 其他 MCP 实例的连接
@@ -281,6 +282,11 @@ if (wss) {
   connectToMainInstance()
 }
 
+const MAX_RECONNECT_ATTEMPTS = 10  // 最大重连次数
+const RECONNECT_INTERVAL = 3000    // 重连间隔 (ms)
+let reconnectAttempts = 0
+let wasEverConnected = false  // 是否曾经成功连接过
+
 /**
  * 连接到主实例的 WebSocket 服务器
  */
@@ -293,6 +299,8 @@ function connectToMainInstance() {
 
   ws.on("open", () => {
     log(`✅ 已连接到主实例 (端口 ${actualPort})`)
+    reconnectAttempts = 0  // 重置重连计数
+    wasEverConnected = true
   })
 
   ws.on("message", (data) => {
@@ -313,17 +321,32 @@ function connectToMainInstance() {
     log("⚠️ 与主实例的连接已断开")
     activeConnection = null
     failAllPending("与主实例的连接已断开")
-    // 尝试重连
+
+    // 尝试重连，但限制次数
+    reconnectAttempts++
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      log(`❌ 重连失败次数过多 (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})，客户端进程退出`)
+      process.exit(0)
+    }
+
     setTimeout(() => {
       if (!activeConnection) {
-        log("🔄 尝试重新连接到主实例...")
+        log(`🔄 尝试重新连接到主实例... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`)
         connectToMainInstance()
       }
-    }, 3000)
+    }, RECONNECT_INTERVAL)
   })
 
   ws.on("error", (err) => {
     log(`❌ 连接主实例失败: ${err.message}`)
+    // 如果从未成功连接过，增加重连计数
+    if (!wasEverConnected) {
+      reconnectAttempts++
+      if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        log(`❌ 无法连接到主实例，客户端进程退出`)
+        process.exit(0)
+      }
+    }
   })
 }
 
@@ -550,6 +573,77 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: "清空已捕获的网络请求记录",
       inputSchema: { type: "object", properties: {} },
     },
+    {
+      name: "capture_screenshot",
+      description:
+        "【推荐用于视觉分析】截取当前页面的截图，返回 base64 图片。" +
+        "适用于：1) 查看页面实际视觉效果 2) 排查 UI/样式/布局/颜色问题 " +
+        "3) 验证页面渲染 4) 分析元素位置和间距 5) 查看图片/图标等视觉内容。" +
+        "当需要看到页面「长什么样」时使用此工具。" +
+        "如仅需文本/链接等信息，建议使用更快的 get_page_content。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          format: {
+            type: "string",
+            enum: ["png", "jpeg"],
+            description: "图片格式，默认 png（无损），jpeg 更小"
+          },
+          quality: {
+            type: "number",
+            description: "JPEG 质量 (0-100)，仅当 format 为 jpeg 时有效，建议 80"
+          },
+          fullPage: {
+            type: "boolean",
+            description: "是否截取完整页面长截图（包括滚动区域），默认 false 只截取可见区域。用于查看整个页面内容时设为 true"
+          },
+          clip: {
+            type: "object",
+            description: "指定截取区域（像素）",
+            properties: {
+              x: { type: "number", description: "左上角 X 坐标" },
+              y: { type: "number", description: "左上角 Y 坐标" },
+              width: { type: "number", description: "宽度" },
+              height: { type: "number", description: "高度" },
+            },
+          },
+        },
+      },
+    },
+    {
+      name: "get_page_content",
+      description:
+        "【推荐用于快速获取页面内容】提取当前页面的文本、HTML 或结构化数据。" +
+        "比 capture_screenshot 更快更轻量，适用于：" +
+        "1) 获取页面文字内容 2) 提取链接/按钮/表单等元素 " +
+        "3) 分析 DOM 结构 4) 获取页面元数据（title/description）。" +
+        "当需要文本信息而非视觉效果时，优先使用此工具。" +
+        "注意：不支持 iframe 内容，不反映 CSS 样式。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          mode: {
+            type: "string",
+            enum: ["text", "html", "structured"],
+            description:
+              "提取模式：text=纯文本（默认，最快）; html=HTML片段; structured=结构化数据（标题/链接/按钮/表单/图片）",
+          },
+          selector: {
+            type: "string",
+            description:
+              "CSS 选择器，限定提取范围。如 'main'、'#content'、'.article'。不指定则提取整个 body",
+          },
+          maxLength: {
+            type: "number",
+            description: "最大返回长度（字符数），默认 50000。仅对 text/html 模式有效",
+          },
+          includeMetadata: {
+            type: "boolean",
+            description: "是否包含页面元数据（title/url/description），默认 true",
+          },
+        },
+      },
+    },
   ],
 }))
 
@@ -678,6 +772,56 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: jsonText(res) }] }
     }
 
+    if (name === "capture_screenshot") {
+      const { format, quality, fullPage, clip } = args
+      // 截图可能需要更长时间（特别是完整页面截图）
+      const res = await askChrome("captureScreenshot", { format, quality, fullPage, clip }, { timeoutMs: 15000 })
+      
+      // 返回图片内容（MCP 支持 image 类型）
+      const contents = []
+      
+      // 添加图片数据
+      if (res.imageData) {
+        contents.push({
+          type: "image",
+          data: res.imageData,
+          mimeType: res.format === "jpeg" ? "image/jpeg" : "image/png",
+        })
+      }
+      
+      // 添加元数据文本
+      const metadata = {
+        format: res.format,
+        fullPage: res.fullPage,
+        width: res.width,
+        height: res.height,
+        ...(res.note ? { note: res.note } : {}),
+      }
+      contents.push({
+        type: "text",
+        text: jsonText(metadata),
+      })
+      
+      return { content: contents }
+    }
+
+    if (name === "get_page_content") {
+      const { mode = "text", selector, maxLength = 50000, includeMetadata = true } = args
+
+      const validModes = ["text", "html", "structured"]
+      if (mode && !validModes.includes(mode)) {
+        return {
+          content: [{
+            type: "text",
+            text: `Error: 无效的 mode "${mode}"，可选值: ${validModes.join(", ")}`
+          }]
+        }
+      }
+
+      const res = await askChrome("getPageContent", { mode, selector, maxLength, includeMetadata })
+      return { content: [{ type: "text", text: jsonText(res) }] }
+    }
+
     return { content: [{ type: "text", text: `未知工具：${name}` }] }
   } catch (e) {
     return { content: [{ type: "text", text: `Error: ${e.message}` }] }
@@ -689,9 +833,43 @@ await server.connect(transport)
 
 // 启动完成日志
 const roleText = isMainInstance ? "主实例" : "客户端"
-log(`✅ MCP server 已启动 | 角色: ${roleText} | 端口: ${actualPort} | PID: ${process.pid}`)
+log(`✅ MCP server 已启动 | 角色: ${roleText} | 端口: ${actualPort} | PID: ${process.pid} | PPID: ${process.ppid}`)
 log(`📄 端口信息文件: ${PORT_INFO_FILE}`)
 log(`💡 使用 get_server_info 工具查看详细状态`)
+
+// ========== 孤儿进程检测与自动退出 ==========
+const PARENT_CHECK_INTERVAL = 5000  // 每 5 秒检查一次父进程
+const parentPid = process.ppid
+
+// 方法 1: 监听 stdin 关闭（父进程退出时 stdin 会关闭）
+process.stdin.on("end", () => {
+  log("⚠️ stdin 已关闭，父进程可能已退出，正在退出...")
+  cleanup()
+  process.exit(0)
+})
+
+process.stdin.on("close", () => {
+  log("⚠️ stdin 已关闭，正在退出...")
+  cleanup()
+  process.exit(0)
+})
+
+// 方法 2: 定期检查父进程是否还存活
+const parentCheckTimer = setInterval(() => {
+  try {
+    // process.kill(pid, 0) 不会杀死进程，只检查进程是否存在
+    process.kill(parentPid, 0)
+  } catch (e) {
+    // 父进程不存在了
+    log(`⚠️ 父进程 (PID: ${parentPid}) 已不存在，正在退出...`)
+    clearInterval(parentCheckTimer)
+    cleanup()
+    process.exit(0)
+  }
+}, PARENT_CHECK_INTERVAL)
+
+// 确保定时器不阻止进程退出
+parentCheckTimer.unref()
 
 // ========== 进程退出清理 ==========
 function cleanup() {
