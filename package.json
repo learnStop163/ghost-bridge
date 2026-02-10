@@ -1,6 +1,6 @@
 {
   "name": "ghost-bridge",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": false,
   "type": "module",
   "description": "Ghost Bridge: Zero-restart Chrome debugger bridge for Claude MCP. Includes CLI for easy setup.",

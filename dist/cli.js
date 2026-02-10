@@ -5474,7 +5474,7 @@ function getServerPath() {
   return path.resolve(currentDir, "../dist/server.js");
 }
 function getUserExtensionDir() {
-  return path.join(os2.homedir(), ".ghost-bridge", "extension");
+  return path.join(os2.homedir(), "ghost-bridge", "extension");
 }
 var init_utils = __esm({
   "lib/utils.js"() {
@@ -5487,6 +5487,18 @@ __export(init_exports, {
   init: () => init
 });
 import path2 from "path";
+import { exec } from "child_process";
+import os3 from "os";
+function openFolder(folderPath) {
+  const platform = os3.platform();
+  let command = "";
+  if (platform === "darwin") command = `open "${folderPath}"`;
+  else if (platform === "win32") command = `start "" "${folderPath}"`;
+  else command = `xdg-open "${folderPath}"`;
+  exec(command, (err) => {
+    if (err) console.error(source_default.dim("Failed to open folder:", err.message));
+  });
+}
 async function init(options) {
   console.log(source_default.bold("\u{1F47B} Ghost Bridge Initialization"));
   const configPath = getClaudeConfigPath();
@@ -5539,6 +5551,8 @@ async function init(options) {
   console.log(`4. Select the folder: ${source_default.bold(targetExt)}`);
   if (!isDryRun) {
     await import_fs_extra.default.outputFile(path2.join(targetExt, ".ghost-bridge-managed"), "This folder is managed by ghost-bridge CLI. Do not edit manually.");
+    console.log(source_default.dim("\n\u{1F4C2} Opening extension folder..."));
+    openFolder(targetExt);
   }
 }
 var import_fs_extra;
@@ -5555,15 +5569,15 @@ var extension_exports = {};
 __export(extension_exports, {
   showExtension: () => showExtension
 });
-import { exec } from "child_process";
-import os3 from "os";
-function openFolder(path4) {
-  const platform = os3.platform();
+import { exec as exec2 } from "child_process";
+import os4 from "os";
+function openFolder2(path4) {
+  const platform = os4.platform();
   let command = "";
   if (platform === "darwin") command = `open "${path4}"`;
   else if (platform === "win32") command = `start "" "${path4}"`;
   else command = `xdg-open "${path4}"`;
-  exec(command, (err) => {
+  exec2(command, (err) => {
     if (err) console.error("Failed to open folder:", err);
   });
 }
@@ -5583,7 +5597,7 @@ async function showExtension(options) {
   console.log('3. Click "Load unpacked" and select the directory above.');
   if (options.open) {
     console.log(source_default.dim("Opening folder..."));
-    openFolder(extDir);
+    openFolder2(extDir);
   }
 }
 var import_fs_extra2;
