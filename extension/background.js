@@ -801,20 +801,9 @@ function sendToServer(data) {
   chrome.runtime.sendMessage({ type: 'send', data }).catch(() => {})
 }
 
-// ========== 消息监听 ==========
+// ========== 状态广播 ==========
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // 判断消息来源
-  const senderUrl = sender.url || ''
-  const isFromOffscreen = senderUrl.includes('offscreen.html')
-  const isFromBackground = !sender.url // background 发的消息没有 url
-
-  // background 自己发出的消息不处理（避免循环）
-  if (isFromBackground) {
-    return
-  }
-
-  // 主动推送状态给 popup
+// 主动推送状态给 popup
 function broadcastStatus() {
   let status
   if (!state.enabled) {
@@ -839,7 +828,20 @@ function broadcastStatus() {
   }).catch(() => {}) // popup 可能未打开，忽略错误
 }
 
-// 来自 offscreen 的状态更新
+// ========== 消息监听 ==========
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // 判断消息来源
+  const senderUrl = sender.url || ''
+  const isFromOffscreen = senderUrl.includes('offscreen.html')
+  const isFromBackground = !sender.url // background 发的消息没有 url
+
+  // background 自己发出的消息不处理（避免循环）
+  if (isFromBackground) {
+    return
+  }
+
+  // 来自 offscreen 的状态更新
   if (message.type === 'status' && isFromOffscreen) {
     if (message.status === 'connected') {
       state.connected = true

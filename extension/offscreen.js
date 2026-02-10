@@ -3,6 +3,7 @@
 
 let ws = null
 let reconnectTimer = null
+let manualDisconnect = false  // 用户主动断开标志，防止 onclose 触发重连
 let config = {
   basePort: 33333,
   token: '',
@@ -23,6 +24,9 @@ function getMonthlyToken() {
 
 // 连接到服务器
 function connect(portIndex = 0, isNewRound = false) {
+  // 如果已手动断开，不再尝试连接
+  if (manualDisconnect) return
+
   if (portIndex >= config.maxPortRetries) {
     log(`扫描完毕，未找到服务，2秒后重试...`)
     reconnectTimer = setTimeout(() => connect(0, true), 2000)
@@ -99,6 +103,9 @@ function connect(portIndex = 0, isNewRound = false) {
   ws.onclose = (event) => {
     clearTimeout(connectionTimeout)
 
+    // 用户主动断开，不重连
+    if (manualDisconnect) return
+
     if (!identityVerified) {
       // 连接失败，尝试下一个端口
       setTimeout(() => connect(portIndex + 1), 50)
@@ -127,6 +134,7 @@ function sendToServer(data) {
 
 // 断开连接
 function disconnect() {
+  manualDisconnect = true  // 标记为手动断开，阻止 onclose 重连
   if (reconnectTimer) {
     clearTimeout(reconnectTimer)
     reconnectTimer = null
@@ -145,6 +153,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     config.token = message.token || getMonthlyToken()
     config.maxPortRetries = message.maxPortRetries || 10
     disconnect()
+    manualDisconnect = false  // 用户重新连接，清除断开标志
     connect(0, true)
     sendResponse({ ok: true })
     return true
