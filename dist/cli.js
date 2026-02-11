@@ -5453,12 +5453,13 @@ var require_lib = __commonJS({
 // lib/utils.js
 import path from "path";
 import os2 from "os";
+import { fileURLToPath } from "url";
 function getClaudeConfigPath() {
   const homeDir = os2.homedir();
   return path.join(homeDir, ".claude.json");
 }
 function getExtensionPath() {
-  const __filename2 = new URL(import.meta.url).pathname;
+  const __filename2 = fileURLToPath(import.meta.url);
   const currentDir = path.dirname(__filename2);
   if (currentDir.endsWith("/dist") || currentDir.endsWith("\\dist")) {
     return path.resolve(currentDir, "../extension");
@@ -5466,7 +5467,7 @@ function getExtensionPath() {
   return path.resolve(currentDir, "../extension");
 }
 function getServerPath() {
-  const __filename2 = new URL(import.meta.url).pathname;
+  const __filename2 = fileURLToPath(import.meta.url);
   const currentDir = path.dirname(__filename2);
   if (currentDir.endsWith("/dist") || currentDir.endsWith("\\dist")) {
     return path.resolve(currentDir, "server.js");
@@ -5679,10 +5680,10 @@ var {
 
 // bin/ghost-bridge.js
 init_source();
-import { fileURLToPath } from "url";
+import { fileURLToPath as fileURLToPath2 } from "url";
 import path3 from "path";
 import fs4 from "fs";
-var __filename = fileURLToPath(import.meta.url);
+var __filename = fileURLToPath2(import.meta.url);
 var __dirname = path3.dirname(__filename);
 var packageJsonParams = JSON.parse(
   fs4.readFileSync(path3.join(__dirname, "../package.json"), "utf-8")
