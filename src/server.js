@@ -470,7 +470,7 @@ function buildSnippet(source, line, column, { beautifyEnabled = true, contextLin
 }
 
 const server = new Server(
-  { name: "ghost-bridge", version: "0.1.0" },
+  { name: "ghost-bridge", version: "0.3.0" },
   { capabilities: { tools: {} } }
 )
 
@@ -574,6 +574,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: { type: "object", properties: {} },
     },
     {
+      name: "perf_metrics",
+      description:
+        "获取页面性能指标：包含引擎级指标（JS堆内存、DOM节点数、Layout次数、脚本执行时间）、" +
+        "Web Vitals（FCP、TTFB、DOMContentLoaded、Long Tasks）和资源加载摘要。" +
+        "用于诊断页面卡顿、内存占用过高、加载缓慢等性能问题。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          includeTimings: {
+            type: "boolean",
+            description: "是否包含 Navigation Timing 和 Web Vitals，默认 true",
+          },
+          includeResources: {
+            type: "boolean",
+            description: "是否包含资源加载摘要（按类型统计、最慢资源），默认 true",
+          },
+        },
+      },
+    },
+    {
       name: "capture_screenshot",
       description:
         "【推荐用于视觉分析】截取当前页面的截图，返回 base64 图片。" +
@@ -675,7 +695,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             type: "text",
             text: jsonText({
               service: "ghost-bridge",
-              version: "0.1.0",
+              version: "0.3.0",
               role: isMainInstance ? "主实例 (WebSocket Server)" : "客户端 (连接到主实例)",
               wsPort: actualPort,
               wsUrl: `ws://localhost:${actualPort}`,
@@ -769,6 +789,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (name === "clear_network_requests") {
       const res = await askChrome("clearNetworkRequests")
+      return { content: [{ type: "text", text: jsonText(res) }] }
+    }
+
+    if (name === "perf_metrics") {
+      const { includeTimings, includeResources } = args
+      const res = await askChrome("perfMetrics", { includeTimings, includeResources })
       return { content: [{ type: "text", text: jsonText(res) }] }
     }
 

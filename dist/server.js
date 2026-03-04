@@ -28896,7 +28896,7 @@ function buildSnippet(source, line, column, { beautifyEnabled = true, contextLin
   return result;
 }
 var server = new Server(
-  { name: "ghost-bridge", version: "0.1.0" },
+  { name: "ghost-bridge", version: "0.3.0" },
   { capabilities: { tools: {} } }
 );
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -28994,6 +28994,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: { type: "object", properties: {} }
     },
     {
+      name: "perf_metrics",
+      description: "\u83B7\u53D6\u9875\u9762\u6027\u80FD\u6307\u6807\uFF1A\u5305\u542B\u5F15\u64CE\u7EA7\u6307\u6807\uFF08JS\u5806\u5185\u5B58\u3001DOM\u8282\u70B9\u6570\u3001Layout\u6B21\u6570\u3001\u811A\u672C\u6267\u884C\u65F6\u95F4\uFF09\u3001Web Vitals\uFF08FCP\u3001TTFB\u3001DOMContentLoaded\u3001Long Tasks\uFF09\u548C\u8D44\u6E90\u52A0\u8F7D\u6458\u8981\u3002\u7528\u4E8E\u8BCA\u65AD\u9875\u9762\u5361\u987F\u3001\u5185\u5B58\u5360\u7528\u8FC7\u9AD8\u3001\u52A0\u8F7D\u7F13\u6162\u7B49\u6027\u80FD\u95EE\u9898\u3002",
+      inputSchema: {
+        type: "object",
+        properties: {
+          includeTimings: {
+            type: "boolean",
+            description: "\u662F\u5426\u5305\u542B Navigation Timing \u548C Web Vitals\uFF0C\u9ED8\u8BA4 true"
+          },
+          includeResources: {
+            type: "boolean",
+            description: "\u662F\u5426\u5305\u542B\u8D44\u6E90\u52A0\u8F7D\u6458\u8981\uFF08\u6309\u7C7B\u578B\u7EDF\u8BA1\u3001\u6700\u6162\u8D44\u6E90\uFF09\uFF0C\u9ED8\u8BA4 true"
+          }
+        }
+      }
+    },
+    {
       name: "capture_screenshot",
       description: "\u3010\u63A8\u8350\u7528\u4E8E\u89C6\u89C9\u5206\u6790\u3011\u622A\u53D6\u5F53\u524D\u9875\u9762\u7684\u622A\u56FE\uFF0C\u8FD4\u56DE base64 \u56FE\u7247\u3002\u9002\u7528\u4E8E\uFF1A1) \u67E5\u770B\u9875\u9762\u5B9E\u9645\u89C6\u89C9\u6548\u679C 2) \u6392\u67E5 UI/\u6837\u5F0F/\u5E03\u5C40/\u989C\u8272\u95EE\u9898 3) \u9A8C\u8BC1\u9875\u9762\u6E32\u67D3 4) \u5206\u6790\u5143\u7D20\u4F4D\u7F6E\u548C\u95F4\u8DDD 5) \u67E5\u770B\u56FE\u7247/\u56FE\u6807\u7B49\u89C6\u89C9\u5185\u5BB9\u3002\u5F53\u9700\u8981\u770B\u5230\u9875\u9762\u300C\u957F\u4EC0\u4E48\u6837\u300D\u65F6\u4F7F\u7528\u6B64\u5DE5\u5177\u3002\u5982\u4EC5\u9700\u6587\u672C/\u94FE\u63A5\u7B49\u4FE1\u606F\uFF0C\u5EFA\u8BAE\u4F7F\u7528\u66F4\u5FEB\u7684 get_page_content\u3002",
       inputSchema: {
@@ -29078,7 +29095,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             type: "text",
             text: jsonText({
               service: "ghost-bridge",
-              version: "0.1.0",
+              version: "0.3.0",
               role: isMainInstance ? "\u4E3B\u5B9E\u4F8B (WebSocket Server)" : "\u5BA2\u6237\u7AEF (\u8FDE\u63A5\u5230\u4E3B\u5B9E\u4F8B)",
               wsPort: actualPort,
               wsUrl: `ws://localhost:${actualPort}`,
@@ -29161,6 +29178,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     if (name === "clear_network_requests") {
       const res = await askChrome("clearNetworkRequests");
+      return { content: [{ type: "text", text: jsonText(res) }] };
+    }
+    if (name === "perf_metrics") {
+      const { includeTimings, includeResources } = args;
+      const res = await askChrome("perfMetrics", { includeTimings, includeResources });
       return { content: [{ type: "text", text: jsonText(res) }] };
     }
     if (name === "capture_screenshot") {
