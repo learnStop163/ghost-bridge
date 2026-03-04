@@ -590,6 +590,157 @@ async function handleClearNetworkRequests() {
   return { cleared: count }
 }
 
+async function handlePerfMetrics(params = {}) {
+  const target = await ensureAttached()
+  const { includeResources = true, includeTimings = true } = params
+
+  // 1. CDP Performance.getMetrics — 底层引擎指标
+  await chrome.debugger.sendCommand(target, "Performance.enable")
+  const { metrics } = await chrome.debugger.sendCommand(target, "Performance.getMetrics")
+  await chrome.debugger.sendCommand(target, "Performance.disable")
+
+  // 整理为可读的分组
+  const metricsMap = {}
+  for (const m of metrics) {
+    metricsMap[m.name] = m.value
+  }
+
+  const engineMetrics = {
+    memory: {
+      jsHeapUsedSize: formatBytes(metricsMap.JSHeapUsedSize),
+      jsHeapTotalSize: formatBytes(metricsMap.JSHeapTotalSize),
+      usagePercent: metricsMap.JSHeapTotalSize
+        ? Math.round((metricsMap.JSHeapUsedSize / metricsMap.JSHeapTotalSize) * 100) + "%"
+        : "N/A",
+    },
+    dom: {
+      nodes: metricsMap.Nodes,
+      documents: metricsMap.Documents,
+      frames: metricsMap.Frames,
+      jsEventListeners: metricsMap.JSEventListeners,
+    },
+    layout: {
+      layoutCount: metricsMap.LayoutCount,
+      recalcStyleCount: metricsMap.RecalcStyleCount,
+      layoutDuration: roundMs(metricsMap.LayoutDuration),
+      recalcStyleDuration: roundMs(metricsMap.RecalcStyleDuration),
+    },
+    tasks: {
+      scriptDuration: roundMs(metricsMap.ScriptDuration),
+      taskDuration: roundMs(metricsMap.TaskDuration),
+      taskOtherDuration: roundMs(metricsMap.TaskOtherDuration),
+    },
+  }
+
+  const result = { engineMetrics }
+
+  // 2. Web Vitals + Navigation Timing（通过 Runtime.evaluate）
+  if (includeTimings) {
+    const expression = `(function() {
+      try {
+        const result = {};
+        // Navigation Timing
+        const nav = performance.getEntriesByType('navigation')[0];
+        if (nav) {
+          result.navigation = {
+            type: nav.type,
+            redirectTime: Math.round(nav.redirectEnd - nav.redirectStart),
+            dnsTime: Math.round(nav.domainLookupEnd - nav.domainLookupStart),
+            connectTime: Math.round(nav.connectEnd - nav.connectStart),
+            ttfb: Math.round(nav.responseStart - nav.requestStart),
+            responseTime: Math.round(nav.responseEnd - nav.responseStart),
+            domInteractive: Math.round(nav.domInteractive),
+            domContentLoaded: Math.round(nav.domContentLoadedEventEnd),
+            loadComplete: Math.round(nav.loadEventEnd),
+            totalDuration: Math.round(nav.duration),
+          };
+        }
+        // Paint Timing (FP, FCP)
+        const paints = performance.getEntriesByType('paint');
+        result.paint = {};
+        for (const p of paints) {
+          if (p.name === 'first-paint') result.paint.firstPaint = Math.round(p.startTime);
+          if (p.name === 'first-contentful-paint') result.paint.firstContentfulPaint = Math.round(p.startTime);
+        }
+        // Long Tasks（如果有 PerformanceObserver 记录）
+        try {
+          const longTasks = performance.getEntriesByType('longtask');
+          if (longTasks && longTasks.length > 0) {
+            result.longTasks = {
+              count: longTasks.length,
+              totalDuration: Math.round(longTasks.reduce((s, t) => s + t.duration, 0)),
+              longest: Math.round(Math.max(...longTasks.map(t => t.duration))),
+            };
+          }
+        } catch(e) {}
+        // 基本信息
+        result.timing = {
+          now: Math.round(performance.now()),
+          timeOrigin: Math.round(performance.timeOrigin),
+        };
+        return result;
+      } catch (e) { return { error: e.message }; }
+    })()`
+    const { result: evalResult } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+      expression,
+      returnByValue: true,
+    })
+    if (evalResult?.value) {
+      result.webVitals = evalResult.value
+    }
+  }
+
+  // 3. 资源加载摘要
+  if (includeResources) {
+    const resExpression = `(function() {
+      try {
+        const entries = performance.getEntriesByType('resource');
+        const byType = {};
+        let totalSize = 0, totalDuration = 0, slowest = null;
+        for (const e of entries) {
+          const type = e.initiatorType || 'other';
+          if (!byType[type]) byType[type] = { count: 0, totalSize: 0, totalDuration: 0 };
+          byType[type].count++;
+          byType[type].totalSize += e.transferSize || 0;
+          byType[type].totalDuration += e.duration || 0;
+          totalSize += e.transferSize || 0;
+          totalDuration += e.duration || 0;
+          if (!slowest || e.duration > slowest.duration) {
+            slowest = { name: e.name.split('/').pop().split('?')[0] || e.name.slice(0, 60), duration: Math.round(e.duration), size: e.transferSize || 0, type };
+          }
+        }
+        // 格式化 byType
+        const summary = {};
+        for (const [type, data] of Object.entries(byType)) {
+          summary[type] = { count: data.count, totalSize: data.totalSize, avgDuration: Math.round(data.totalDuration / data.count) };
+        }
+        return { totalResources: entries.length, totalTransferSize: totalSize, summary, slowest };
+      } catch (e) { return { error: e.message }; }
+    })()`
+    const { result: resResult } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+      expression: resExpression,
+      returnByValue: true,
+    })
+    if (resResult?.value) {
+      result.resources = resResult.value
+    }
+  }
+
+  return result
+}
+
+function formatBytes(bytes) {
+  if (bytes == null) return "N/A"
+  if (bytes < 1024) return bytes + " B"
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB"
+  return (bytes / (1024 * 1024)).toFixed(1) + " MB"
+}
+
+function roundMs(seconds) {
+  if (seconds == null) return "N/A"
+  return Math.round(seconds * 1000) + "ms"
+}
+
 async function handleCaptureScreenshot(params = {}) {
   const target = await ensureAttached()
   const { format = 'png', quality, fullPage = false, clip } = params
@@ -784,6 +935,7 @@ async function handleCommand(message) {
     else if (command === "listNetworkRequests") result = await handleListNetworkRequests(params)
     else if (command === "getNetworkDetail") result = await handleGetNetworkDetail(params)
     else if (command === "clearNetworkRequests") result = await handleClearNetworkRequests()
+    else if (command === "perfMetrics") result = await handlePerfMetrics(params)
     else if (command === "captureScreenshot") result = await handleCaptureScreenshot(params)
     else if (command === "getPageContent") result = await handleGetPageContent(params)
     else throw new Error(`未知指令 ${command}`)
