@@ -28896,7 +28896,7 @@ function buildSnippet(source, line, column, { beautifyEnabled = true, contextLin
   return result;
 }
 var server = new Server(
-  { name: "ghost-bridge", version: "0.3.0" },
+  { name: "ghost-bridge", version: "0.4.0" },
   { capabilities: { tools: {} } }
 );
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -29067,6 +29067,66 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           }
         }
       }
+    },
+    {
+      name: "get_interactive_snapshot",
+      description: "\u3010\u64CD\u4F5C\u9875\u9762\u524D\u5FC5\u987B\u5148\u8C03\u7528\u3011\u626B\u63CF\u5F53\u524D\u9875\u9762\u6240\u6709\u53EF\u89C1\u7684\u53EF\u4EA4\u4E92\u5143\u7D20\uFF08\u6309\u94AE/\u94FE\u63A5/\u8F93\u5165\u6846/\u4E0B\u62C9\u6846\u7B49\uFF09\uFF0C\u8FD4\u56DE\u5E26\u6709 ref \u77ED\u6807\u8BC6\uFF08\u5982 e1, e2, e3\uFF09\u7684\u7CBE\u7B80\u5217\u8868\uFF0C\u5305\u542B\u5143\u7D20\u7C7B\u578B\u3001\u6587\u672C\u548C\u4F4D\u7F6E\u3002Token \u6781\u7701\uFF08\u901A\u5E38 < 1000 tokens\uFF09\uFF0C\u4E13\u4E3A AI \u64CD\u4F5C\u9875\u9762\u800C\u8BBE\u8BA1\u3002\u83B7\u53D6\u540E\u53EF\u901A\u8FC7 dispatch_action \u5DE5\u5177\u4F7F\u7528 ref \u6807\u8BC6\u6765\u70B9\u51FB\u3001\u586B\u5199\u3001\u6309\u952E\u7B49\u3002\u652F\u6301 Shadow DOM \u7A7F\u900F\u3002\n\u26A0\uFE0F \u4EC5\u7528\u4E8E\u4EA4\u4E92\u64CD\u4F5C\u524D\u7684\u5143\u7D20\u5B9A\u4F4D\u3002\u5982\u9700\u6392\u67E5 UI/CSS \u5E03\u5C40\u95EE\u9898\uFF0C\u8BF7\u4F7F\u7528 capture_screenshot \u6216 get_page_content\u3002",
+      inputSchema: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "CSS \u9009\u62E9\u5668\uFF0C\u9650\u5B9A\u626B\u63CF\u8303\u56F4\u3002\u4E0D\u6307\u5B9A\u5219\u626B\u63CF\u6574\u4E2A\u9875\u9762"
+          },
+          includeText: {
+            type: "boolean",
+            description: "\u662F\u5426\u5305\u542B\u5143\u7D20\u7684\u6587\u672C/\u5360\u4F4D\u7B26\u7B49\u4FE1\u606F\uFF0C\u9ED8\u8BA4 true"
+          },
+          maxElements: {
+            type: "number",
+            description: "\u6700\u5927\u8FD4\u56DE\u5143\u7D20\u6570\u91CF\uFF0C\u9ED8\u8BA4 100"
+          }
+        }
+      }
+    },
+    {
+      name: "dispatch_action",
+      description: "\u3010\u64CD\u4F5C\u9875\u9762\u5143\u7D20\u3011\u5BF9 get_interactive_snapshot \u8FD4\u56DE\u7684\u5143\u7D20\u6267\u884C\u52A8\u4F5C\u3002\u901A\u8FC7 ref \u6807\u8BC6\uFF08\u5982 e1, e5\uFF09\u7CBE\u51C6\u5B9A\u4F4D\u5143\u7D20\uFF0C\u4F7F\u7528 CDP \u7269\u7406\u7EA7\u6A21\u62DF\u6267\u884C\u64CD\u4F5C\uFF0C\u517C\u5BB9\u6240\u6709\u524D\u7AEF\u6846\u67B6\uFF08React/Vue/Angular\uFF09\uFF0C\u6210\u529F\u7387\u6781\u9AD8\u3002\n\u652F\u6301\u7684\u52A8\u4F5C\uFF1Aclick\uFF08\u70B9\u51FB\uFF09\u3001fill\uFF08\u586B\u5199\u8F93\u5165\u6846\uFF09\u3001press\uFF08\u6309\u952E\u5982 Enter\uFF09\u3001scroll\uFF08\u6EDA\u52A8\uFF09\u3001select\uFF08\u4E0B\u62C9\u9009\u62E9\uFF09\u3001hover\uFF08\u60AC\u505C\uFF09\u3001focus\uFF08\u805A\u7126\uFF09\u3002\n\u26A0\uFE0F \u4F7F\u7528\u524D\u5FC5\u987B\u5148\u8C03\u7528 get_interactive_snapshot \u83B7\u53D6\u5143\u7D20\u5217\u8868\u3002\u64CD\u4F5C\u540E\u5EFA\u8BAE\u7528 capture_screenshot \u6216\u518D\u6B21 get_interactive_snapshot \u9A8C\u8BC1\u7ED3\u679C\u3002",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ref: {
+            type: "string",
+            description: "\u76EE\u6807\u5143\u7D20\u7684 ref \u6807\u8BC6\uFF0C\u5982 'e1'\u3001'e5'\uFF08\u4ECE get_interactive_snapshot \u83B7\u53D6\uFF09"
+          },
+          action: {
+            type: "string",
+            enum: ["click", "fill", "press", "scroll", "select", "hover", "focus"],
+            description: "\u8981\u6267\u884C\u7684\u52A8\u4F5C\u7C7B\u578B"
+          },
+          value: {
+            type: "string",
+            description: "fill \u65F6\u4E3A\u8981\u8F93\u5165\u7684\u6587\u672C\uFF1Bselect \u65F6\u4E3A\u8981\u9009\u62E9\u7684 option value\uFF1Bpress \u65F6\u4E3A\u6309\u952E\u540D\uFF08\u53EF\u9009\uFF09"
+          },
+          key: {
+            type: "string",
+            description: "press \u52A8\u4F5C\u7684\u6309\u952E\u540D\uFF0C\u5982 'Enter'\u3001'Escape'\u3001'Tab'\u3001'Backspace'\u3002\u9ED8\u8BA4 'Enter'"
+          },
+          deltaX: {
+            type: "number",
+            description: "scroll \u52A8\u4F5C\u7684\u6C34\u5E73\u6EDA\u52A8\u91CF\uFF08\u50CF\u7D20\uFF09\uFF0C\u9ED8\u8BA4 0"
+          },
+          deltaY: {
+            type: "number",
+            description: "scroll \u52A8\u4F5C\u7684\u5782\u76F4\u6EDA\u52A8\u91CF\uFF08\u50CF\u7D20\uFF09\uFF0C\u9ED8\u8BA4 300\uFF08\u6B63\u6570\u5411\u4E0B\uFF0C\u8D1F\u6570\u5411\u4E0A\uFF09"
+          },
+          waitMs: {
+            type: "number",
+            description: "\u64CD\u4F5C\u540E\u7B49\u5F85\u9875\u9762\u54CD\u5E94\u7684\u65F6\u95F4\uFF08\u6BEB\u79D2\uFF09\uFF0C\u9ED8\u8BA4 500\uFF0C\u6700\u5927 3000"
+          }
+        },
+        required: ["ref", "action"]
+      }
     }
   ]
 }));
@@ -29221,6 +29281,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
       const res = await askChrome("getPageContent", { mode, selector, maxLength, includeMetadata });
+      return { content: [{ type: "text", text: jsonText(res) }] };
+    }
+    if (name === "get_interactive_snapshot") {
+      const { selector, includeText, maxElements } = args;
+      const res = await askChrome("getInteractiveSnapshot", { selector, includeText, maxElements });
+      return { content: [{ type: "text", text: jsonText(res) }] };
+    }
+    if (name === "dispatch_action") {
+      const { ref, action, value, key, deltaX, deltaY, waitMs } = args;
+      const res = await askChrome("dispatchAction", { ref, action, value, key, deltaX, deltaY, waitMs }, { timeoutMs: 1e4 });
       return { content: [{ type: "text", text: jsonText(res) }] };
     }
     return { content: [{ type: "text", text: `\u672A\u77E5\u5DE5\u5177\uFF1A${name}` }] };

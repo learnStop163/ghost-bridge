@@ -912,6 +912,299 @@ async function handleGetPageContent(params = {}) {
   return result?.value
 }
 
+// ========== DOM 交互：可交互元素快照 ==========
+
+async function handleGetInteractiveSnapshot(params = {}) {
+  const target = await ensureAttached()
+  const { selector, includeText = true, maxElements = 100 } = params
+
+  const selectorStr = selector ? JSON.stringify(selector) : 'null'
+
+  const expression = `(function() {
+    try {
+      let refCounter = 0;
+      const elements = [];
+
+      // 判断元素是否可见
+      function isVisible(el) {
+        if (!el.offsetParent && el.tagName !== 'HTML' && el.tagName !== 'BODY' &&
+            window.getComputedStyle(el).position !== 'fixed' &&
+            window.getComputedStyle(el).position !== 'sticky') return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) return false;
+        return true;
+      }
+
+      // 判断元素是否可交互
+      function isInteractive(el) {
+        const tag = el.tagName.toLowerCase();
+        if (['a', 'button', 'input', 'select', 'textarea'].includes(tag)) return true;
+        if (el.getAttribute('role') === 'button' || el.getAttribute('role') === 'link' ||
+            el.getAttribute('role') === 'tab' || el.getAttribute('role') === 'menuitem' ||
+            el.getAttribute('role') === 'checkbox' || el.getAttribute('role') === 'radio' ||
+            el.getAttribute('role') === 'switch' || el.getAttribute('role') === 'combobox') return true;
+        if (el.getAttribute('tabindex') && parseInt(el.getAttribute('tabindex')) >= 0) return true;
+        if (el.getAttribute('contenteditable') === 'true') return true;
+        if (el.onclick || el.getAttribute('onclick')) return true;
+        return false;
+      }
+
+      // 递归遍历 DOM 树（含 Shadow DOM）
+      function walkDOM(node, root) {
+        if (elements.length >= ${maxElements}) return;
+        const children = node.children || [];
+        for (let i = 0; i < children.length; i++) {
+          if (elements.length >= ${maxElements}) return;
+          const el = children[i];
+          if (isInteractive(el) && isVisible(el)) {
+            refCounter++;
+            const ref = 'e' + refCounter;
+            el.setAttribute('data-ghost-ref', ref);
+            const tag = el.tagName.toLowerCase();
+            const rect = el.getBoundingClientRect();
+            const entry = {
+              ref: ref,
+              tag: tag,
+              cx: Math.round(rect.left + rect.width / 2),
+              cy: Math.round(rect.top + rect.height / 2),
+            };
+            // 类型信息
+            if (el.type) entry.type = el.type;
+            if (el.name) entry.name = el.name;
+            if (el.getAttribute('role')) entry.role = el.getAttribute('role');
+            // 文本信息
+            if (${includeText}) {
+              if (el.placeholder) entry.placeholder = el.placeholder.slice(0, 80);
+              if (el.value && tag !== 'textarea') entry.value = el.value.slice(0, 80);
+              if (tag === 'a') entry.href = (el.href || '').slice(0, 150);
+              if (tag === 'select') {
+                entry.options = Array.from(el.options).slice(0, 10).map(o => ({
+                  value: o.value, text: o.text.slice(0, 50), selected: o.selected
+                }));
+              }
+              const text = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim();
+              if (text && text.length <= 100) entry.text = text;
+              else if (text) entry.text = text.slice(0, 97) + '...';
+            }
+            // disabled 状态
+            if (el.disabled) entry.disabled = true;
+            elements.push(entry);
+          }
+          // 递归子节点
+          walkDOM(el, root);
+          // 穿透 Shadow DOM
+          if (el.shadowRoot) {
+            walkDOM(el.shadowRoot, root);
+          }
+        }
+      }
+
+      // 清理旧的 ref 标记
+      document.querySelectorAll('[data-ghost-ref]').forEach(el => el.removeAttribute('data-ghost-ref'));
+
+      // 确定扫描根节点
+      let rootEl = document.body;
+      const sel = ${selectorStr};
+      if (sel) {
+        rootEl = document.querySelector(sel);
+        if (!rootEl) return { error: '选择器未匹配到任何元素', selector: sel };
+      }
+
+      walkDOM(rootEl, rootEl);
+
+      return {
+        url: window.location.href,
+        title: document.title,
+        elementCount: elements.length,
+        viewport: {
+          width: window.innerWidth,
+          height: window.innerHeight,
+          scrollX: Math.round(window.scrollX),
+          scrollY: Math.round(window.scrollY),
+        },
+        elements: elements,
+      };
+    } catch (e) { return { error: e.message }; }
+  })()`
+
+  const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+    expression,
+    returnByValue: true,
+  })
+
+  if (result?.value?.error) throw new Error(result.value.error)
+  return result?.value
+}
+
+// ========== DOM 交互：动作分发器 ==========
+
+async function handleDispatchAction(params = {}) {
+  const target = await ensureAttached()
+  const { ref, action, value, key, deltaX, deltaY, waitMs = 500 } = params
+
+  if (!ref) throw new Error("需要提供 ref（元素标识，如 'e1'）")
+  if (!action) throw new Error("需要提供 action（动作类型：click/fill/press/scroll/select/hover/focus）")
+
+  // Step 1: 实时获取目标元素的最新坐标和状态
+  const locateExpression = `(function() {
+    try {
+      const el = document.querySelector('[data-ghost-ref="${ref}"]');
+      if (!el) return { error: '元素未找到，ref 可能已失效，请重新获取快照' };
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) return { error: '元素不可见（宽高为 0）' };
+      return {
+        found: true,
+        tag: el.tagName.toLowerCase(),
+        type: el.type || '',
+        cx: Math.round(rect.left + rect.width / 2),
+        cy: Math.round(rect.top + rect.height / 2),
+        disabled: el.disabled || false,
+        value: (el.value || '').slice(0, 100),
+      };
+    } catch (e) { return { error: e.message }; }
+  })()`
+
+  const { result: locResult } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+    expression: locateExpression,
+    returnByValue: true,
+  })
+
+  const loc = locResult?.value
+  if (!loc || loc.error) throw new Error(loc?.error || "无法定位元素")
+  if (loc.disabled) throw new Error(`元素 ${ref} 已被禁用 (disabled)`)
+
+  const cx = loc.cx
+  const cy = loc.cy
+
+  let actionResult = { ref, action, success: true }
+
+  // Step 2: 根据动作类型执行 CDP 命令
+  if (action === "click") {
+    // 物理级 CDP 鼠标点击
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mousePressed", x: cx, y: cy, button: "left", clickCount: 1,
+    })
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mouseReleased", x: cx, y: cy, button: "left", clickCount: 1,
+    })
+    actionResult.detail = `已点击 ${ref} (${loc.tag}) 坐标 (${cx}, ${cy})`
+
+  } else if (action === "fill") {
+    if (value === undefined || value === null) throw new Error("fill 动作需要提供 value 参数")
+    // 先点击聚焦
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mousePressed", x: cx, y: cy, button: "left", clickCount: 1,
+    })
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mouseReleased", x: cx, y: cy, button: "left", clickCount: 1,
+    })
+    // 全选并清空已有内容
+    await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+      expression: `(function() {
+        const el = document.querySelector('[data-ghost-ref="${ref}"]');
+        if (el) { el.focus(); el.select && el.select(); }
+      })()`,
+    })
+    // 用 CDP 模拟键盘输入
+    await chrome.debugger.sendCommand(target, "Input.insertText", {
+      text: String(value),
+    })
+    // 强制触发 input/change 事件（兼容 React/Vue）
+    await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+      expression: `(function() {
+        const el = document.querySelector('[data-ghost-ref="${ref}"]');
+        if (el) {
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      })()`,
+    })
+    actionResult.detail = `已在 ${ref} (${loc.tag}) 中填入 "${String(value).slice(0, 50)}"`
+
+  } else if (action === "press") {
+    // 模拟键盘按键
+    const keyName = key || value || "Enter"
+    // 先确保元素聚焦
+    await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+      expression: `(function() {
+        const el = document.querySelector('[data-ghost-ref="${ref}"]');
+        if (el) el.focus();
+      })()`,
+    })
+    await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
+      type: "keyDown", key: keyName,
+    })
+    await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
+      type: "keyUp", key: keyName,
+    })
+    actionResult.detail = `已在 ${ref} 上按下 ${keyName}`
+
+  } else if (action === "scroll") {
+    const dx = deltaX || 0
+    const dy = deltaY || 300
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mouseWheel", x: cx, y: cy, deltaX: dx, deltaY: dy,
+    })
+    actionResult.detail = `已在 ${ref} 位置滚动 (${dx}, ${dy})`
+
+  } else if (action === "select") {
+    // 下拉框选择
+    if (value === undefined) throw new Error("select 动作需要提供 value 参数")
+    await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+      expression: `(function() {
+        const el = document.querySelector('[data-ghost-ref="${ref}"]');
+        if (el && el.tagName === 'SELECT') {
+          el.value = ${JSON.stringify(String(value))};
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      })()`,
+    })
+    actionResult.detail = `已在 ${ref} 选择值 "${value}"`
+
+  } else if (action === "hover") {
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mouseMoved", x: cx, y: cy,
+    })
+    actionResult.detail = `已将鼠标悬停到 ${ref} (${cx}, ${cy})`
+
+  } else if (action === "focus") {
+    await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+      expression: `(function() {
+        const el = document.querySelector('[data-ghost-ref="${ref}"]');
+        if (el) el.focus();
+      })()`,
+    })
+    actionResult.detail = `已聚焦到 ${ref}`
+
+  } else {
+    throw new Error(`不支持的动作类型: ${action}，可选: click/fill/press/scroll/select/hover/focus`)
+  }
+
+  // Step 3: 等待页面响应
+  if (waitMs > 0) {
+    await sleep(Math.min(waitMs, 3000))
+  }
+
+  // Step 4: 获取操作后状态摘要
+  const { result: afterResult } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+    expression: `(function() {
+      return {
+        url: window.location.href,
+        title: document.title,
+        readyState: document.readyState,
+      };
+    })()`,
+    returnByValue: true,
+  })
+  if (afterResult?.value) {
+    actionResult.pageAfter = afterResult.value
+  }
+
+  return actionResult
+}
+
 // 处理来自服务器的命令
 async function handleCommand(message) {
   const { id, command, params, token } = message
@@ -938,6 +1231,8 @@ async function handleCommand(message) {
     else if (command === "perfMetrics") result = await handlePerfMetrics(params)
     else if (command === "captureScreenshot") result = await handleCaptureScreenshot(params)
     else if (command === "getPageContent") result = await handleGetPageContent(params)
+    else if (command === "getInteractiveSnapshot") result = await handleGetInteractiveSnapshot(params)
+    else if (command === "dispatchAction") result = await handleDispatchAction(params)
     else throw new Error(`未知指令 ${command}`)
 
     sendToServer({ id, result })
