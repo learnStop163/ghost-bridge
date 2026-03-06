@@ -1,6 +1,6 @@
 # Ghost Bridge
 
-> 零重启 Chrome 调试桥 —— 通过 MCP 让 AI 直接访问浏览器 DevTools 能力，面向线上压缩代码（无 sourcemap）快速定位问题。
+> 无侵入 Chrome AI 副驾 —— 通过 MCP 让 AI 无缝接管你正在使用的浏览器，实时调试、观察页面、操控交互，无需启动新浏览器实例。
 
 ## ✨ 特性
 
@@ -8,6 +8,7 @@
 - 🔍 **无 sourcemap 调试** — 片段截取、字符串搜索、覆盖率分析，在压缩代码中定位问题
 - 🌐 **网络请求分析** — 完整记录请求/响应，支持多维度过滤和响应体查看
 - 📸 **页面截图与内容提取** — 视觉分析 + 结构化数据提取
+- 🎯 **DOM 交互操控** — AI 可直接点击按钮、填写表单、按键提交，使用 CDP 物理级模拟，兼容 React/Vue/Angular
 - 📊 **性能诊断** — JS 堆内存、DOM 规模、Layout 开销、Web Vitals、资源加载分析
 - 🔄 **多实例支持** — 自动单例管理，多个 MCP 客户端共享同一 Chrome 连接
 
@@ -76,6 +77,28 @@ ghost-bridge init
 | `capture_screenshot` | 截取页面截图（支持完整长截图、指定区域、JPEG/PNG 格式） |
 | `get_page_content` | 提取页面内容：纯文本 / HTML / 结构化数据（标题、链接、按钮、表单） |
 
+### 🎯 页面交互（DOM 操作）
+
+| 工具 | 说明 |
+|------|------|
+| `get_interactive_snapshot` | 扫描页面所有可见可交互元素，返回带 ref 短标识（e1, e2...）的精简列表，支持 Shadow DOM 穿透 |
+| `dispatch_action` | 对目标元素执行动作（click / fill / press / scroll / select / hover / focus），使用 CDP 物理级模拟 |
+
+**交互工作流示例：**
+
+```
+1. AI 调用 get_interactive_snapshot
+   → 返回: [{ref:"e1", tag:"input", placeholder:"Search..."}, {ref:"e2", tag:"button", text:"Login"}]
+
+2. AI 调用 dispatch_action({ref: "e1", action: "fill", value: "hello"})
+   → 在搜索框中输入 "hello"
+
+3. AI 调用 dispatch_action({ref: "e2", action: "click"})
+   → 点击 Login 按钮
+
+4. AI 调用 capture_screenshot 验证操作结果
+```
+
 ### 📊 性能分析
 
 | 工具 | 说明 |
@@ -124,6 +147,9 @@ ghost-bridge init
 - 若目标页面已打开 DevTools，`chrome.debugger.attach` 可能失败，请关闭后重试
 - 大体积单行 bundle beautify 可能耗时，服务端对超长源码会截取片段
 - 跨月时 token 会自动更新，扩展和服务端需在同月内启动
+- DOM 交互：SPA 路由变化后 ref 标识会失效，需重新调用 `get_interactive_snapshot`
+- DOM 交互：跨域 iframe 内的元素暂不支持细粒度操作
+- DOM 交互：Shadow DOM 内的元素可以被扫描到，但部分封闭模式的 Shadow Root 可能无法穿透
 
 ## License
 

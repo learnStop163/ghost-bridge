@@ -470,7 +470,7 @@ function buildSnippet(source, line, column, { beautifyEnabled = true, contextLin
 }
 
 const server = new Server(
-  { name: "ghost-bridge", version: "0.3.0" },
+  { name: "ghost-bridge", version: "0.4.0" },
   { capabilities: { tools: {} } }
 )
 
@@ -664,6 +664,79 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: "get_interactive_snapshot",
+      description:
+        "【操作页面前必须先调用】扫描当前页面所有可见的可交互元素（按钮/链接/输入框/下拉框等），" +
+        "返回带有 ref 短标识（如 e1, e2, e3）的精简列表，包含元素类型、文本和位置。" +
+        "Token 极省（通常 < 1000 tokens），专为 AI 操作页面而设计。" +
+        "获取后可通过 dispatch_action 工具使用 ref 标识来点击、填写、按键等。" +
+        "支持 Shadow DOM 穿透。\n" +
+        "⚠️ 仅用于交互操作前的元素定位。如需排查 UI/CSS 布局问题，请使用 capture_screenshot 或 get_page_content。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "CSS 选择器，限定扫描范围。不指定则扫描整个页面",
+          },
+          includeText: {
+            type: "boolean",
+            description: "是否包含元素的文本/占位符等信息，默认 true",
+          },
+          maxElements: {
+            type: "number",
+            description: "最大返回元素数量，默认 100",
+          },
+        },
+      },
+    },
+    {
+      name: "dispatch_action",
+      description:
+        "【操作页面元素】对 get_interactive_snapshot 返回的元素执行动作。" +
+        "通过 ref 标识（如 e1, e5）精准定位元素，使用 CDP 物理级模拟执行操作，" +
+        "兼容所有前端框架（React/Vue/Angular），成功率极高。\n" +
+        "支持的动作：click（点击）、fill（填写输入框）、press（按键如 Enter）、" +
+        "scroll（滚动）、select（下拉选择）、hover（悬停）、focus（聚焦）。\n" +
+        "⚠️ 使用前必须先调用 get_interactive_snapshot 获取元素列表。" +
+        "操作后建议用 capture_screenshot 或再次 get_interactive_snapshot 验证结果。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ref: {
+            type: "string",
+            description: "目标元素的 ref 标识，如 'e1'、'e5'（从 get_interactive_snapshot 获取）",
+          },
+          action: {
+            type: "string",
+            enum: ["click", "fill", "press", "scroll", "select", "hover", "focus"],
+            description: "要执行的动作类型",
+          },
+          value: {
+            type: "string",
+            description: "fill 时为要输入的文本；select 时为要选择的 option value；press 时为按键名（可选）",
+          },
+          key: {
+            type: "string",
+            description: "press 动作的按键名，如 'Enter'、'Escape'、'Tab'、'Backspace'。默认 'Enter'",
+          },
+          deltaX: {
+            type: "number",
+            description: "scroll 动作的水平滚动量（像素），默认 0",
+          },
+          deltaY: {
+            type: "number",
+            description: "scroll 动作的垂直滚动量（像素），默认 300（正数向下，负数向上）",
+          },
+          waitMs: {
+            type: "number",
+            description: "操作后等待页面响应的时间（毫秒），默认 500，最大 3000",
+          },
+        },
+        required: ["ref", "action"],
+      },
+    },
   ],
 }))
 
@@ -845,6 +918,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       const res = await askChrome("getPageContent", { mode, selector, maxLength, includeMetadata })
+      return { content: [{ type: "text", text: jsonText(res) }] }
+    }
+
+    if (name === "get_interactive_snapshot") {
+      const { selector, includeText, maxElements } = args
+      const res = await askChrome("getInteractiveSnapshot", { selector, includeText, maxElements })
+      return { content: [{ type: "text", text: jsonText(res) }] }
+    }
+
+    if (name === "dispatch_action") {
+      const { ref, action, value, key, deltaX, deltaY, waitMs } = args
+      const res = await askChrome("dispatchAction", { ref, action, value, key, deltaX, deltaY, waitMs }, { timeoutMs: 10000 })
       return { content: [{ type: "text", text: jsonText(res) }] }
     }
 
