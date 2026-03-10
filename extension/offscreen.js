@@ -171,7 +171,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true
   }
 
-  if (message.type === 'getStatus') {
+  if (message.type === 'getOffscreenStatus') {
     sendResponse({
       connected: ws && ws.readyState === WebSocket.OPEN,
     })

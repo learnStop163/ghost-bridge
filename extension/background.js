@@ -253,15 +253,22 @@ chrome.debugger.onDetach.addListener((source, reason) => {
     scriptSourceCache = new Map()
     networkRequests = []
     requestMap = new Map()
-  }
-  if (!state.enabled) return
-  if (reason === "canceled_by_user") {
-    log("调试被用户取消，已关闭")
-    state.enabled = false
-    setBadgeState("off")
-  } else {
-    log(`调试已断开：${reason}`)
-    setBadgeState("att")
+    
+    if (!state.enabled) return
+    if (reason === "canceled_by_user") {
+      log("调试被用户取消，已关闭")
+      state.enabled = false
+      state.connected = false
+      setBadgeState("off")
+      chrome.runtime.sendMessage({ type: 'disconnect' }).catch(() => {})
+    } else {
+      log(`调试已断开：${reason}`)
+      if (state.connected) {
+        setBadgeState("on")
+      } else {
+        setBadgeState("att")
+      }
+    }
   }
 })
 
@@ -294,11 +301,19 @@ async function ensureAttached() {
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
   if (!tab) throw new Error("没有激活的标签页")
   if (attachedTabId !== tab.id) {
+    if (attachedTabId) {
+      try { await chrome.debugger.detach({ tabId: attachedTabId }) } catch (e) {}
+    }
     try {
       await chrome.debugger.attach({ tabId: tab.id }, "1.3")
       setBadgeState("on")
     } catch (e) {
-      setBadgeState("att")
+      attachedTabId = null
+      if (state.connected) {
+        setBadgeState("on")
+      } else {
+        setBadgeState("att")
+      }
       throw e
     }
     attachedTabId = tab.id
@@ -1052,6 +1067,8 @@ async function handleDispatchAction(params = {}) {
     try {
       const el = document.querySelector('[data-ghost-ref="${ref}"]');
       if (!el) return { error: '元素未找到，ref 可能已失效，请重新获取快照' };
+      // 关键修复：确保元素在视口内，否则超出屏幕的坐标无法被 CDP 模拟点击
+      el.scrollIntoView({ block: 'center', inline: 'center' });
       const rect = el.getBoundingClientRect();
       if (rect.width === 0 && rect.height === 0) return { error: '元素不可见（宽高为 0）' };
       return {
@@ -1383,8 +1400,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     setBadgeState('off')
     detachAllTargets().catch(() => {})
 
-    // 通知 offscreen 断开
+    // 通知 offscreen 断开 (WebSocket 清除)
     chrome.runtime.sendMessage({ type: 'disconnect' }).catch(() => {})
+    
+    // 关键修复：显式销毁 offscreen document 防止内存泄漏
+    closeOffscreenDocument().catch(() => {})
 
     sendResponse({ ok: true })
     return true
