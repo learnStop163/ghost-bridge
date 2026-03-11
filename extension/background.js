@@ -10,10 +10,10 @@ const CONFIG = {
   maxPortRetries: 10,
   token: getMonthlyToken(),
   autoDetach: false,
-  maxErrors: 40,
-  maxStackFrames: 5,
+  maxErrors: 100,
+  maxStackFrames: 20,
   maxRequestsTracked: 200,
-  maxRequestBodySize: 100000,
+  maxRequestBodySize: 500000, // 提升至 500KB，容纳较大的 API 请求
 }
 
 let attachedTabId = null
@@ -111,7 +111,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       url: topFrame?.url || detail.url,
       line: topFrame?.lineNumber,
       column: topFrame?.columnNumber,
-      text: detail.text,
+      text: detail.exception?.description || detail.text,
       scriptId: topFrame?.scriptId,
       stack: compactStack(detail.stackTrace),
       timestamp: Date.now(),
@@ -139,7 +139,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   }
 
   if (method === "Runtime.consoleAPICalled") {
-    const args = (params.args || []).map((a) => a.value).filter(Boolean)
+    const args = (params.args || []).map((a) => a.description || a.value).filter(Boolean)
     pushError({
       type: params.type || "console",
       severity: params.type === "error" ? "error" : params.type === "warning" ? "warn" : "info",
@@ -327,6 +327,13 @@ async function ensureAttached() {
     await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Debugger.enable")
     await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Profiler.enable")
     await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Network.enable").catch(() => {})
+    
+    // Enable auto-attach to sub-targets (iframes, workers) for comprehensive capture
+    await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Target.setAutoAttach", {
+      autoAttach: true,
+      waitForDebuggerOnStart: false,
+      flatten: true,
+    }).catch(() => {})
   }
   return { tabId: attachedTabId }
 }
