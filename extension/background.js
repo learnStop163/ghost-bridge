@@ -31,10 +31,10 @@ const pendingRequests = new Map()
 function setBadgeState(status) {
   const map = {
     connecting: { text: "…", color: "#999" },
-    on: { text: "ON", color: "#34c759" },
+    on: { text: "ON", color: "#00d2ff" },
     off: { text: "OFF", color: "#999" },
     err: { text: "ERR", color: "#ff3b30" },
-    att: { text: "ATT", color: "#ff9f0a" },
+    att: { text: "ATT", color: "#a252ff" },
   }
   const cfg = map[status] || map.off
   chrome.action.setBadgeText({ text: cfg.text })
@@ -1281,23 +1281,65 @@ function broadcastStatus() {
     status = 'disconnected'
   } else if (state.connected) {
     status = 'connected'
-  } else if (state.scanRound >= 2) {
+  } else if (state.scanRound >= 4) {
     status = 'not_found'
   } else {
     status = 'scanning'
   }
-  chrome.runtime.sendMessage({
-    type: 'statusUpdate',
-    state: {
-      status,
-      enabled: state.enabled,
-      port: state.port,
-      currentPort: state.currentPort,
-      basePort: CONFIG.basePort,
-      scanRound: state.scanRound,
-    }
-  }).catch(() => {}) // popup 可能未打开，忽略错误
+
+  let tabUrl = ''
+  let tabTitle = ''
+  
+  if (attachedTabId) {
+    chrome.tabs.get(attachedTabId).then(t => {
+      tabUrl = t.url
+      tabTitle = t.title
+      doBroadcast()
+    }).catch(() => doBroadcast())
+  } else {
+    doBroadcast()
+  }
+
+  function doBroadcast() {
+    const actualErrors = lastErrors.filter(e => e.severity === 'error')
+    chrome.runtime.sendMessage({
+      type: 'statusUpdate',
+      state: {
+        status,
+        enabled: state.enabled,
+        port: state.port,
+        currentPort: state.currentPort,
+        basePort: CONFIG.basePort,
+        scanRound: state.scanRound,
+        errorCount: actualErrors.length,
+        recentErrors: actualErrors.slice(0, 5),
+        tabTitle,
+        tabUrl,
+      }
+    }).catch(() => {}) // popup 可能未打开，忽略错误
+  }
 }
+
+// 监听被调试页面的导航变化，实时推送到 popup
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (tabId === attachedTabId && (changeInfo.title || changeInfo.url)) {
+    if (state.connected) broadcastStatus()
+  }
+})
+
+// 监听用户切换标签页（Active Tab 发生变化），让调试器自动跟随到新标签页
+chrome.tabs.onActivated.addListener(async (activeInfo) => {
+  if (state.enabled && state.connected) {
+    try {
+      // 这里的 ensureAttached() 会自动处理从旧 Tab detach 并 attach 到新 Tab
+      await ensureAttached()
+      broadcastStatus()
+    } catch (e) {
+      log(`自动跟随切换 Tab 失败：${e.message}`)
+    }
+  }
+})
+
 
 // ========== 消息监听 ==========
 
@@ -1359,19 +1401,41 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       status = 'disconnected'
     } else if (state.connected) {
       status = 'connected'
-    } else if (state.scanRound >= 2) {
+    } else if (state.scanRound >= 4) {
       status = 'not_found'
     } else {
       status = 'scanning'
     }
-    sendResponse({
-      status,
-      enabled: state.enabled,
-      port: state.port,
-      currentPort: state.currentPort,
-      basePort: CONFIG.basePort,
-      scanRound: state.scanRound,
-    })
+
+    let tabUrl = ''
+    let tabTitle = ''
+    if (attachedTabId) {
+      chrome.tabs.get(attachedTabId).then(t => {
+        tabUrl = t.url
+        tabTitle = t.title
+        sendStatusResponse()
+      }).catch(() => {
+        sendStatusResponse()
+      })
+    } else {
+      sendStatusResponse()
+    }
+
+    function sendStatusResponse() {
+      const actualErrors = lastErrors.filter(e => e.severity === 'error')
+      sendResponse({
+        status,
+        enabled: state.enabled,
+        port: state.port,
+        currentPort: state.currentPort,
+        basePort: CONFIG.basePort,
+        scanRound: state.scanRound,
+        errorCount: actualErrors.length,
+        recentErrors: actualErrors.slice(0, 5),
+        tabTitle,
+        tabUrl,
+      })
+    }
     return true
   }
 

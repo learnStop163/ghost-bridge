@@ -5454,9 +5454,15 @@ var require_lib = __commonJS({
 import path from "path";
 import os2 from "os";
 import { fileURLToPath } from "url";
-function getClaudeConfigPath() {
+function getClientConfigPaths() {
   const homeDir = os2.homedir();
-  return path.join(homeDir, ".claude.json");
+  return [
+    { name: "Claude Code", path: path.join(homeDir, ".claude.json") },
+    { name: "Antigravity", path: path.join(homeDir, ".gemini", "antigravity", "mcp.json") },
+    // Codex config placeholder - exact path depends on how Codex stores user config.
+    // Assuming a common pattern here like ~/.codex/mcp.json or similar.
+    { name: "Codex", path: path.join(homeDir, ".codex", "mcp.json") }
+  ];
 }
 function getExtensionPath() {
   const __filename2 = fileURLToPath(import.meta.url);
@@ -5502,20 +5508,28 @@ function openFolder(folderPath) {
 }
 async function init(options) {
   console.log(source_default.bold("\u{1F47B} Ghost Bridge Initialization"));
-  const configPath = getClaudeConfigPath();
+  const clientConfigs = getClientConfigPaths();
   const serverPath = getServerPath();
   const isDryRun = options.dryRun;
-  console.log(source_default.dim("Checking Claude configuration..."));
-  if (isDryRun) {
-    console.log(source_default.yellow(`[Dry Run] Would check config at: ${configPath}`));
-    console.log(source_default.yellow(`[Dry Run] Would add MCP server pointing to: ${serverPath}`));
-  } else {
-    if (!import_fs_extra.default.existsSync(configPath)) {
-      console.log(source_default.yellow(`Configuration file not found at ${configPath}, creating/skipping...`));
-      await import_fs_extra.default.ensureDir(path2.dirname(configPath));
-      if (!import_fs_extra.default.existsSync(configPath)) {
-        await import_fs_extra.default.writeJson(configPath, { mcpServers: {} }, { spaces: 2 });
+  console.log(source_default.dim("Checking MCP Client configurations..."));
+  let configuredCount = 0;
+  for (const client of clientConfigs) {
+    const configPath = client.path;
+    if (isDryRun) {
+      console.log(source_default.yellow(`[Dry Run] Would check ${client.name} config at: ${configPath}`));
+      if (import_fs_extra.default.existsSync(configPath) || client.name === "Claude Code") {
+        console.log(source_default.yellow(`[Dry Run] Would add MCP server logic for ${client.name}`));
       }
+      continue;
+    }
+    const exists = import_fs_extra.default.existsSync(configPath);
+    if (!exists && client.name !== "Claude Code") {
+      continue;
+    }
+    if (!exists) {
+      console.log(source_default.yellow(`Configuration file not found for ${client.name} at ${configPath}, creating...`));
+      await import_fs_extra.default.ensureDir(path2.dirname(configPath));
+      await import_fs_extra.default.writeJson(configPath, { mcpServers: {} }, { spaces: 2 });
     }
     try {
       const config = await import_fs_extra.default.readJson(configPath);
@@ -5525,10 +5539,14 @@ async function init(options) {
         args: [serverPath]
       };
       await import_fs_extra.default.writeJson(configPath, config, { spaces: 2 });
-      console.log(source_default.green(`\u2705 MCP Server 'ghost-bridge' configured in ${configPath}`));
+      console.log(source_default.green(`\u2705 MCP Server configured for ${source_default.bold(client.name)} in ${configPath}`));
+      configuredCount++;
     } catch (err) {
-      console.error(source_default.red(`Failed to update config: ${err.message}`));
+      console.error(source_default.red(`Failed to update config for ${client.name}: ${err.message}`));
     }
+  }
+  if (configuredCount === 0 && !isDryRun) {
+    console.log(source_default.yellow("\u26A0\uFE0F No supported MCP clients found to configure automatically."));
   }
   const sourceExt = getExtensionPath();
   const targetExt = getUserExtensionDir();
@@ -5617,34 +5635,47 @@ __export(status_exports, {
 });
 async function status() {
   console.log(source_default.bold("\u{1F47B} Ghost Bridge Status"));
-  const configPath = getClaudeConfigPath();
+  const clientConfigs = getClientConfigPaths();
   const extDir = getUserExtensionDir();
   const serverPath = getServerPath();
-  let mcpStatus = source_default.red("Not Configured");
-  let mcpDetails = "";
-  if (import_fs_extra3.default.existsSync(configPath)) {
-    try {
-      const config = await import_fs_extra3.default.readJson(configPath);
-      if (config.mcpServers && config.mcpServers["ghost-bridge"]) {
-        mcpStatus = source_default.green("Configured");
-        const cfg = config.mcpServers["ghost-bridge"];
-        const configuredPath = cfg.args[0];
-        if (configuredPath === serverPath) {
-          mcpDetails = source_default.dim("(Paths match)");
-        } else {
-          mcpDetails = source_default.yellow(`(Path mismatch)
-  Configured: ${configuredPath}
-  Current:    ${serverPath}`);
+  console.log(source_default.bold.blue("\nMCP Client Configurations:"));
+  let configuredCount = 0;
+  for (const client of clientConfigs) {
+    let mcpStatus = source_default.gray("Not Configured");
+    let mcpDetails = "";
+    const configPath = client.path;
+    if (import_fs_extra3.default.existsSync(configPath)) {
+      try {
+        const config = await import_fs_extra3.default.readJson(configPath);
+        if (config.mcpServers && config.mcpServers["ghost-bridge"]) {
+          mcpStatus = source_default.green("Configured");
+          const cfg = config.mcpServers["ghost-bridge"];
+          const configuredPath = cfg.args[0];
+          if (configuredPath === serverPath) {
+            mcpDetails = source_default.dim("(Paths match)");
+          } else {
+            mcpDetails = source_default.yellow(`(Path mismatch) 
+      Configured: ${configuredPath}
+      Current:    ${serverPath}`);
+          }
+          configuredCount++;
         }
+      } catch (e) {
+        mcpStatus = source_default.red("Error reading config");
       }
-    } catch (e) {
-      mcpStatus = source_default.red("Error reading config");
+    } else {
+      if (client.name === "Claude Code") {
+        mcpStatus = source_default.yellow("Config file not found");
+      } else {
+        mcpStatus = source_default.gray("Not Installed");
+      }
     }
-  } else {
-    mcpStatus = source_default.yellow("Config file not found");
+    console.log(`  ${source_default.bold(client.name)}: ${mcpStatus} ${mcpDetails}`);
+    console.log(`    Config File: ${source_default.dim(configPath)}`);
   }
-  console.log(`MCP Configuration: ${mcpStatus} ${mcpDetails}`);
-  console.log(`  Config File: ${configPath}`);
+  if (configuredCount === 0) {
+    console.log(source_default.yellow("\n  No MCP clients currently have ghost-bridge configured. Run `ghost-bridge init`."));
+  }
   let extStatus = source_default.red("Not Installed (Run init)");
   if (import_fs_extra3.default.existsSync(extDir)) {
     extStatus = source_default.green("Installed");

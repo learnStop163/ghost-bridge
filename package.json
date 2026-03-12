@@ -1,9 +1,32 @@
 {
   "name": "ghost-bridge",
-  "version": "0.4.2",
+  "version": "0.4.4",
   "private": false,
   "type": "module",
   "description": "Ghost Bridge: Zero-restart Chrome debugger bridge for Claude MCP. Includes CLI for easy setup.",
+  "keywords": [
+    "mcp",
+    "chrome",
+    "debugger",
+    "ai",
+    "claude",
+    "cdp",
+    "llm",
+    "copilot"
+  ],
+  "author": "<Author>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/<Username>/ghost-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/<Username>/ghost-bridge/issues"
+  },
+  "homepage": "https://github.com/<Username>/ghost-bridge#readme",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "bin": {
     "ghost-bridge": "./dist/cli.js"
   },
