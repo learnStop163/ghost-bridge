@@ -176,43 +176,15 @@
       z-index: 2;
     }
 
-    .status-ping {
-      position: absolute;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
-      border-radius: 50%;
-      z-index: 1;
-      opacity: 0;
-    }
-
     /* Connected State */
     .connected .status-dot { background: #00d2ff; box-shadow: 0 0 10px #00d2ff; }
-    .connected .status-ping {
-      background: #00d2ff;
-      animation: ping-slow 3s cubic-bezier(0, 0, 0.2, 1) infinite;
-    }
 
     /* Connecting/Scanning State */
     .connecting .status-dot { background: #a252ff; box-shadow: 0 0 12px #a252ff; }
-    .connecting .status-ping {
-      background: #a252ff;
-      animation: ping-fast 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;
-    }
 
     /* Disconnected/Error State */
     .disconnected .status-dot { background: #4b5563; }
     .error .status-dot { background: #ef4444; box-shadow: 0 0 8px #ef4444; }
-
-    @keyframes ping-fast {
-      0% { transform: scale(1); opacity: 0.8; }
-      75%, 100% { transform: scale(2.5); opacity: 0; }
-    }
-    @keyframes ping-slow {
-      0% { transform: scale(1); opacity: 0.6; }
-      75%, 100% { transform: scale(2.2); opacity: 0; }
-    }
 
     .status-text {
       font-size: 15px;
@@ -452,7 +424,6 @@
     <div class="status-card" id="statusCard">
       <div class="status-row">
         <div class="status-dot-wrapper" id="dotWrapper">
-          <div class="status-ping"></div>
           <div class="status-dot"></div>
         </div>
         <span class="status-text" id="statusText">Checking...</span>
