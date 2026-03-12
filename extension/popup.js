@@ -1,88 +1,161 @@
 // popup.js - Ghost Bridge 弹窗逻辑
 
-const statusDot = document.getElementById('statusDot')
+const dotWrapper = document.getElementById('dotWrapper')
+const statusCard = document.getElementById('statusCard')
 const statusText = document.getElementById('statusText')
-const statusDetail = document.getElementById('statusDetail')
+const detailContainer = document.getElementById('detailContainer')
+const portVal = document.getElementById('portVal')
+const tabRow = document.getElementById('tabRow')
+const tabVal = document.getElementById('tabVal')
+const errorRow = document.getElementById('errorRow')
+const errorVal = document.getElementById('errorVal')
+const errorList = document.getElementById('errorList')
+const headerGhost = document.getElementById('headerGhost')
+
 const connectBtn = document.getElementById('connectBtn')
 const disconnectBtn = document.getElementById('disconnectBtn')
 const scanInfo = document.getElementById('scanInfo')
 
-// 状态稳定性控制：防止闪烁
 let lastStableStatus = null
 let pendingStatus = null
 let statusChangeTimer = null
-const STATUS_DEBOUNCE_MS = 300 // 状态变化需要持续 300ms 才生效
+const STATUS_DEBOUNCE_MS = 300
 
-// 状态映射
 const STATUS_MAP = {
   connected: {
-    dotClass: 'connected',
-    text: '✅ 已连接',
+    statusClass: 'connected',
+    text: 'ON / Attached',
   },
   connecting: {
-    dotClass: 'connecting',
-    text: '🔍 正在扫描...',
+    statusClass: 'connecting',
+    text: 'Scanning...',
   },
   verifying: {
-    dotClass: 'connecting',
-    text: '🔐 验证身份...',
+    statusClass: 'connecting',
+    text: 'Verifying Auth...',
   },
   scanning: {
-    dotClass: 'connecting',
-    text: '📡 搜索服务...',
+    statusClass: 'connecting',
+    text: 'Searching...',
   },
   not_found: {
-    dotClass: 'disconnected',
-    text: '🔴 未找到服务',
+    statusClass: 'disconnected',
+    text: 'Not Found',
   },
   disconnected: {
-    dotClass: 'disconnected',
-    text: '未连接',
+    statusClass: 'disconnected',
+    text: 'Disconnected',
   },
   error: {
-    dotClass: 'error',
-    text: '连接失败',
+    statusClass: 'error',
+    text: 'Connection Error',
   },
 }
 
-// 实际执行 UI 更新
 function renderUI(state) {
-  const { status, port, scanRound, enabled, currentPort, basePort } = state
+  const { status, port, scanRound, enabled, currentPort, basePort, errorCount, recentErrors, tabTitle } = state
   const config = STATUS_MAP[status] || STATUS_MAP.disconnected
 
-  statusDot.className = `status-dot ${config.dotClass}`
-  statusText.textContent = config.text
-
-  // 状态详情
-  if (status === 'connected' && port) {
-    statusDetail.textContent = `端口 ${port} · WebSocket 已建立`
-  } else if ((status === 'connecting' || status === 'verifying' || status === 'scanning') && currentPort) {
-    const roundText = scanRound > 0 ? `（第 ${scanRound + 1} 轮）` : ''
-    statusDetail.textContent = `正在扫描 ${basePort}-${basePort + 9}${roundText}`
-  } else if (status === 'not_found') {
-    statusDetail.textContent = '请确保 Claude Code 已启动'
+  // Update classes for color & animations
+  dotWrapper.className = `status-dot-wrapper ${config.statusClass}`
+  
+  // Update Ghost & Body Animation State
+  if (config.statusClass === 'connected') {
+    headerGhost.className = 'ghost-wrapper ghost-connected'
+    document.body.className = 'connected-state'
+  } else if (config.statusClass === 'connecting') {
+    headerGhost.className = 'ghost-wrapper ghost-connecting'
+    document.body.className = 'connecting-state'
   } else {
-    statusDetail.textContent = ''
+    headerGhost.className = 'ghost-wrapper ghost-disconnected'
+    document.body.className = 'disconnected-state'
   }
 
-  // 按钮状态
-  connectBtn.textContent = enabled ? '重新连接' : '连接'
-  connectBtn.disabled = false
+  // Animate text change
+  if (statusText.textContent !== config.text) {
+    statusText.style.opacity = '0'
+    setTimeout(() => {
+      statusText.textContent = config.text
+      statusText.style.opacity = '1'
+    }, 150)
+  }
 
-  // 扫描轮次提示
-  if ((status === 'connecting' || status === 'scanning') && scanRound > 2) {
-    scanInfo.textContent = `已扫描 ${scanRound} 轮，请确保 Claude Code 已启动`
-    scanInfo.style.color = '#ff9f0a'
+  // Update Detail Container
+  if (status === 'connected' && port) {
+    portVal.textContent = port
+    portVal.className = 'detail-value highlight'
+    
+    if (tabTitle) {
+      tabRow.classList.remove('hidden')
+      tabVal.textContent = tabTitle
+      tabVal.title = tabTitle
+    } else {
+      tabRow.classList.add('hidden')
+    }
+
+    errorRow.classList.remove('hidden')
+    errorVal.textContent = errorCount || 0
+    errorVal.className = errorCount > 0 ? 'detail-value warning' : 'detail-value'
+    
+    // Render error list
+    if (recentErrors && recentErrors.length > 0) {
+      errorList.innerHTML = recentErrors.map(err => {
+        const text = err.text ? err.text.substring(0, 100) : 'Unknown Error'
+        const file = err.url ? err.url.split('/').pop() : 'inline'
+        const loc = err.line ? `${file}:${err.line}` : file
+        return `
+          <div class="error-item" title="${err.text || ''}">
+            <div class="err-msg">${text}${err.text && err.text.length > 100 ? '...' : ''}</div>
+            <div class="err-loc">${loc}</div>
+          </div>
+        `
+      }).join('')
+    } else {
+      errorList.innerHTML = '<div class="error-item" style="text-align:center;color:#64748b;border:none;">No recent errors recorded.</div>'
+      errorList.classList.add('collapsed')
+    }
+    
+    detailContainer.classList.remove('collapsed')
+  } else if ((status === 'connecting' || status === 'verifying' || status === 'scanning') && currentPort) {
+    const roundText = scanRound > 0 ? ` [R${scanRound + 1}]` : ''
+    portVal.textContent = `Scanning: ${currentPort}${roundText}`
+    portVal.className = 'detail-value highlight'
+    tabRow.classList.add('hidden')
+    errorRow.classList.add('hidden')
+    detailContainer.classList.remove('collapsed')
+  } else if (status === 'disconnected') {
+    detailContainer.classList.add('collapsed')
+  } else if (status === 'not_found') {
+    portVal.textContent = 'Launch Claude Code'
+    portVal.className = 'detail-value warning'
+    tabRow.classList.add('hidden')
+    errorRow.classList.add('hidden')
+    detailContainer.classList.remove('collapsed')
   } else {
-    scanInfo.textContent = ''
+    detailContainer.classList.add('collapsed')
+  }
+
+  // Button States
+  if (status === 'connecting' || status === 'scanning' || status === 'verifying') {
+    connectBtn.textContent = 'Connecting...'
+    connectBtn.disabled = true
+  } else {
+    connectBtn.textContent = enabled ? 'Reconnect' : 'Connect'
+    connectBtn.disabled = false
+  }
+
+  // Scan info text
+  if ((status === 'connecting' || status === 'scanning') && scanRound > 2) {
+    scanInfo.textContent = `Round ${scanRound}: Is your MCP Server running?`
+    scanInfo.classList.remove('collapsed')
+  } else {
+    scanInfo.classList.add('collapsed')
   }
 }
 
-// 更新 UI 状态（带防抖，防止闪烁）
 function updateUI(state) {
   const newStatus = state.status
 
-  // 如果是首次加载或状态相同，直接更新
   if (lastStableStatus === null || newStatus === lastStableStatus) {
     lastStableStatus = newStatus
     pendingStatus = null
@@ -94,10 +167,7 @@ function updateUI(state) {
     return
   }
 
-  // 状态变化：从 connected 变为其他状态时需要防抖
-  // 防止短暂的状态波动导致 UI 闪烁
   if (lastStableStatus === 'connected' && newStatus !== 'connected') {
-    // 需要持续一段时间才确认断开
     if (pendingStatus !== newStatus) {
       pendingStatus = newStatus
       if (statusChangeTimer) clearTimeout(statusChangeTimer)
@@ -108,11 +178,9 @@ function updateUI(state) {
         renderUI(state)
       }, STATUS_DEBOUNCE_MS)
     }
-    // 暂不更新 UI，等待确认
     return
   }
 
-  // 其他状态变化（如从 scanning 到 connected）立即更新
   lastStableStatus = newStatus
   pendingStatus = null
   if (statusChangeTimer) {
@@ -122,7 +190,6 @@ function updateUI(state) {
   renderUI(state)
 }
 
-// 从 background 获取状态
 async function fetchStatus() {
   try {
     const response = await chrome.runtime.sendMessage({ type: 'getStatus' })
@@ -130,36 +197,44 @@ async function fetchStatus() {
       updateUI(response)
     }
   } catch (e) {
-    console.error('获取状态失败:', e)
+    console.error('Fetch status failed:', e)
   }
 }
 
-// 启用连接（自动扫描端口）
 connectBtn.addEventListener('click', async () => {
   try {
+    // Add visual click feedback
+    connectBtn.textContent = 'Connecting...'
+    connectBtn.disabled = true
     await chrome.runtime.sendMessage({ type: 'connect' })
-    setTimeout(fetchStatus, 100)
+    setTimeout(fetchStatus, 150)
   } catch (e) {
-    console.error('连接失败:', e)
+    console.error('Connect failed:', e)
   }
 })
 
-// 断开连接
 disconnectBtn.addEventListener('click', async () => {
   try {
     await chrome.runtime.sendMessage({ type: 'disconnect' })
-    setTimeout(fetchStatus, 100)
+    setTimeout(fetchStatus, 50)
   } catch (e) {
-    console.error('断开失败:', e)
+    console.error('Disconnect failed:', e)
   }
 })
 
-// 初始加载
 fetchStatus()
 
-// 监听 background 主动推送的状态变化
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === 'statusUpdate') {
     updateUI(message.state)
+  }
+})
+
+// Error List Toggle Logic
+errorRow.addEventListener('click', () => {
+  if (errorList.classList.contains('collapsed')) {
+    errorList.classList.remove('collapsed')
+  } else {
+    errorList.classList.add('collapsed')
   }
 })
