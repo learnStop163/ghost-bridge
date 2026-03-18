@@ -53,7 +53,7 @@ const STATUS_MAP = {
 }
 
 function renderUI(state) {
-  const { status, port, scanRound, enabled, currentPort, basePort, errorCount, recentErrors, tabTitle } = state
+  const { status, port, enabled, currentPort, basePort, connectionError, errorCount, recentErrors, tabTitle } = state
   const config = STATUS_MAP[status] || STATUS_MAP.disconnected
 
   // Update classes for color & animations
@@ -66,6 +66,9 @@ function renderUI(state) {
   } else if (config.statusClass === 'connecting') {
     headerGhost.className = 'ghost-wrapper ghost-connecting'
     document.body.className = 'connecting-state'
+  } else if (config.statusClass === 'error') {
+    headerGhost.className = 'ghost-wrapper ghost-error'
+    document.body.className = 'error-state'
   } else {
     headerGhost.className = 'ghost-wrapper ghost-disconnected'
     document.body.className = 'disconnected-state'
@@ -117,8 +120,7 @@ function renderUI(state) {
     
     detailContainer.classList.remove('collapsed')
   } else if ((status === 'connecting' || status === 'verifying' || status === 'scanning') && currentPort) {
-    const roundText = scanRound > 0 ? ` [R${scanRound + 1}]` : ''
-    portVal.textContent = `Scanning: ${currentPort}${roundText}`
+    portVal.textContent = `Connecting: ${currentPort}`
     portVal.className = 'detail-value highlight'
     tabRow.classList.add('hidden')
     errorRow.classList.add('hidden')
@@ -127,6 +129,12 @@ function renderUI(state) {
     detailContainer.classList.add('collapsed')
   } else if (status === 'not_found') {
     portVal.textContent = 'Launch Claude Code'
+    portVal.className = 'detail-value warning'
+    tabRow.classList.add('hidden')
+    errorRow.classList.add('hidden')
+    detailContainer.classList.remove('collapsed')
+  } else if (status === 'error') {
+    portVal.textContent = `Port ${currentPort || basePort || '-'} blocked`
     portVal.className = 'detail-value warning'
     tabRow.classList.add('hidden')
     errorRow.classList.add('hidden')
@@ -145,8 +153,11 @@ function renderUI(state) {
   }
 
   // Scan info text
-  if ((status === 'connecting' || status === 'scanning') && scanRound > 2) {
-    scanInfo.textContent = `Round ${scanRound}: Is your MCP Server running?`
+  if (status === 'error' && connectionError) {
+    scanInfo.textContent = connectionError
+    scanInfo.classList.remove('collapsed')
+  } else if (status === 'not_found' && basePort) {
+    scanInfo.textContent = `Port ${basePort} unavailable. Is your MCP server running on this port?`
     scanInfo.classList.remove('collapsed')
   } else {
     scanInfo.classList.add('collapsed')

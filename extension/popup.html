@@ -121,6 +121,15 @@
     }
     body.connected-state .bg-ripple-2 { animation-delay: 1.25s; }
 
+    .ghost-error .ghost-body { fill: #ef4444; }
+    .ghost-error .ghost-eyes-normal { opacity: 1; }
+
+    body.error-state .bg-ripple {
+      stroke: #ef4444;
+      animation: bg-ripple-scan 1.8s infinite cubic-bezier(0, 0, 0.2, 1);
+    }
+    body.error-state .bg-ripple-2 { animation-delay: 0.9s; }
+
     @keyframes bg-ripple-scan {
       0% { r: 10%; opacity: 0.8; stroke-width: 3; }
       100% { r: 80%; opacity: 0; stroke-width: 0; }

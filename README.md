@@ -1,159 +1,159 @@
 # 👻 Ghost Bridge
 
 [![npm version](https://img.shields.io/npm/v/ghost-bridge.svg?style=flat-square)](https://www.npmjs.com/package/ghost-bridge)
+[![npm total downloads](https://img.shields.io/npm/dt/ghost-bridge.svg?style=flat-square&label=downloads)](https://www.npmjs.com/package/ghost-bridge)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 
-> **Zero-restart Chrome AI Copilot** — Subvert your workflow. Allow AI to seamlessly take over the browser you're already using, enabling real-time debugging, visual observation, and interactive manipulation without launching a new Chrome instance.
+> Zero-restart Chrome bridge for MCP clients. Let AI inspect, debug, and operate the browser session you are already using.
 
----
+## Why
 
-## ✨ Why Ghost Bridge?
+Most browser-capable AI tools start a separate browser. Ghost Bridge connects AI to your existing Chrome session instead, so it can work with the page state you already have: logged-in accounts, reproduced bugs, in-progress flows, network failures, and real UI state.
 
-- 🔌 **Zero-Config Attach** — Bypasses the need for `--remote-debugging-port`. Captures Chrome's native DevTools Protocol directly via an extension.
-- 🔍 **No-Sourcemap Debugging** — Slice code fragments, perform string searches, and analyze coverage to pinpoint bugs straight in minified production code.
-- 🌐 **Deep Network Analysis** — Comprehensive capture of requests/responses with multi-dimensional filtering and response body inspection.
-- 📸 **Visual & Structural Perception** — Full-page or clipped high-fidelity screenshots paired with structural data extraction (titles, links, forms, buttons).
-- 🎯 **DOM Physical Manipulation** — Empowers AI to click, type, and form-submit with CDP-level physical simulation. Fully compatible with complex SPAs (React/Vue/Angular/Svelte).
-- 📊 **Performance Diagnostics** — Get granular engine metrics: JS Heap, Layout recalculations, Web Vitals (TTFB/FCP/LCP), and resource loading speeds.
-- 🔄 **Multi-Client Mastery** — Built-in singleton manager automatically coordinates multiple MCP clients sharing a single Chrome transport.
+## What It Does
 
----
+- Attach to Chrome without `--remote-debugging-port`
+- Inspect page structure, text, screenshots, errors, and network traffic
+- Search and extract script sources, even in production bundles
+- Click, type, scroll, and submit forms on the current page
+- Share one Chrome transport across multiple MCP clients
 
-## 🚀 Quick Start
+## What's New in 0.6.1
 
-### 1. Install & Initialize
+- `list_network_requests` and `get_network_detail` now summarize `data:` URLs and oversized URLs so inline images and long query strings do not overwhelm model context
+
+## What's New in 0.6.0
+
+- `inspect_page` now collects structured page data and interactive elements in one browser-side snapshot, reducing duplicate DOM scans and cutting one round-trip from the hot path
+- `capture_screenshot` now defaults to JPEG for better transfer efficiency: visible viewport screenshots default to `quality: 80`, and `fullPage` screenshots default to `quality: 70`
+- Use `format: "png"` when you need high-fidelity text rendering, 1px lines, icon edges, transparency, or pixel-level UI inspection
+- Attachment and request cleanup paths are more robust under concurrent usage and multi-client reconnect scenarios
+
+## Quick Start
+
+### 1. Install
 
 ```bash
-# Install globally
 npm install -g ghost-bridge
-
-# Auto-configure MCP (Claude Code, Antigravity, Codex) and prepare the extension directory
 ghost-bridge init
 ```
 
-> **Note on other MCP clients (Cursor, Windsurf, Roo):** 
-> `ghost-bridge init` attempts to auto-configure supported clients. If your client isn't auto-detected, simply add the following to your client's MCP configuration file (e.g., `mcp.json`):
-> ```json
-> {
->   "mcpServers": {
->     "ghost-bridge": {
->       "command": "node",
->       "args": ["/absolute/path/to/global/node_modules/ghost-bridge/dist/server.js"]
->     }
->   }
-> }
-> ```
+`ghost-bridge init` currently writes config for:
 
-### 2. Load the Chrome Extension
+- Claude Code: `~/.claude/settings.json` or `~/.claude.json`
+- Codex: `~/.codex/config.toml`
+- Cursor: `~/.cursor/mcp.json`
+- Antigravity: `~/.gemini/antigravity/mcp.json`
 
-1. Open Chrome and navigate to `chrome://extensions`
-2. Toggle **Developer mode** in the top right corner.
-3. Click **Load unpacked**
-4. Select the directory: `~/.ghost-bridge/extension`
+If your MCP client is not auto-detected, add one of these manually.
 
-> 💡 *Tip: Run `ghost-bridge extension --open` to reveal the directory directly.*
+JSON config:
 
-### 3. Connect & Command
-
-1. Click the **Ghost Bridge** ghost icon in your browser toolbar.
-2. Click **Connect** and wait for the status to turn to ✅ **ON**.
-3. Open Claude Desktop or your Claude CLI. All tools are now primed and ready!
-
----
-
-## 🛠️ Tool Arsenal
-
-### 🔍 Core Debugging
-
-| Tool | Capability |
-|------|------------|
-| `get_server_info` | Retrieves server instance status, WebSocket ports, and client roles. |
-| `get_last_error` | Aggregates recent exceptions, console errors, and failed network requests with mapped locators. |
-| `get_script_source` | Pulls raw script definitions. Supports URL-fragment filtering, specific line targeting, and beautification. |
-| `coverage_snapshot` | Triggers a quick coverage trace (1.5s default) to identify the most active scripts on the page. |
-| `find_by_string` | Scans page script sources for keywords, returning a 200-character context window. |
-| `symbolic_hints` | Gathers context clues: Resource lists, Global Variable keys, LocalStorage schema, and UA strings. |
-| `eval_script` | Executes raw JavaScript expressions in the page context. *(Use with caution)* |
-
-### 🌍 Network Intelligence
-
-| Tool | Capability |
-|------|------------|
-| `list_network_requests` | Lists captured network traffic. Supports filtering by URL, Method, Status Code, or Resource Type. |
-| `get_network_detail` | Dives deep into a specific request's Headers, Timing, and optional Response Body extraction. |
-| `clear_network_requests` | Wipes the current network capture buffer. |
-
-### 📸 Page Perception
-
-| Tool | Capability |
-|------|------------|
-| `capture_screenshot` | Captures the viewport or emulates full-page scrolling screenshots. |
-| `get_page_content` | Extracts raw text, sanitized HTML, or structured actionable data representations. |
-
-### 🎯 Interactive Automation (DOM)
-
-| Tool | Capability |
-|------|------------|
-| `get_interactive_snapshot` | Scans for visible interactive elements, returning a concise map `[e1, e2...]`. Pierces open Shadow DOMs. |
-| `dispatch_action` | Dispatches physical UI actions (click, fill, press, hover) against targeted element references (e.g., `e1`). |
-
-**Example Agent Workflow:**
-1. AI: `get_interactive_snapshot` ➝ `[{ref:"e1", tag:"input", placeholder:"Search..."}, {ref:"e2", tag:"button", text:"Login"}]`
-2. AI: `dispatch_action({ref: "e1", action: "fill", value: "hello"})`
-3. AI: `dispatch_action({ref: "e2", action: "click"})`
-4. AI: `capture_screenshot` to verify state changes.
-
-### 📊 Performance Profiling
-
-| Tool | Capability |
-|------|------------|
-| `perf_metrics` | Collects layered performance data (Engine Metrics, Web Vitals, and Resource Load Summaries). |
-
----
-
-## ⚙️ Configuration
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| **Base Port** | `33333` | WS port. Auto-increments if occupied. |
-| **Token** | *Monthly UUID* | Local WS auth token, auto-rotates on the 1st of every month. |
-| **Auto Detach** | `false` | Keeps debugger attached to actively buffer invisible exceptions and network calls. |
-
-**Environment Variables:**
-- `GHOST_BRIDGE_PORT` — Override base port.
-- `GHOST_BRIDGE_TOKEN` — Override connection token.
-
----
-
-## 🏗️ Architecture
-
-```mermaid
-graph LR
-    A[Claude CLI/Desktop] <-->|stdio| B(MCP Server\nserver.js)
-    B <-->|WebSocket| C(Chrome Extension\nbackground.js)
-    C <-->|CDP| D[Browser Tab\nTarget Context]
+```json
+{
+  "mcpServers": {
+    "ghost-bridge": {
+      "command": "/absolute/path/to/node",
+      "args": ["/absolute/path/to/global/node_modules/ghost-bridge/dist/server.js"]
+    }
+  }
+}
 ```
 
-- **MCP Server**: Spawned by Claude via standard I/O streams. Orchestrates WS connections.
-- **Chrome Extension (MV3)**: Taps into `chrome.debugger` API. Utilizes an Offscreen Document to prevent WS hibernation.
-- **Singleton Design**: If multiple agents spawn servers, the first becomes the master bridge while subsequent instances chain transparently as clients.
+Codex TOML:
 
----
+```toml
+[mcp_servers.ghost-bridge]
+type = "stdio"
+command = "/absolute/path/to/node"
+args = ["/absolute/path/to/global/node_modules/ghost-bridge/dist/server.js"]
+```
 
-## ⚠️ Known Limitations
+### 2. Load the Extension
 
-- **Service Workers Suspending**: MV3 background workers may suspend. We've built robust auto-reconnection logic, but prolonged inactivity might require re-toggling.
-- **DevTools Conflict**: If you manually open Chrome DevTools (F12) on the target tab, `chrome.debugger.attach` may be rejected.
-- **Beautify Overhead**: Beautifying massive single-line bundles is expensive; the server will auto-truncate overly large scripts.
-- **Cross-Origin OOPIF**: Elements and errors deeply embedded in strict Cross-Origin Iframes might evade the primary debugger hook without further multi-target attach logic.
+1. Open `chrome://extensions`
+2. Enable Developer mode
+3. Click `Load unpacked`
+4. Select `~/.ghost-bridge/extension`
 
----
+You can also run:
 
-## 🤝 Contributing
+```bash
+ghost-bridge extension --open
+```
 
-Contributions, issues, and feature requests are welcome! 
-Check out our [Contributing Guide](CONTRIBUTING.md) to get started building tools or improving the bridge.
+### 3. Connect
 
-## 📄 License
+1. Click the Ghost Bridge extension icon
+2. Click `Connect`
+3. Wait until the status becomes `ON`
+4. Open your MCP client and start working on the current page
 
-This project is [MIT](LICENSE) licensed.
+Typical prompts:
+
+- `Analyze the current page`
+- `Check why this layout is broken`
+- `Inspect the DOM structure`
+- `Click the login button and submit the form`
+
+## Tools
+
+| Tool | Purpose |
+|------|---------|
+| `inspect_page` | Default entry point for page analysis |
+| `capture_screenshot` | Visual inspection and UI debugging |
+| `get_page_content` | Text, HTML, and structured DOM extraction |
+| `get_interactive_snapshot` | Find clickable and editable elements |
+| `dispatch_action` | Click, fill, press, scroll, hover, select |
+| `list_network_requests` | Inspect captured network traffic |
+| `get_network_detail` | Read one request in detail |
+| `get_last_error` | Inspect recent errors and exceptions |
+| `get_script_source` | Extract page scripts |
+| `find_by_string` | Search within bundled script content |
+| `coverage_snapshot` | Identify active scripts quickly |
+| `perf_metrics` | Collect Web Vitals and engine metrics |
+
+Recommended flow:
+
+1. Start with `inspect_page`
+2. Use `capture_screenshot` for visual issues
+   Default is optimized for transfer with JPEG; switch to `png` for pixel-level checks
+3. Use `get_page_content` for DOM or text extraction
+4. Use `get_interactive_snapshot` before `dispatch_action`
+
+Notes:
+
+- `list_network_requests` and `get_network_detail` automatically summarize `data:` URLs and very long URLs so inline images or oversized query strings do not overwhelm model context
+
+## Configuration
+
+| Setting | Default | Notes |
+|---------|---------|-------|
+| Port | `33333` | Set `GHOST_BRIDGE_PORT` to override |
+| Token | Monthly UUID | Set `GHOST_BRIDGE_TOKEN` to override |
+| Auto detach | `false` | Keeps debugger attached for ongoing capture |
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A["AI Client<br/>Claude / Codex / Cursor"]
+    B["Ghost Bridge MCP Server<br/>server.js"]
+    C["Chrome Extension<br/>background.js"]
+    D["Browser Tab<br/>Target Context"]
+
+    A <-->|"stdio"| B
+    B <-->|"WebSocket"| C
+    C <-->|"CDP"| D
+```
+
+## Limitations
+
+- Chrome DevTools on the target tab can conflict with `chrome.debugger.attach`
+- MV3 background lifecycle can still cause reconnect scenarios after long idle periods
+- Very large minified bundles may be truncated during beautify or extraction
+- Deep cross-origin iframe cases are not fully covered yet
+
+## License
+
+[MIT](LICENSE)
