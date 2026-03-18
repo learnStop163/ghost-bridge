@@ -1,9 +1,21 @@
 import * as esbuild from 'esbuild';
 import fs from 'fs-extra';
+import path from 'path';
 
 // Clean dist directory
 fs.removeSync('dist');
 fs.ensureDirSync('dist');
+
+const packageJson = fs.readJsonSync('package.json');
+const extensionManifestPath = path.join('extension', 'manifest.json');
+
+function syncExtensionManifestVersion() {
+    const manifest = fs.readJsonSync(extensionManifestPath);
+    if (manifest.version !== packageJson.version) {
+        manifest.version = packageJson.version;
+        fs.writeJsonSync(extensionManifestPath, manifest, { spaces: 2 });
+    }
+}
 
 const commonConfig = {
   bundle: true,
@@ -20,6 +32,8 @@ const commonConfig = {
 };
 
 async function build() {
+    syncExtensionManifestVersion();
+
     console.log('📦 Bundling CLI...');
     await esbuild.build({
         ...commonConfig,

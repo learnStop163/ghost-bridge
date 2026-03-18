@@ -3228,8 +3228,8 @@ var require_utils = __commonJS({
       }
       return ind;
     }
-    function removeDotSegments(path2) {
-      let input = path2;
+    function removeDotSegments(path3) {
+      let input = path3;
       const output = [];
       let nextSlash = -1;
       let len = 0;
@@ -3428,8 +3428,8 @@ var require_schemes = __commonJS({
         wsComponent.secure = void 0;
       }
       if (wsComponent.resourceName) {
-        const [path2, query] = wsComponent.resourceName.split("?");
-        wsComponent.path = path2 && path2 !== "/" ? path2 : void 0;
+        const [path3, query] = wsComponent.resourceName.split("?");
+        wsComponent.path = path3 && path3 !== "/" ? path3 : void 0;
         wsComponent.query = query;
         wsComponent.resourceName = void 0;
       }
@@ -6782,12 +6782,12 @@ var require_dist = __commonJS({
         throw new Error(`Unknown format "${name}"`);
       return f;
     };
-    function addFormats(ajv, list, fs2, exportName) {
+    function addFormats(ajv, list, fs3, exportName) {
       var _a2;
       var _b;
       (_a2 = (_b = ajv.opts.code).formats) !== null && _a2 !== void 0 ? _a2 : _b.formats = (0, codegen_1._)`require("ajv-formats/dist/formats").${exportName}`;
       for (const f of list)
-        ajv.addFormat(f, fs2[f]);
+        ajv.addFormat(f, fs3[f]);
     }
     module.exports = exports = formatsPlugin;
     Object.defineProperty(exports, "__esModule", { value: true });
@@ -15012,8 +15012,8 @@ function getErrorMap() {
 
 // node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue = (params) => {
-  const { data, path: path2, errorMaps, issueData } = params;
-  const fullPath = [...path2, ...issueData.path || []];
+  const { data, path: path3, errorMaps, issueData } = params;
+  const fullPath = [...path3, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -15128,11 +15128,11 @@ var errorUtil;
 
 // node_modules/zod/v3/types.js
 var ParseInputLazyPath = class {
-  constructor(parent, value, path2, key) {
+  constructor(parent, value, path3, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path2;
+    this._path = path3;
     this._key = key;
   }
   get path() {
@@ -18776,10 +18776,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path2) {
-  if (!path2)
+function getElementAtPath(obj, path3) {
+  if (!path3)
     return obj;
-  return path2.reduce((acc, key) => acc?.[key], obj);
+  return path3.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -19162,11 +19162,11 @@ function aborted(x, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path2, issues) {
+function prefixIssues(path3, issues) {
   return issues.map((iss) => {
     var _a2;
     (_a2 = iss).path ?? (_a2.path = []);
-    iss.path.unshift(path2);
+    iss.path.unshift(path3);
     return iss;
   });
 }
@@ -28520,11 +28520,22 @@ var import_websocket_server = __toESM(require_websocket_server(), 1);
 var import_js_beautify = __toESM(require_js(), 1);
 import crypto from "crypto";
 import net from "net";
-import fs from "fs";
+import fs2 from "fs";
 import os from "os";
+import path2 from "path";
+
+// lib/version.js
+import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
+var __filename = fileURLToPath(import.meta.url);
+var __dirname = path.dirname(__filename);
+var packageJsonPath = path.resolve(__dirname, "../package.json");
+var packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+var GHOST_BRIDGE_VERSION = packageJson.version;
+
+// src/server.js
 var BASE_PORT = Number(process.env.GHOST_BRIDGE_PORT || 33333);
-var MAX_PORT_RETRIES = 10;
 function getMonthlyToken() {
   const now = /* @__PURE__ */ new Date();
   const firstDayOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
@@ -28532,7 +28543,7 @@ function getMonthlyToken() {
 }
 var WS_TOKEN = process.env.GHOST_BRIDGE_TOKEN || getMonthlyToken();
 var RESPONSE_TIMEOUT = 8e3;
-var PORT_INFO_FILE = path.join(os.tmpdir(), "ghost-bridge-port.json");
+var PORT_INFO_FILE = path2.join(os.tmpdir(), "ghost-bridge-port.json");
 var chromeConnection = null;
 var activeConnection = null;
 var actualPort = BASE_PORT;
@@ -28552,12 +28563,16 @@ function isProcessRunning(pid) {
 }
 function getExistingService() {
   try {
-    if (!fs.existsSync(PORT_INFO_FILE)) return null;
-    const info = JSON.parse(fs.readFileSync(PORT_INFO_FILE, "utf-8"));
+    if (!fs2.existsSync(PORT_INFO_FILE)) return null;
+    const info = JSON.parse(fs2.readFileSync(PORT_INFO_FILE, "utf-8"));
     if (!info.pid || !info.port) return null;
+    if (info.port !== BASE_PORT) {
+      fs2.unlinkSync(PORT_INFO_FILE);
+      return null;
+    }
     if (!isProcessRunning(info.pid)) {
       log(`\u65E7\u670D\u52A1 PID ${info.pid} \u5DF2\u4E0D\u5B58\u5728\uFF0C\u6E05\u7406\u65E7\u4FE1\u606F`);
-      fs.unlinkSync(PORT_INFO_FILE);
+      fs2.unlinkSync(PORT_INFO_FILE);
       return null;
     }
     return info;
@@ -28606,22 +28621,14 @@ function isPortAvailable(port) {
   });
 }
 async function startWebSocketServer() {
-  for (let i = 0; i < MAX_PORT_RETRIES; i++) {
-    const port = BASE_PORT + i;
-    const available = await isPortAvailable(port);
-    if (available) {
-      actualPort = port;
-      const wss2 = new import_websocket_server.default({ port });
-      if (port !== BASE_PORT) {
-        log(`\u26A0\uFE0F \u7AEF\u53E3 ${BASE_PORT} \u88AB\u5360\u7528\uFF0C\u5DF2\u5207\u6362\u5230\u7AEF\u53E3 ${port}`);
-      }
-      log(`\u{1F680} WebSocket \u670D\u52A1\u5DF2\u542F\u52A8\uFF0C\u7AEF\u53E3 ${port}${WS_TOKEN ? "\uFF08\u542F\u7528 token \u6821\u9A8C\uFF09" : ""}`);
-      return wss2;
-    } else {
-      log(`\u7AEF\u53E3 ${port} \u88AB\u5360\u7528\uFF0C\u5C1D\u8BD5\u4E0B\u4E00\u4E2A...`);
-    }
+  const available = await isPortAvailable(BASE_PORT);
+  if (!available) {
+    throw new Error(`\u56FA\u5B9A\u7AEF\u53E3 ${BASE_PORT} \u4E0D\u53EF\u7528\uFF0C\u8BF7\u91CA\u653E\u8BE5\u7AEF\u53E3\u6216\u901A\u8FC7 GHOST_BRIDGE_PORT \u6307\u5B9A\u5176\u4ED6\u7AEF\u53E3`);
   }
-  throw new Error(`\u65E0\u6CD5\u627E\u5230\u53EF\u7528\u7AEF\u53E3\uFF08\u5DF2\u5C1D\u8BD5 ${BASE_PORT} - ${BASE_PORT + MAX_PORT_RETRIES - 1}\uFF09`);
+  actualPort = BASE_PORT;
+  const wss2 = new import_websocket_server.default({ port: BASE_PORT });
+  log(`\u{1F680} WebSocket \u670D\u52A1\u5DF2\u542F\u52A8\uFF0C\u7AEF\u53E3 ${BASE_PORT}${WS_TOKEN ? "\uFF08\u542F\u7528 token \u6821\u9A8C\uFF09" : ""}`);
+  return wss2;
 }
 async function initWebSocketService() {
   const existing = getExistingService();
@@ -28636,14 +28643,24 @@ async function initWebSocketService() {
     } else {
       log(`\u274C \u73B0\u6709\u670D\u52A1\u9A8C\u8BC1\u5931\u8D25\uFF0C\u542F\u52A8\u65B0\u670D\u52A1...`);
       try {
-        fs.unlinkSync(PORT_INFO_FILE);
+        fs2.unlinkSync(PORT_INFO_FILE);
       } catch {
       }
     }
   }
+  if (!await isPortAvailable(BASE_PORT)) {
+    const valid = await verifyExistingService(BASE_PORT);
+    if (valid) {
+      actualPort = BASE_PORT;
+      isMainInstance = false;
+      log(`\u2705 \u590D\u7528\u56FA\u5B9A\u7AEF\u53E3\u4E0A\u7684\u73B0\u6709\u670D\u52A1\uFF0C\u7AEF\u53E3 ${actualPort}`);
+      return null;
+    }
+    throw new Error(`\u56FA\u5B9A\u7AEF\u53E3 ${BASE_PORT} \u5DF2\u88AB\u5176\u4ED6\u8FDB\u7A0B\u5360\u7528\uFF0C\u8BF7\u91CA\u653E\u8BE5\u7AEF\u53E3\u6216\u901A\u8FC7 GHOST_BRIDGE_PORT \u6307\u5B9A\u5176\u4ED6\u7AEF\u53E3`);
+  }
   const wss2 = await startWebSocketServer();
   isMainInstance = true;
-  fs.writeFileSync(
+  fs2.writeFileSync(
     PORT_INFO_FILE,
     JSON.stringify({
       port: actualPort,
@@ -28796,9 +28813,18 @@ function connectToMainInstance() {
   });
 }
 function failAllPending(message) {
-  pendingRequests.forEach(({ reject, timer }) => {
-    clearTimeout(timer);
-    reject(new Error(message));
+  pendingRequests.forEach((pending, id) => {
+    if (pending.reject) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(message));
+    } else if (pending.source) {
+      try {
+        if (pending.source.readyState === import_websocket.default.OPEN) {
+          pending.source.send(JSON.stringify({ id, error: message }));
+        }
+      } catch {
+      }
+    }
   });
   pendingRequests.clear();
 }
@@ -28858,7 +28884,7 @@ async function askChrome(command, params = {}, options = {}) {
   });
 }
 function jsonText(data) {
-  return typeof data === "string" ? data : JSON.stringify(data, null, 2);
+  return typeof data === "string" ? data : JSON.stringify(data);
 }
 function buildSnippet(source, line, column, { beautifyEnabled = true, contextLines = 20 } = {}) {
   const result = {};
@@ -28896,11 +28922,32 @@ function buildSnippet(source, line, column, { beautifyEnabled = true, contextLin
   return result;
 }
 var server = new Server(
-  { name: "ghost-bridge", version: "0.4.0" },
+  { name: "ghost-bridge", version: GHOST_BRIDGE_VERSION },
   { capabilities: { tools: {} } }
 );
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
+    {
+      name: "inspect_page",
+      description: "\u3010\u9875\u9762\u5206\u6790\u5165\u53E3\u3011\u5F53\u7528\u6237\u8981\u6C42\u5206\u6790\u5F53\u524D\u9875\u9762/\u7F51\u7AD9/\u7F51\u9875\u3001\u7406\u89E3\u9875\u9762\u7ED3\u6784\u3001\u5FEB\u901F\u67E5\u770B\u5F53\u524D\u6807\u7B7E\u5185\u5BB9\u65F6\uFF0C\u4F18\u5148\u4F7F\u7528\u6B64\u5DE5\u5177\u3002\u65E0\u9700\u7528\u6237\u663E\u5F0F\u63D0\u5230 ghost-bridge\u3002\u9ED8\u8BA4\u8FD4\u56DE\u9875\u9762\u5143\u6570\u636E\u3001\u7ED3\u6784\u5316\u5185\u5BB9\u6458\u8981\u548C\u53EF\u4EA4\u4E92\u5143\u7D20\u6982\u89C8\uFF0C\u9002\u5408\u4F5C\u4E3A\u540E\u7EED\u622A\u56FE\u3001\u4EA4\u4E92\u3001\u7F51\u7EDC\u6392\u67E5\u524D\u7684\u7B2C\u4E00\u6B65\u3002",
+      inputSchema: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "CSS \u9009\u62E9\u5668\uFF0C\u9650\u5B9A\u5206\u6790\u8303\u56F4\u3002\u4E0D\u6307\u5B9A\u5219\u5206\u6790\u6574\u4E2A\u9875\u9762"
+          },
+          includeInteractive: {
+            type: "boolean",
+            description: "\u662F\u5426\u5305\u542B\u4EA4\u4E92\u5143\u7D20\u6982\u89C8\uFF0C\u9ED8\u8BA4 true"
+          },
+          maxElements: {
+            type: "number",
+            description: "\u4EA4\u4E92\u5143\u7D20\u6982\u89C8\u7684\u6700\u5927\u6570\u91CF\uFF0C\u9ED8\u8BA4 30"
+          }
+        }
+      }
+    },
     {
       name: "get_server_info",
       description: "\u83B7\u53D6 ghost-bridge \u670D\u52A1\u5668\u72B6\u6001\uFF0C\u5305\u62EC\u5F53\u524D WebSocket \u7AEF\u53E3\u3001\u8FDE\u63A5\u72B6\u6001\u7B49",
@@ -28908,8 +28955,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_last_error",
-      description: "\u83B7\u53D6\u5F53\u524D\u6807\u7B7E\u6700\u8FD1\u7684\u5F02\u5E38/\u62A5\u9519\u5806\u6808\u4E0E\u5143\u6570\u636E\uFF08\u65E0 sourcemap \u53CB\u597D\uFF09",
-      inputSchema: { type: "object", properties: {} }
+      description: "\u83B7\u53D6\u5F53\u524D\u6807\u7B7E\u6700\u8FD1\u7684\u5F02\u5E38/\u62A5\u9519\u5806\u6808\u4E0E\u5143\u6570\u636E\uFF08\u65E0 sourcemap \u53CB\u597D\uFF09\u3002\u9ED8\u8BA4\u53EA\u8FD4\u56DE error \u7EA7\u522B\u7684\u6700\u8FD1 20 \u6761\u3002",
+      inputSchema: {
+        type: "object",
+        properties: {
+          severity: {
+            type: "string",
+            enum: ["error", "warn", "info", "all"],
+            description: "\u65E5\u5FD7\u7EA7\u522B\u8FC7\u6EE4\uFF0C\u9ED8\u8BA4 error"
+          },
+          limit: {
+            type: "number",
+            description: "\u8FD4\u56DE\u6761\u6570\u9650\u5236\uFF0C\u9ED8\u8BA4 20\uFF0C\u6700\u5927 100"
+          }
+        }
+      }
     },
     {
       name: "get_script_source",
@@ -28964,7 +29024,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "list_network_requests",
-      description: "\u5217\u51FA\u6355\u83B7\u7684\u7F51\u7EDC\u8BF7\u6C42\uFF0C\u652F\u6301\u6309 URL\u3001\u65B9\u6CD5\u3001\u72B6\u6001\u3001\u7C7B\u578B\u8FC7\u6EE4",
+      description: "\u5217\u51FA\u6355\u83B7\u7684\u7F51\u7EDC\u8BF7\u6C42\uFF0C\u652F\u6301\u6309 URL\u3001\u65B9\u6CD5\u3001\u72B6\u6001\u3001\u7C7B\u578B\u8FC7\u6EE4\u3002\u9ED8\u8BA4\u6309\u6392\u969C\u4F18\u5148\u7EA7\u6392\u5E8F\uFF1A\u5931\u8D25\u8BF7\u6C42\u3001\u8FDB\u884C\u4E2D\u8BF7\u6C42\u3001XHR/Fetch \u4F1A\u4F18\u5148\u5C55\u793A\u3002\u4E3A\u907F\u514D\u4E0A\u4E0B\u6587\u81A8\u80C0\uFF0Cdata URL \u548C\u8D85\u957F URL \u4F1A\u81EA\u52A8\u6458\u8981\u5316\u3002",
       inputSchema: {
         type: "object",
         properties: {
@@ -28972,13 +29032,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           method: { type: "string", description: "\u8BF7\u6C42\u65B9\u6CD5\uFF1AGET/POST/PUT/DELETE \u7B49" },
           status: { type: "string", description: "\u72B6\u6001\uFF1Asuccess/error/failed/pending" },
           resourceType: { type: "string", description: "\u8D44\u6E90\u7C7B\u578B\uFF1AXHR/Fetch/Script/Image \u7B49" },
-          limit: { type: "number", description: "\u8FD4\u56DE\u6570\u91CF\u9650\u5236\uFF0C\u9ED8\u8BA4 50" }
+          limit: { type: "number", description: "\u8FD4\u56DE\u6570\u91CF\u9650\u5236\uFF0C\u9ED8\u8BA4 50" },
+          priorityMode: {
+            type: "string",
+            enum: ["debug", "api", "recent"],
+            description: "\u6392\u5E8F\u6A21\u5F0F\uFF1Adebug=\u6392\u969C\u4F18\u5148\uFF08\u9ED8\u8BA4\uFF09\uFF0Capi=\u63A5\u53E3\u4F18\u5148\uFF0Crecent=\u6309\u65F6\u95F4\u5012\u5E8F"
+          }
         }
       }
     },
     {
       name: "get_network_detail",
-      description: "\u83B7\u53D6\u5355\u4E2A\u7F51\u7EDC\u8BF7\u6C42\u7684\u8BE6\u7EC6\u4FE1\u606F\uFF0C\u5305\u62EC\u8BF7\u6C42\u5934\u3001\u54CD\u5E94\u5934\uFF0C\u53EF\u9009\u83B7\u53D6\u54CD\u5E94\u4F53",
+      description: "\u83B7\u53D6\u5355\u4E2A\u7F51\u7EDC\u8BF7\u6C42\u7684\u8BE6\u7EC6\u4FE1\u606F\uFF0C\u5305\u62EC\u8BF7\u6C42\u5934\u3001\u54CD\u5E94\u5934\uFF0C\u53EF\u9009\u83B7\u53D6\u54CD\u5E94\u4F53\u3002\u4E3A\u907F\u514D\u4E0A\u4E0B\u6587\u81A8\u80C0\uFF0Cdata URL \u548C\u8D85\u957F URL \u4F1A\u81EA\u52A8\u6458\u8981\u5316\u3002",
       inputSchema: {
         type: "object",
         properties: {
@@ -29012,18 +29077,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "capture_screenshot",
-      description: "\u3010\u63A8\u8350\u7528\u4E8E\u89C6\u89C9\u5206\u6790\u3011\u622A\u53D6\u5F53\u524D\u9875\u9762\u7684\u622A\u56FE\uFF0C\u8FD4\u56DE base64 \u56FE\u7247\u3002\u9002\u7528\u4E8E\uFF1A1) \u67E5\u770B\u9875\u9762\u5B9E\u9645\u89C6\u89C9\u6548\u679C 2) \u6392\u67E5 UI/\u6837\u5F0F/\u5E03\u5C40/\u989C\u8272\u95EE\u9898 3) \u9A8C\u8BC1\u9875\u9762\u6E32\u67D3 4) \u5206\u6790\u5143\u7D20\u4F4D\u7F6E\u548C\u95F4\u8DDD 5) \u67E5\u770B\u56FE\u7247/\u56FE\u6807\u7B49\u89C6\u89C9\u5185\u5BB9\u3002\u5F53\u9700\u8981\u770B\u5230\u9875\u9762\u300C\u957F\u4EC0\u4E48\u6837\u300D\u65F6\u4F7F\u7528\u6B64\u5DE5\u5177\u3002\u5982\u4EC5\u9700\u6587\u672C/\u94FE\u63A5\u7B49\u4FE1\u606F\uFF0C\u5EFA\u8BAE\u4F7F\u7528\u66F4\u5FEB\u7684 get_page_content\u3002",
+      description: "\u3010\u63A8\u8350\u7528\u4E8E\u89C6\u89C9\u5206\u6790\u3011\u622A\u53D6\u5F53\u524D\u9875\u9762\u7684\u622A\u56FE\uFF0C\u8FD4\u56DE base64 \u56FE\u7247\u3002\u9002\u7528\u4E8E\uFF1A1) \u67E5\u770B\u9875\u9762\u5B9E\u9645\u89C6\u89C9\u6548\u679C 2) \u6392\u67E5 UI/\u6837\u5F0F/\u5E03\u5C40/\u989C\u8272\u95EE\u9898 3) \u9A8C\u8BC1\u9875\u9762\u6E32\u67D3 4) \u5206\u6790\u5143\u7D20\u4F4D\u7F6E\u548C\u95F4\u8DDD 5) \u67E5\u770B\u56FE\u7247/\u56FE\u6807\u7B49\u89C6\u89C9\u5185\u5BB9\u3002\u5F53\u7528\u6237\u8BF4\u201C\u770B\u770B\u8FD9\u4E2A\u9875\u9762\u957F\u4EC0\u4E48\u6837\u201D\u201C\u5E2E\u6211\u5206\u6790\u754C\u9762/\u5E03\u5C40/\u6837\u5F0F\u201D\u65F6\uFF0C\u5E94\u4F18\u5148\u4F7F\u7528\u6B64\u5DE5\u5177\uFF0C\u65E0\u9700\u7528\u6237\u663E\u5F0F\u63D0\u5230 ghost-bridge\u3002\u5F53\u9700\u8981\u770B\u5230\u9875\u9762\u300C\u957F\u4EC0\u4E48\u6837\u300D\u65F6\u4F7F\u7528\u6B64\u5DE5\u5177\u3002\u9ED8\u8BA4\u4F18\u5148\u4F7F\u7528\u66F4\u7701\u4F20\u8F93\u7684 JPEG\uFF1A\u666E\u901A\u622A\u56FE\u9ED8\u8BA4 quality 80\uFF0C\u5B8C\u6574\u957F\u622A\u56FE\u9ED8\u8BA4 quality 70\u3002\u5F53\u9700\u8981\u68C0\u67E5\u6587\u5B57\u6E05\u6670\u5EA6\u30011px \u7EC6\u7EBF\u3001\u56FE\u6807\u8FB9\u7F18\u3001\u900F\u660E\u80CC\u666F\u6216\u50CF\u7D20\u7EA7\u7EC6\u8282\u65F6\uFF0C\u5E94\u4F18\u5148\u4F7F\u7528 PNG\u3002\u5982\u4EC5\u9700\u6587\u672C/\u94FE\u63A5\u7B49\u4FE1\u606F\uFF0C\u5EFA\u8BAE\u4F7F\u7528\u66F4\u5FEB\u7684 get_page_content\u3002",
       inputSchema: {
         type: "object",
         properties: {
           format: {
             type: "string",
             enum: ["png", "jpeg"],
-            description: "\u56FE\u7247\u683C\u5F0F\uFF0C\u9ED8\u8BA4 png\uFF08\u65E0\u635F\uFF09\uFF0Cjpeg \u66F4\u5C0F"
+            description: "\u56FE\u7247\u683C\u5F0F\u3002\u9ED8\u8BA4\u4F7F\u7528 jpeg\uFF1B\u9700\u8981\u9AD8\u4FDD\u771F\u6587\u5B57\u3001\u7EC6\u7EBF\u3001\u900F\u660E\u80CC\u666F\u65F6\u7528 png"
           },
           quality: {
             type: "number",
-            description: "JPEG \u8D28\u91CF (0-100)\uFF0C\u4EC5\u5F53 format \u4E3A jpeg \u65F6\u6709\u6548\uFF0C\u5EFA\u8BAE 80"
+            description: "JPEG \u8D28\u91CF (0-100)\uFF0C\u4EC5\u5F53 format \u4E3A jpeg \u65F6\u6709\u6548\u3002\u9ED8\u8BA4\u666E\u901A\u622A\u56FE 80\uFF0C\u5B8C\u6574\u957F\u622A\u56FE 70"
           },
           fullPage: {
             type: "boolean",
@@ -29044,7 +29109,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_page_content",
-      description: "\u3010\u63A8\u8350\u7528\u4E8E\u5FEB\u901F\u83B7\u53D6\u9875\u9762\u5185\u5BB9\u3011\u63D0\u53D6\u5F53\u524D\u9875\u9762\u7684\u6587\u672C\u3001HTML \u6216\u7ED3\u6784\u5316\u6570\u636E\u3002\u6BD4 capture_screenshot \u66F4\u5FEB\u66F4\u8F7B\u91CF\uFF0C\u9002\u7528\u4E8E\uFF1A1) \u83B7\u53D6\u9875\u9762\u6587\u5B57\u5185\u5BB9 2) \u63D0\u53D6\u94FE\u63A5/\u6309\u94AE/\u8868\u5355\u7B49\u5143\u7D20 3) \u5206\u6790 DOM \u7ED3\u6784 4) \u83B7\u53D6\u9875\u9762\u5143\u6570\u636E\uFF08title/description\uFF09\u3002\u5F53\u9700\u8981\u6587\u672C\u4FE1\u606F\u800C\u975E\u89C6\u89C9\u6548\u679C\u65F6\uFF0C\u4F18\u5148\u4F7F\u7528\u6B64\u5DE5\u5177\u3002\u6CE8\u610F\uFF1A\u4E0D\u652F\u6301 iframe \u5185\u5BB9\uFF0C\u4E0D\u53CD\u6620 CSS \u6837\u5F0F\u3002",
+      description: "\u3010\u63A8\u8350\u7528\u4E8E\u5FEB\u901F\u83B7\u53D6\u9875\u9762\u5185\u5BB9\u3011\u63D0\u53D6\u5F53\u524D\u9875\u9762\u7684\u6587\u672C\u3001HTML \u6216\u7ED3\u6784\u5316\u6570\u636E\u3002\u6BD4 capture_screenshot \u66F4\u5FEB\u66F4\u8F7B\u91CF\uFF0C\u9002\u7528\u4E8E\uFF1A1) \u83B7\u53D6\u9875\u9762\u6587\u5B57\u5185\u5BB9 2) \u63D0\u53D6\u94FE\u63A5/\u6309\u94AE/\u8868\u5355\u7B49\u5143\u7D20 3) \u5206\u6790 DOM \u7ED3\u6784 4) \u83B7\u53D6\u9875\u9762\u5143\u6570\u636E\uFF08title/description\uFF09\u3002\u5F53\u7528\u6237\u8BF4\u201C\u5206\u6790\u8FD9\u4E2A\u9875\u9762/\u7F51\u7AD9\u201D\u201C\u770B\u770B\u9875\u9762\u91CC\u6709\u4EC0\u4E48\u5185\u5BB9\u201D\u4E14\u4E0D\u5F3A\u8C03\u89C6\u89C9\u6548\u679C\u65F6\uFF0C\u4F18\u5148\u4F7F\u7528\u6B64\u5DE5\u5177\uFF0C\u65E0\u9700\u7528\u6237\u663E\u5F0F\u63D0\u5230 ghost-bridge\u3002\u5F53\u9700\u8981\u6587\u672C\u4FE1\u606F\u800C\u975E\u89C6\u89C9\u6548\u679C\u65F6\uFF0C\u4F18\u5148\u4F7F\u7528\u6B64\u5DE5\u5177\u3002\u6CE8\u610F\uFF1A\u4E0D\u652F\u6301 iframe \u5185\u5BB9\uFF0C\u4E0D\u53CD\u6620 CSS \u6837\u5F0F\u3002",
       inputSchema: {
         type: "object",
         properties: {
@@ -29070,7 +29135,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_interactive_snapshot",
-      description: "\u3010\u64CD\u4F5C\u9875\u9762\u524D\u5FC5\u987B\u5148\u8C03\u7528\u3011\u626B\u63CF\u5F53\u524D\u9875\u9762\u6240\u6709\u53EF\u89C1\u7684\u53EF\u4EA4\u4E92\u5143\u7D20\uFF08\u6309\u94AE/\u94FE\u63A5/\u8F93\u5165\u6846/\u4E0B\u62C9\u6846\u7B49\uFF09\uFF0C\u8FD4\u56DE\u5E26\u6709 ref \u77ED\u6807\u8BC6\uFF08\u5982 e1, e2, e3\uFF09\u7684\u7CBE\u7B80\u5217\u8868\uFF0C\u5305\u542B\u5143\u7D20\u7C7B\u578B\u3001\u6587\u672C\u548C\u4F4D\u7F6E\u3002Token \u6781\u7701\uFF08\u901A\u5E38 < 1000 tokens\uFF09\uFF0C\u4E13\u4E3A AI \u64CD\u4F5C\u9875\u9762\u800C\u8BBE\u8BA1\u3002\u83B7\u53D6\u540E\u53EF\u901A\u8FC7 dispatch_action \u5DE5\u5177\u4F7F\u7528 ref \u6807\u8BC6\u6765\u70B9\u51FB\u3001\u586B\u5199\u3001\u6309\u952E\u7B49\u3002\u652F\u6301 Shadow DOM \u7A7F\u900F\u3002\n\u26A0\uFE0F \u4EC5\u7528\u4E8E\u4EA4\u4E92\u64CD\u4F5C\u524D\u7684\u5143\u7D20\u5B9A\u4F4D\u3002\u5982\u9700\u6392\u67E5 UI/CSS \u5E03\u5C40\u95EE\u9898\uFF0C\u8BF7\u4F7F\u7528 capture_screenshot \u6216 get_page_content\u3002",
+      description: "\u3010\u64CD\u4F5C\u9875\u9762\u524D\u5FC5\u987B\u5148\u8C03\u7528\u3011\u626B\u63CF\u5F53\u524D\u9875\u9762\u6240\u6709\u53EF\u89C1\u7684\u53EF\u4EA4\u4E92\u5143\u7D20\uFF08\u6309\u94AE/\u94FE\u63A5/\u8F93\u5165\u6846/\u4E0B\u62C9\u6846\u7B49\uFF09\uFF0C\u8FD4\u56DE\u5E26\u6709 ref \u77ED\u6807\u8BC6\uFF08\u5982 e1, e2, e3\uFF09\u7684\u7CBE\u7B80\u5217\u8868\uFF0C\u5305\u542B\u5143\u7D20\u7C7B\u578B\u3001\u6587\u672C\u548C\u4F4D\u7F6E\u3002Token \u6781\u7701\uFF08\u901A\u5E38 < 1000 tokens\uFF09\uFF0C\u4E13\u4E3A AI \u64CD\u4F5C\u9875\u9762\u800C\u8BBE\u8BA1\u3002\u5F53\u7528\u6237\u8981\u6C42\u70B9\u51FB\u3001\u8F93\u5165\u3001\u767B\u5F55\u3001\u63D0\u4EA4\u8868\u5355\u3001\u6253\u5F00\u83DC\u5355\u7B49\u64CD\u4F5C\u65F6\uFF0C\u5E94\u4E3B\u52A8\u4F7F\u7528\u6B64\u5DE5\u5177\u5F00\u59CB\u5B9A\u4F4D\u5143\u7D20\uFF0C\u65E0\u9700\u7528\u6237\u663E\u5F0F\u63D0\u5230 ghost-bridge\u3002\u83B7\u53D6\u540E\u53EF\u901A\u8FC7 dispatch_action \u5DE5\u5177\u4F7F\u7528 ref \u6807\u8BC6\u6765\u70B9\u51FB\u3001\u586B\u5199\u3001\u6309\u952E\u7B49\u3002\u652F\u6301 Shadow DOM \u7A7F\u900F\u3002\n\u26A0\uFE0F \u4EC5\u7528\u4E8E\u4EA4\u4E92\u64CD\u4F5C\u524D\u7684\u5143\u7D20\u5B9A\u4F4D\u3002\u5982\u9700\u6392\u67E5 UI/CSS \u5E03\u5C40\u95EE\u9898\uFF0C\u8BF7\u4F7F\u7528 capture_screenshot \u6216 get_page_content\u3002",
       inputSchema: {
         type: "object",
         properties: {
@@ -29091,7 +29156,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "dispatch_action",
-      description: "\u3010\u64CD\u4F5C\u9875\u9762\u5143\u7D20\u3011\u5BF9 get_interactive_snapshot \u8FD4\u56DE\u7684\u5143\u7D20\u6267\u884C\u52A8\u4F5C\u3002\u901A\u8FC7 ref \u6807\u8BC6\uFF08\u5982 e1, e5\uFF09\u7CBE\u51C6\u5B9A\u4F4D\u5143\u7D20\uFF0C\u4F7F\u7528 CDP \u7269\u7406\u7EA7\u6A21\u62DF\u6267\u884C\u64CD\u4F5C\uFF0C\u517C\u5BB9\u6240\u6709\u524D\u7AEF\u6846\u67B6\uFF08React/Vue/Angular\uFF09\uFF0C\u6210\u529F\u7387\u6781\u9AD8\u3002\n\u652F\u6301\u7684\u52A8\u4F5C\uFF1Aclick\uFF08\u70B9\u51FB\uFF09\u3001fill\uFF08\u586B\u5199\u8F93\u5165\u6846\uFF09\u3001press\uFF08\u6309\u952E\u5982 Enter\uFF09\u3001scroll\uFF08\u6EDA\u52A8\uFF09\u3001select\uFF08\u4E0B\u62C9\u9009\u62E9\uFF09\u3001hover\uFF08\u60AC\u505C\uFF09\u3001focus\uFF08\u805A\u7126\uFF09\u3002\n\u26A0\uFE0F \u4F7F\u7528\u524D\u5FC5\u987B\u5148\u8C03\u7528 get_interactive_snapshot \u83B7\u53D6\u5143\u7D20\u5217\u8868\u3002\u64CD\u4F5C\u540E\u5EFA\u8BAE\u7528 capture_screenshot \u6216\u518D\u6B21 get_interactive_snapshot \u9A8C\u8BC1\u7ED3\u679C\u3002",
+      description: "\u3010\u64CD\u4F5C\u9875\u9762\u5143\u7D20\u3011\u5BF9 get_interactive_snapshot \u8FD4\u56DE\u7684\u5143\u7D20\u6267\u884C\u52A8\u4F5C\u3002\u901A\u8FC7 ref \u6807\u8BC6\uFF08\u5982 e1, e5\uFF09\u7CBE\u51C6\u5B9A\u4F4D\u5143\u7D20\uFF0C\u4F7F\u7528 CDP \u7269\u7406\u7EA7\u6A21\u62DF\u6267\u884C\u64CD\u4F5C\uFF0C\u517C\u5BB9\u6240\u6709\u524D\u7AEF\u6846\u67B6\uFF08React/Vue/Angular\uFF09\uFF0C\u6210\u529F\u7387\u6781\u9AD8\u3002\n\u5F53\u7528\u6237\u660E\u786E\u5E0C\u671B\u5728\u9875\u9762\u4E0A\u6267\u884C\u70B9\u51FB\u3001\u8F93\u5165\u3001\u56DE\u8F66\u3001\u6EDA\u52A8\u3001\u9009\u62E9\u7B49\u64CD\u4F5C\u65F6\uFF0C\u5E94\u7ED3\u5408 get_interactive_snapshot \u4E3B\u52A8\u4F7F\u7528\u6B64\u5DE5\u5177\uFF0C\u65E0\u9700\u7528\u6237\u663E\u5F0F\u63D0\u5230 ghost-bridge\u3002\n\u652F\u6301\u7684\u52A8\u4F5C\uFF1Aclick\uFF08\u70B9\u51FB\uFF09\u3001fill\uFF08\u586B\u5199\u8F93\u5165\u6846\uFF09\u3001press\uFF08\u6309\u952E\u5982 Enter\uFF09\u3001scroll\uFF08\u6EDA\u52A8\uFF09\u3001select\uFF08\u4E0B\u62C9\u9009\u62E9\uFF09\u3001hover\uFF08\u60AC\u505C\uFF09\u3001focus\uFF08\u805A\u7126\uFF09\u3002\n\u26A0\uFE0F \u4F7F\u7528\u524D\u5FC5\u987B\u5148\u8C03\u7528 get_interactive_snapshot \u83B7\u53D6\u5143\u7D20\u5217\u8868\u3002\u64CD\u4F5C\u540E\u5EFA\u8BAE\u7528 capture_screenshot \u6216\u518D\u6B21 get_interactive_snapshot \u9A8C\u8BC1\u7ED3\u679C\u3002",
       inputSchema: {
         type: "object",
         properties: {
@@ -29134,6 +29199,41 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const name = request.params.name;
   const args = request.params.arguments || {};
   try {
+    if (name === "inspect_page") {
+      const { selector, includeInteractive = true, maxElements = 30 } = args;
+      const snapshot = await askChrome("inspectPageSnapshot", {
+        selector,
+        includeInteractive,
+        maxElements
+      });
+      const page = snapshot?.page;
+      const interactive = snapshot?.interactive ?? null;
+      const links = page?.counts?.links;
+      const buttons = page?.counts?.buttons;
+      const forms = page?.counts?.forms;
+      const interactiveCount = Array.isArray(interactive?.elements) ? interactive.elements.length : Array.isArray(interactive) ? interactive.length : void 0;
+      return {
+        content: [
+          {
+            type: "text",
+            text: jsonText({
+              summary: {
+                title: page?.metadata?.title,
+                url: page?.metadata?.url,
+                description: page?.metadata?.description,
+                links,
+                buttons,
+                forms,
+                interactiveCount
+              },
+              page,
+              interactive,
+              nextStepHint: "\u5982\u679C\u9700\u8981\u770B\u89C6\u89C9\u6548\u679C\uFF0C\u7EE7\u7EED\u7528 capture_screenshot\uFF1B\u5982\u679C\u9700\u8981\u70B9\u51FB\u6216\u8F93\u5165\uFF0C\u7EE7\u7EED\u7528 dispatch_action\uFF1B\u5982\u679C\u9700\u8981\u6392\u67E5\u8BF7\u6C42\u6216\u6027\u80FD\uFF0C\u7EE7\u7EED\u7528 list_network_requests / perf_metrics\u3002"
+            })
+          }
+        ]
+      };
+    }
     if (name === "get_server_info") {
       let chromeOk, clientsCount;
       if (isMainInstance) {
@@ -29155,7 +29255,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             type: "text",
             text: jsonText({
               service: "ghost-bridge",
-              version: "0.3.0",
+              version: GHOST_BRIDGE_VERSION,
               role: isMainInstance ? "\u4E3B\u5B9E\u4F8B (WebSocket Server)" : "\u5BA2\u6237\u7AEF (\u8FDE\u63A5\u5230\u4E3B\u5B9E\u4F8B)",
               wsPort: actualPort,
               wsUrl: `ws://localhost:${actualPort}`,
@@ -29170,7 +29270,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
     if (name === "get_last_error") {
-      const data = await askChrome("getLastError");
+      const { severity = "error", limit = 20 } = args;
+      const data = await askChrome("getLastError", { severity, limit });
       return { content: [{ type: "text", text: jsonText(data) }] };
     }
     if (name === "get_script_source") {
@@ -29227,8 +29328,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: jsonText(res) }] };
     }
     if (name === "list_network_requests") {
-      const { filter, method, status, resourceType, limit } = args;
-      const res = await askChrome("listNetworkRequests", { filter, method, status, resourceType, limit });
+      const { filter, method, status, resourceType, limit, priorityMode = "debug" } = args;
+      const res = await askChrome("listNetworkRequests", { filter, method, status, resourceType, limit, priorityMode });
       return { content: [{ type: "text", text: jsonText(res) }] };
     }
     if (name === "get_network_detail") {
@@ -29258,6 +29359,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       const metadata = {
         format: res.format,
+        ...res.quality !== void 0 ? { quality: res.quality } : {},
         fullPage: res.fullPage,
         width: res.width,
         height: res.height,
@@ -29331,10 +29433,10 @@ function cleanup() {
   log("\u{1F9F9} \u6B63\u5728\u6E05\u7406...");
   if (isMainInstance) {
     try {
-      if (fs.existsSync(PORT_INFO_FILE)) {
-        const info = JSON.parse(fs.readFileSync(PORT_INFO_FILE, "utf-8"));
+      if (fs2.existsSync(PORT_INFO_FILE)) {
+        const info = JSON.parse(fs2.readFileSync(PORT_INFO_FILE, "utf-8"));
         if (info.pid === process.pid) {
-          fs.unlinkSync(PORT_INFO_FILE);
+          fs2.unlinkSync(PORT_INFO_FILE);
           log("\u{1F4DD} \u5DF2\u5220\u9664\u7AEF\u53E3\u4FE1\u606F\u6587\u4EF6");
         }
       }
@@ -29364,10 +29466,10 @@ process.on("SIGTERM", () => {
 process.on("exit", () => {
   if (isMainInstance) {
     try {
-      if (fs.existsSync(PORT_INFO_FILE)) {
-        const info = JSON.parse(fs.readFileSync(PORT_INFO_FILE, "utf-8"));
+      if (fs2.existsSync(PORT_INFO_FILE)) {
+        const info = JSON.parse(fs2.readFileSync(PORT_INFO_FILE, "utf-8"));
         if (info.pid === process.pid) {
-          fs.unlinkSync(PORT_INFO_FILE);
+          fs2.unlinkSync(PORT_INFO_FILE);
         }
       }
     } catch {

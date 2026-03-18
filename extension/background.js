@@ -7,7 +7,6 @@ function getMonthlyToken() {
 
 const CONFIG = {
   basePort: 33333,
-  maxPortRetries: 10,
   token: getMonthlyToken(),
   autoDetach: false,
   maxErrors: 100,
@@ -23,7 +22,7 @@ let lastErrors = []
 let lastErrorLocation = null
 let requestMap = new Map()
 let networkRequests = []
-let state = { enabled: false, connected: false, port: null, currentPort: null, scanRound: 0 }
+let state = { enabled: false, connected: false, port: null, currentPort: null, connectionStatus: 'disconnected', connectionError: '' }
 
 // 待处理的请求（等待 offscreen 响应）
 const pendingRequests = new Map()
@@ -167,10 +166,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       status: "pending",
     }
     requestMap.set(params.requestId, entry)
-    if (requestMap.size > CONFIG.maxRequestsTracked * 2) {
-      const firstKey = requestMap.keys().next().value
-      requestMap.delete(firstKey)
-    }
+    trimPendingRequests()
   }
 
   if (method === "Network.responseReceived") {
@@ -241,8 +237,189 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
 function pushNetworkRequest(entry) {
   networkRequests.unshift(entry)
-  if (networkRequests.length > CONFIG.maxRequestsTracked) {
-    networkRequests.pop()
+  trimNetworkRequests()
+}
+
+function getApiSignalScore(entry) {
+  const url = (entry.url || '').toLowerCase()
+  let score = 0
+  if (url.includes('/api/')) score += 80
+  if (url.includes('graphql')) score += 80
+  if (url.includes('/rpc/')) score += 60
+  if (url.includes('/rest/')) score += 40
+  if ((entry.method || 'GET').toUpperCase() !== 'GET') score += 25
+  return score
+}
+
+function getResourceTypeScore(entry, mode = 'debug') {
+  const type = (entry.resourceType || '').toLowerCase()
+  const debugScores = {
+    fetch: 140,
+    xhr: 140,
+    websocket: 120,
+    document: 90,
+    script: 45,
+    stylesheet: 25,
+    other: 0,
+    image: -40,
+    font: -40,
+    media: -50,
+  }
+  const apiScores = {
+    fetch: 220,
+    xhr: 220,
+    websocket: 160,
+    document: 40,
+    script: -10,
+    stylesheet: -20,
+    other: 0,
+    image: -80,
+    font: -80,
+    media: -90,
+  }
+  const table = mode === 'api' ? apiScores : debugScores
+  return table[type] ?? table.other
+}
+
+function getStatusScore(entry) {
+  if (entry.status === 'failed') return 360
+  if (entry.status === 'error') return 330
+  if (entry.status === 'pending') return 280
+  if ((entry.statusCode || 0) >= 500) return 340
+  if ((entry.statusCode || 0) >= 400) return 300
+  return 80
+}
+
+function getNetworkPriorityScore(entry, mode = 'debug') {
+  if (mode === 'recent') {
+    return entry.timestamp || 0
+  }
+
+  let score = getStatusScore(entry)
+  score += getResourceTypeScore(entry, mode)
+  score += getApiSignalScore(entry)
+
+  if (entry.fromCache) score -= 20
+  if ((entry.encodedDataLength || 0) === 0 && entry.status === 'success') score -= 10
+
+  return score
+}
+
+function compareNetworkEntries(a, b, mode = 'debug') {
+  if (mode === 'recent') {
+    return (b.timestamp || 0) - (a.timestamp || 0)
+  }
+
+  const scoreDiff = getNetworkPriorityScore(b, mode) - getNetworkPriorityScore(a, mode)
+  if (scoreDiff !== 0) return scoreDiff
+  return (b.timestamp || 0) - (a.timestamp || 0)
+}
+
+const MAX_NETWORK_URL_OUTPUT_LENGTH = 240
+const NETWORK_URL_HEAD_LENGTH = 180
+const NETWORK_URL_TAIL_LENGTH = 40
+const MAX_DATA_URL_OUTPUT_LENGTH = 256
+
+function summarizeNetworkUrl(url) {
+  if (!url) return { displayUrl: url }
+
+  const urlOriginalLength = url.length
+  const schemeMatch = /^([a-z][a-z0-9+.-]*):/i.exec(url)
+  const urlScheme = schemeMatch?.[1]?.toLowerCase()
+
+  if (urlScheme === 'data') {
+    const commaIndex = url.indexOf(',')
+    const meta = commaIndex >= 0 ? url.slice(5, commaIndex) : url.slice(5)
+    const dataUrlMimeType = (meta.split(';')[0] || 'text/plain').toLowerCase()
+    const isBase64 = meta.includes(';base64')
+
+    if (!isBase64 && urlOriginalLength <= MAX_DATA_URL_OUTPUT_LENGTH) {
+      return {
+        displayUrl: url,
+        urlOriginalLength,
+        urlScheme,
+        urlTruncated: false,
+        dataUrlMimeType,
+      }
+    }
+
+    return {
+      displayUrl: `data:${dataUrlMimeType}${isBase64 ? ';base64' : ''},<omitted ${urlOriginalLength} chars>`,
+      urlOriginalLength,
+      urlScheme,
+      urlTruncated: true,
+      dataUrlMimeType,
+    }
+  }
+
+  if (urlOriginalLength > MAX_NETWORK_URL_OUTPUT_LENGTH) {
+    return {
+      displayUrl: `${url.slice(0, NETWORK_URL_HEAD_LENGTH)}...${url.slice(-NETWORK_URL_TAIL_LENGTH)}`,
+      urlOriginalLength,
+      urlScheme,
+      urlTruncated: true,
+    }
+  }
+
+  return {
+    displayUrl: url,
+    urlOriginalLength,
+    urlScheme,
+    urlTruncated: false,
+  }
+}
+
+function buildNetworkRequestSummary(entry) {
+  const urlMeta = summarizeNetworkUrl(entry.url)
+  return {
+    requestId: entry.requestId,
+    url: urlMeta.displayUrl,
+    ...(urlMeta.urlTruncated ? { urlTruncated: true, urlOriginalLength: urlMeta.urlOriginalLength } : {}),
+    ...(urlMeta.urlScheme ? { urlScheme: urlMeta.urlScheme } : {}),
+    ...(urlMeta.dataUrlMimeType ? { dataUrlMimeType: urlMeta.dataUrlMimeType } : {}),
+    method: entry.method,
+    status: entry.status,
+    statusCode: entry.statusCode,
+    resourceType: entry.resourceType,
+    mimeType: entry.mimeType,
+    duration: entry.duration,
+    encodedDataLength: entry.encodedDataLength,
+    fromCache: entry.fromCache,
+    timestamp: entry.timestamp,
+    errorText: entry.errorText,
+  }
+}
+
+function trimNetworkRequests() {
+  while (networkRequests.length > CONFIG.maxRequestsTracked) {
+    let worstIndex = 0
+    for (let i = 1; i < networkRequests.length; i++) {
+      const candidate = networkRequests[i]
+      const worst = networkRequests[worstIndex]
+      const cmp = compareNetworkEntries(candidate, worst, 'debug')
+      if (cmp < 0 || (cmp === 0 && (candidate.timestamp || 0) < (worst.timestamp || 0))) {
+        worstIndex = i
+      }
+    }
+    networkRequests.splice(worstIndex, 1)
+  }
+}
+
+function trimPendingRequests() {
+  while (requestMap.size > CONFIG.maxRequestsTracked * 2) {
+    const entries = [...requestMap.entries()]
+    let worstKey = entries[0]?.[0]
+    let worstValue = entries[0]?.[1]
+    for (let i = 1; i < entries.length; i++) {
+      const [key, value] = entries[i]
+      const cmp = compareNetworkEntries(value, worstValue, 'debug')
+      if (cmp < 0 || (cmp === 0 && (value.timestamp || 0) < (worstValue.timestamp || 0))) {
+        worstKey = key
+        worstValue = value
+      }
+    }
+    if (!worstKey) break
+    requestMap.delete(worstKey)
   }
 }
 
@@ -296,46 +473,57 @@ function compactStack(stackTrace) {
 
 // ========== Debugger 操作 ==========
 
+// attach 互斥锁：防止并发调用 ensureAttached 导致重复 attach / 状态竞态
+let _attachLock = Promise.resolve()
+
 async function ensureAttached() {
-  if (!state.enabled) throw new Error("扩展已暂停，点击图标开启后再试")
-  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
-  if (!tab) throw new Error("没有激活的标签页")
-  if (attachedTabId !== tab.id) {
-    if (attachedTabId) {
-      try { await chrome.debugger.detach({ tabId: attachedTabId }) } catch (e) {}
-    }
-    try {
-      await chrome.debugger.attach({ tabId: tab.id }, "1.3")
-      setBadgeState("on")
-    } catch (e) {
-      attachedTabId = null
-      if (state.connected) {
-        setBadgeState("on")
-      } else {
-        setBadgeState("att")
+  let _release
+  const _prev = _attachLock
+  _attachLock = new Promise(r => _release = r)
+  await _prev
+  try {
+    if (!state.enabled) throw new Error("扩展已暂停，点击图标开启后再试")
+    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+    if (!tab) throw new Error("没有激活的标签页")
+    if (attachedTabId !== tab.id) {
+      if (attachedTabId) {
+        try { await chrome.debugger.detach({ tabId: attachedTabId }) } catch (e) {}
       }
-      throw e
+      try {
+        await chrome.debugger.attach({ tabId: tab.id }, "1.3")
+        setBadgeState("on")
+      } catch (e) {
+        attachedTabId = null
+        if (state.connected) {
+          setBadgeState("on")
+        } else {
+          setBadgeState("att")
+        }
+        throw e
+      }
+      attachedTabId = tab.id
+      scriptMap = new Map()
+      scriptSourceCache = new Map()
+      networkRequests = []
+      requestMap = new Map()
+      await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Runtime.enable")
+      await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Log.enable")
+      await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Console.enable").catch(() => {})
+      await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Debugger.enable")
+      await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Profiler.enable")
+      await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Network.enable").catch(() => {})
+
+      // Enable auto-attach to sub-targets (iframes, workers) for comprehensive capture
+      await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Target.setAutoAttach", {
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: true,
+      }).catch(() => {})
     }
-    attachedTabId = tab.id
-    scriptMap = new Map()
-    scriptSourceCache = new Map()
-    networkRequests = []
-    requestMap = new Map()
-    await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Runtime.enable")
-    await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Log.enable")
-    await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Console.enable").catch(() => {})
-    await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Debugger.enable")
-    await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Profiler.enable")
-    await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Network.enable").catch(() => {})
-    
-    // Enable auto-attach to sub-targets (iframes, workers) for comprehensive capture
-    await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Target.setAutoAttach", {
-      autoAttach: true,
-      waitForDebuggerOnStart: false,
-      flatten: true,
-    }).catch(() => {})
+    return { tabId: attachedTabId }
+  } finally {
+    _release()
   }
-  return { tabId: attachedTabId }
 }
 
 async function maybeDetach(force = false) {
@@ -376,10 +564,15 @@ async function detachAllTargets() {
 
 // ========== 命令处理 ==========
 
-async function handleGetLastError() {
+async function handleGetLastError(params = {}) {
   await ensureAttached()
-  const events = lastErrors.slice(0, CONFIG.maxErrors)
-  const counts = events.reduce(
+  const severity = params.severity || "error"
+  const limit = Math.max(1, Math.min(params.limit || 20, CONFIG.maxErrors))
+  const allEvents = lastErrors.slice(0, CONFIG.maxErrors)
+  const filteredEvents = severity === "all"
+    ? allEvents
+    : allEvents.filter((event) => (event.severity || "info") === severity)
+  const counts = allEvents.reduce(
     (acc, e) => {
       acc.total++
       acc[e.severity || "info"] = (acc[e.severity || "info"] || 0) + 1
@@ -387,12 +580,17 @@ async function handleGetLastError() {
     },
     { total: 0 }
   )
+  const events = filteredEvents.slice(0, limit)
   return {
     lastErrorLocation,
     summary: {
       count: events.length,
+      cachedCount: allEvents.length,
+      filteredCount: filteredEvents.length,
+      requestedSeverity: severity,
+      limit,
       severityCount: counts,
-      lastTimestamp: events[0]?.timestamp,
+      lastTimestamp: filteredEvents[0]?.timestamp || allEvents[0]?.timestamp,
     },
     recent: events,
   }
@@ -530,7 +728,7 @@ async function handleEval(params = {}) {
 
 async function handleListNetworkRequests(params = {}) {
   await ensureAttached()
-  const { filter, method, status, resourceType, limit = 50 } = params
+  const { filter, method, status, resourceType, limit = 50, priorityMode = 'debug' } = params
 
   let results = [...networkRequests]
   const pending = [...requestMap.values()].map(r => ({ ...r, status: "pending" }))
@@ -547,25 +745,14 @@ async function handleListNetworkRequests(params = {}) {
     results = results.filter(r => r.resourceType?.toLowerCase() === lowerType)
   }
 
+  results.sort((a, b) => compareNetworkEntries(a, b, priorityMode))
   results = results.slice(0, limit)
 
   return {
     total: networkRequests.length + requestMap.size,
     filtered: results.length,
-    requests: results.map(r => ({
-      requestId: r.requestId,
-      url: r.url,
-      method: r.method,
-      status: r.status,
-      statusCode: r.statusCode,
-      resourceType: r.resourceType,
-      mimeType: r.mimeType,
-      duration: r.duration,
-      encodedDataLength: r.encodedDataLength,
-      fromCache: r.fromCache,
-      timestamp: r.timestamp,
-      errorText: r.errorText,
-    })),
+    priorityMode,
+    requests: results.map(buildNetworkRequestSummary),
   }
 }
 
@@ -578,7 +765,20 @@ async function handleGetNetworkDetail(params = {}) {
   if (!entry) entry = networkRequests.find(r => r.requestId === requestId)
   if (!entry) throw new Error(`未找到请求: ${requestId}`)
 
-  const result = { ...entry }
+  const urlMeta = summarizeNetworkUrl(entry.url)
+  const result = {
+    ...entry,
+    url: urlMeta.displayUrl,
+    ...(urlMeta.urlTruncated ? { urlTruncated: true, urlOriginalLength: urlMeta.urlOriginalLength } : {}),
+    ...(urlMeta.urlScheme ? { urlScheme: urlMeta.urlScheme } : {}),
+    ...(urlMeta.dataUrlMimeType ? { dataUrlMimeType: urlMeta.dataUrlMimeType } : {}),
+  }
+
+  if (urlMeta.urlTruncated) {
+    result.urlNote = urlMeta.urlScheme === 'data'
+      ? '为避免上下文膨胀，data URL 已摘要化展示。'
+      : '为避免上下文膨胀，超长 URL 已摘要化展示。'
+  }
 
   if (includeBody && entry.status !== "pending" && entry.status !== "failed") {
     try {
@@ -765,13 +965,17 @@ function roundMs(seconds) {
 
 async function handleCaptureScreenshot(params = {}) {
   const target = await ensureAttached()
-  const { format = 'png', quality, fullPage = false, clip } = params
+  const { format: requestedFormat, quality: requestedQuality, fullPage = false, clip } = params
+  const format = requestedFormat || 'jpeg'
+  const quality = format === 'jpeg'
+    ? (requestedQuality ?? (fullPage ? 70 : 80))
+    : undefined
 
   await chrome.debugger.sendCommand(target, 'Page.enable')
 
   let captureParams = {
     format,
-    ...(quality !== undefined && format === 'jpeg' ? { quality } : {}),
+    ...(format === 'jpeg' ? { quality } : {}),
   }
 
   if (clip) {
@@ -813,7 +1017,7 @@ async function handleCaptureScreenshot(params = {}) {
         }
         await chrome.debugger.sendCommand(target, 'Emulation.clearDeviceMetricsOverride').catch(() => {})
         return {
-          imageData: data, format, fullPage: true, width: maxWidth, height: maxHeight,
+          imageData: data, format, quality, fullPage: true, width: maxWidth, height: maxHeight,
           note: pageSize.height > maxHeight ? `页面高度 ${pageSize.height}px 超过限制，已截取前 ${maxHeight}px` : undefined,
         }
       } catch (e) {
@@ -829,7 +1033,207 @@ async function handleCaptureScreenshot(params = {}) {
     returnByValue: true,
   })
 
-  return { imageData: data, format, fullPage: false, width: sizeResult?.value?.width, height: sizeResult?.value?.height }
+  return {
+    imageData: data,
+    format,
+    quality,
+    fullPage: false,
+    width: sizeResult?.value?.width,
+    height: sizeResult?.value?.height
+  }
+}
+
+async function handleInspectPageSnapshot(params = {}) {
+  const target = await ensureAttached()
+  const { selector, includeInteractive = true, maxElements = 30 } = params
+
+  const selectorStr = selector ? JSON.stringify(selector) : 'null'
+
+  const expression = `(function() {
+    try {
+      if (document.readyState === 'loading') {
+        return { error: '页面尚未加载完成，请稍后重试', readyState: document.readyState };
+      }
+
+      const includeInteractive = ${includeInteractive};
+      const maxEls = ${maxElements};
+      const selector = ${selectorStr};
+      const result = {};
+      let targetElement = document.body;
+
+      if (selector) {
+        try {
+          targetElement = document.querySelector(selector);
+          if (!targetElement) {
+            return { error: '选择器未匹配到任何元素', selector: selector, suggestion: '请检查选择器是否正确' };
+          }
+          result.selector = selector;
+          result.matchedTag = targetElement.tagName.toLowerCase();
+        } catch (e) {
+          return { error: '无效的 CSS 选择器: ' + e.message, selector: selector };
+        }
+      }
+
+      result.metadata = {
+        title: document.title || '',
+        url: window.location.href,
+        description: document.querySelector('meta[name="description"]')?.content || '',
+        keywords: document.querySelector('meta[name="keywords"]')?.content || '',
+        charset: document.characterSet,
+        language: document.documentElement.lang || '',
+      };
+
+      const structured = {};
+      const headings = targetElement.querySelectorAll('h1,h2,h3,h4,h5,h6');
+      structured.headings = Array.from(headings).slice(0, 50).map(h => ({
+        level: parseInt(h.tagName[1]),
+        text: h.innerText.trim().slice(0, 200)
+      }));
+      const links = targetElement.querySelectorAll('a[href]');
+      structured.links = Array.from(links).slice(0, 100).map(a => ({
+        text: (a.innerText || '').trim().slice(0, 100),
+        href: a.href
+      })).filter(l => l.href && !l.href.startsWith('javascript:'));
+      const buttons = targetElement.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]');
+      structured.buttons = Array.from(buttons).slice(0, 50).map(b => ({
+        text: (b.innerText || b.value || b.getAttribute('aria-label') || '').trim().slice(0, 100),
+        type: b.type || 'button',
+        disabled: b.disabled || false
+      }));
+      const forms = targetElement.querySelectorAll('form');
+      structured.forms = Array.from(forms).slice(0, 20).map(f => {
+        const fields = Array.from(f.querySelectorAll('input, select, textarea')).slice(0, 30);
+        return {
+          action: f.action || '',
+          method: (f.method || 'GET').toUpperCase(),
+          fieldCount: fields.length,
+          fields: fields.map(field => ({
+            tag: field.tagName.toLowerCase(),
+            type: field.type || '',
+            name: field.name || '',
+            placeholder: field.placeholder || '',
+            required: field.required || false
+          }))
+        };
+      });
+      const images = targetElement.querySelectorAll('img');
+      structured.images = Array.from(images).slice(0, 50).map(img => ({
+        alt: img.alt || '',
+        src: img.src ? img.src.slice(0, 200) : ''
+      })).filter(img => img.src);
+      const tables = targetElement.querySelectorAll('table');
+      structured.tables = Array.from(tables).slice(0, 10).map(table => {
+        const headers = Array.from(table.querySelectorAll('th')).map(th => th.innerText.trim().slice(0, 50));
+        const rows = table.querySelectorAll('tr');
+        return { headers: headers.slice(0, 20), rowCount: rows.length };
+      });
+
+      result.page = {
+        metadata: result.metadata,
+        ...(result.selector ? { selector: result.selector, matchedTag: result.matchedTag } : {}),
+        structured,
+        counts: {
+          headings: structured.headings.length,
+          links: structured.links.length,
+          buttons: structured.buttons.length,
+          forms: structured.forms.length,
+          images: structured.images.length,
+          tables: structured.tables.length
+        },
+        mode: 'structured'
+      };
+
+      if (!includeInteractive) {
+        result.interactive = null;
+        return result;
+      }
+
+      let refCounter = 0;
+      const elements = [];
+      const INTERACTIVE_SELECTOR = 'a,button,input,select,textarea,[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="checkbox"],[role="radio"],[role="switch"],[role="combobox"],[tabindex]:not([tabindex="-1"]),[contenteditable="true"],[onclick]';
+
+      function isVisible(el) {
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) return null;
+        if (!el.offsetParent && el.tagName !== 'HTML' && el.tagName !== 'BODY' &&
+            style.position !== 'fixed' && style.position !== 'sticky') return null;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) return null;
+        return rect;
+      }
+
+      function buildEntry(el, rect) {
+        refCounter++;
+        const ref = 'e' + refCounter;
+        el.setAttribute('data-ghost-ref', ref);
+        const tag = el.tagName.toLowerCase();
+        const entry = { ref, tag, cx: Math.round(rect.left + rect.width / 2), cy: Math.round(rect.top + rect.height / 2) };
+        if (el.type) entry.type = el.type;
+        if (el.name) entry.name = el.name;
+        if (el.getAttribute('role')) entry.role = el.getAttribute('role');
+        if (el.placeholder) entry.placeholder = el.placeholder.slice(0, 80);
+        if (el.value && tag !== 'textarea') entry.value = el.value.slice(0, 80);
+        if (tag === 'a') entry.href = (el.href || '').slice(0, 150);
+        if (tag === 'select') {
+          entry.options = Array.from(el.options).slice(0, 10).map(o => ({
+            value: o.value, text: o.text.slice(0, 50), selected: o.selected
+          }));
+        }
+        const text = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim();
+        if (text && text.length <= 100) entry.text = text;
+        else if (text) entry.text = text.slice(0, 97) + '...';
+        if (el.disabled) entry.disabled = true;
+        return entry;
+      }
+
+      function scanRoot(root) {
+        const candidates = root.querySelectorAll(INTERACTIVE_SELECTOR);
+        for (let i = 0; i < candidates.length && elements.length < maxEls; i++) {
+          const rect = isVisible(candidates[i]);
+          if (rect) elements.push(buildEntry(candidates[i], rect));
+        }
+        if (elements.length < maxEls) {
+          const all = root.querySelectorAll('*');
+          for (let i = 0; i < all.length && elements.length < maxEls; i++) {
+            const el = all[i];
+            if (el.shadowRoot) scanRoot(el.shadowRoot);
+            if (el.onclick && !el.hasAttribute('data-ghost-ref')) {
+              const rect = isVisible(el);
+              if (rect) elements.push(buildEntry(el, rect));
+            }
+          }
+        }
+      }
+
+      document.querySelectorAll('[data-ghost-ref]').forEach(el => el.removeAttribute('data-ghost-ref'));
+      scanRoot(targetElement);
+
+      result.interactive = {
+        url: window.location.href,
+        title: document.title,
+        elementCount: elements.length,
+        viewport: {
+          width: window.innerWidth,
+          height: window.innerHeight,
+          scrollX: Math.round(window.scrollX),
+          scrollY: Math.round(window.scrollY),
+        },
+        elements
+      };
+
+      return result;
+    } catch (e) {
+      return { error: e.message };
+    }
+  })()`
+
+  const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+    expression,
+    returnByValue: true,
+  })
+
+  if (result?.value?.error) throw new Error(result.value.error)
+  return result?.value
 }
 
 async function handleGetPageContent(params = {}) {
@@ -947,78 +1351,65 @@ async function handleGetInteractiveSnapshot(params = {}) {
       let refCounter = 0;
       const elements = [];
 
-      // 判断元素是否可见
+      const maxEls = ${maxElements};
+      // 候选集选择器——用浏览器原生选择器引擎代替全树 JS 递归
+      const INTERACTIVE_SELECTOR = 'a,button,input,select,textarea,[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="checkbox"],[role="radio"],[role="switch"],[role="combobox"],[tabindex]:not([tabindex="-1"]),[contenteditable="true"],[onclick]';
+
+      // 可见性检测（单次 getComputedStyle，返回 rect 复用）
       function isVisible(el) {
-        if (!el.offsetParent && el.tagName !== 'HTML' && el.tagName !== 'BODY' &&
-            window.getComputedStyle(el).position !== 'fixed' &&
-            window.getComputedStyle(el).position !== 'sticky') return false;
         const style = window.getComputedStyle(el);
-        if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) return false;
+        if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) return null;
+        if (!el.offsetParent && el.tagName !== 'HTML' && el.tagName !== 'BODY' &&
+            style.position !== 'fixed' && style.position !== 'sticky') return null;
         const rect = el.getBoundingClientRect();
-        if (rect.width === 0 && rect.height === 0) return false;
-        return true;
+        if (rect.width === 0 && rect.height === 0) return null;
+        return rect;
       }
 
-      // 判断元素是否可交互
-      function isInteractive(el) {
+      function buildEntry(el, rect) {
+        refCounter++;
+        const ref = 'e' + refCounter;
+        el.setAttribute('data-ghost-ref', ref);
         const tag = el.tagName.toLowerCase();
-        if (['a', 'button', 'input', 'select', 'textarea'].includes(tag)) return true;
-        if (el.getAttribute('role') === 'button' || el.getAttribute('role') === 'link' ||
-            el.getAttribute('role') === 'tab' || el.getAttribute('role') === 'menuitem' ||
-            el.getAttribute('role') === 'checkbox' || el.getAttribute('role') === 'radio' ||
-            el.getAttribute('role') === 'switch' || el.getAttribute('role') === 'combobox') return true;
-        if (el.getAttribute('tabindex') && parseInt(el.getAttribute('tabindex')) >= 0) return true;
-        if (el.getAttribute('contenteditable') === 'true') return true;
-        if (el.onclick || el.getAttribute('onclick')) return true;
-        return false;
+        const entry = { ref, tag, cx: Math.round(rect.left + rect.width / 2), cy: Math.round(rect.top + rect.height / 2) };
+        if (el.type) entry.type = el.type;
+        if (el.name) entry.name = el.name;
+        if (el.getAttribute('role')) entry.role = el.getAttribute('role');
+        if (${includeText}) {
+          if (el.placeholder) entry.placeholder = el.placeholder.slice(0, 80);
+          if (el.value && tag !== 'textarea') entry.value = el.value.slice(0, 80);
+          if (tag === 'a') entry.href = (el.href || '').slice(0, 150);
+          if (tag === 'select') {
+            entry.options = Array.from(el.options).slice(0, 10).map(o => ({
+              value: o.value, text: o.text.slice(0, 50), selected: o.selected
+            }));
+          }
+          const text = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim();
+          if (text && text.length <= 100) entry.text = text;
+          else if (text) entry.text = text.slice(0, 97) + '...';
+        }
+        if (el.disabled) entry.disabled = true;
+        return entry;
       }
 
-      // 递归遍历 DOM 树（含 Shadow DOM）
-      function walkDOM(node, root) {
-        if (elements.length >= ${maxElements}) return;
-        const children = node.children || [];
-        for (let i = 0; i < children.length; i++) {
-          if (elements.length >= ${maxElements}) return;
-          const el = children[i];
-          if (isInteractive(el) && isVisible(el)) {
-            refCounter++;
-            const ref = 'e' + refCounter;
-            el.setAttribute('data-ghost-ref', ref);
-            const tag = el.tagName.toLowerCase();
-            const rect = el.getBoundingClientRect();
-            const entry = {
-              ref: ref,
-              tag: tag,
-              cx: Math.round(rect.left + rect.width / 2),
-              cy: Math.round(rect.top + rect.height / 2),
-            };
-            // 类型信息
-            if (el.type) entry.type = el.type;
-            if (el.name) entry.name = el.name;
-            if (el.getAttribute('role')) entry.role = el.getAttribute('role');
-            // 文本信息
-            if (${includeText}) {
-              if (el.placeholder) entry.placeholder = el.placeholder.slice(0, 80);
-              if (el.value && tag !== 'textarea') entry.value = el.value.slice(0, 80);
-              if (tag === 'a') entry.href = (el.href || '').slice(0, 150);
-              if (tag === 'select') {
-                entry.options = Array.from(el.options).slice(0, 10).map(o => ({
-                  value: o.value, text: o.text.slice(0, 50), selected: o.selected
-                }));
-              }
-              const text = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim();
-              if (text && text.length <= 100) entry.text = text;
-              else if (text) entry.text = text.slice(0, 97) + '...';
+      // 候选集扫描（含 Shadow DOM 穿透）
+      function scanRoot(root) {
+        const candidates = root.querySelectorAll(INTERACTIVE_SELECTOR);
+        for (let i = 0; i < candidates.length && elements.length < maxEls; i++) {
+          const rect = isVisible(candidates[i]);
+          if (rect) elements.push(buildEntry(candidates[i], rect));
+        }
+        // 穿透 Shadow DOM + 兜底检测 el.onclick = fn 形式的 JS 属性绑定
+        if (elements.length < maxEls) {
+          const all = root.querySelectorAll('*');
+          for (let i = 0; i < all.length && elements.length < maxEls; i++) {
+            const el = all[i];
+            if (el.shadowRoot) scanRoot(el.shadowRoot);
+            // CSS 选择器只能匹配 [onclick] 属性，这里兜住 el.onclick = fn 的情况
+            if (el.onclick && !el.hasAttribute('data-ghost-ref')) {
+              const rect = isVisible(el);
+              if (rect) elements.push(buildEntry(el, rect));
             }
-            // disabled 状态
-            if (el.disabled) entry.disabled = true;
-            elements.push(entry);
-          }
-          // 递归子节点
-          walkDOM(el, root);
-          // 穿透 Shadow DOM
-          if (el.shadowRoot) {
-            walkDOM(el.shadowRoot, root);
           }
         }
       }
@@ -1026,7 +1417,6 @@ async function handleGetInteractiveSnapshot(params = {}) {
       // 清理旧的 ref 标记
       document.querySelectorAll('[data-ghost-ref]').forEach(el => el.removeAttribute('data-ghost-ref'));
 
-      // 确定扫描根节点
       let rootEl = document.body;
       const sel = ${selectorStr};
       if (sel) {
@@ -1034,7 +1424,7 @@ async function handleGetInteractiveSnapshot(params = {}) {
         if (!rootEl) return { error: '选择器未匹配到任何元素', selector: sel };
       }
 
-      walkDOM(rootEl, rootEl);
+      scanRoot(rootEl);
 
       return {
         url: window.location.href,
@@ -1243,7 +1633,7 @@ async function handleCommand(message) {
   }
   try {
     let result
-    if (command === "getLastError") result = await handleGetLastError()
+    if (command === "getLastError") result = await handleGetLastError(params)
     else if (command === "getScriptSource") result = await handleGetScriptSource(params)
     else if (command === "coverageSnapshot") result = await handleCoverageSnapshot(params)
     else if (command === "findByString") result = await handleFindByString(params)
@@ -1254,6 +1644,7 @@ async function handleCommand(message) {
     else if (command === "clearNetworkRequests") result = await handleClearNetworkRequests()
     else if (command === "perfMetrics") result = await handlePerfMetrics(params)
     else if (command === "captureScreenshot") result = await handleCaptureScreenshot(params)
+    else if (command === "inspectPageSnapshot") result = await handleInspectPageSnapshot(params)
     else if (command === "getPageContent") result = await handleGetPageContent(params)
     else if (command === "getInteractiveSnapshot") result = await handleGetInteractiveSnapshot(params)
     else if (command === "dispatchAction") result = await handleDispatchAction(params)
@@ -1281,10 +1672,8 @@ function broadcastStatus() {
     status = 'disconnected'
   } else if (state.connected) {
     status = 'connected'
-  } else if (state.scanRound >= 4) {
-    status = 'not_found'
   } else {
-    status = 'scanning'
+    status = state.connectionStatus || 'connecting'
   }
 
   let tabUrl = ''
@@ -1310,7 +1699,7 @@ function broadcastStatus() {
         port: state.port,
         currentPort: state.currentPort,
         basePort: CONFIG.basePort,
-        scanRound: state.scanRound,
+        connectionError: state.connectionError,
         errorCount: actualErrors.length,
         recentErrors: actualErrors.slice(0, 5),
         tabTitle,
@@ -1359,18 +1748,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.status === 'connected') {
       state.connected = true
       state.port = message.port
+      state.currentPort = message.port
+      state.connectionStatus = 'connected'
+      state.connectionError = ''
       setBadgeState('on')
       log(`✅ 已连接到 ghost-bridge 服务 (端口 ${message.port})`)
       ensureAttached().catch((e) => log(`attach 失败：${e.message}`))
     } else if (message.status === 'disconnected') {
       state.connected = false
       state.port = null
+      state.connectionStatus = 'connecting'
+      state.connectionError = ''
       if (state.enabled) setBadgeState('connecting')
-    } else if (message.status === 'scanning') {
+    } else if (message.status === 'connecting') {
       state.currentPort = message.currentPort
+      state.connectionStatus = 'connecting'
+      state.connectionError = ''
       setBadgeState('connecting')
+    } else if (message.status === 'error') {
+      state.currentPort = message.currentPort
+      state.connectionStatus = 'error'
+      state.connectionError = message.errorMessage || ''
+      setBadgeState('err')
     } else if (message.status === 'not_found') {
-      state.scanRound++
+      state.currentPort = message.currentPort
+      state.connectionStatus = 'not_found'
+      state.connectionError = ''
       setBadgeState('connecting')
     }
     broadcastStatus() // 状态变化时主动推送
@@ -1401,10 +1804,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       status = 'disconnected'
     } else if (state.connected) {
       status = 'connected'
-    } else if (state.scanRound >= 4) {
-      status = 'not_found'
     } else {
-      status = 'scanning'
+      status = state.connectionStatus || 'connecting'
     }
 
     let tabUrl = ''
@@ -1429,7 +1830,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         port: state.port,
         currentPort: state.currentPort,
         basePort: CONFIG.basePort,
-        scanRound: state.scanRound,
+        connectionError: state.connectionError,
         errorCount: actualErrors.length,
         recentErrors: actualErrors.slice(0, 5),
         tabTitle,
@@ -1446,7 +1847,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       chrome.storage.local.set({ basePort: message.port })
     }
     state.enabled = true
-    state.scanRound = 0
+    state.connected = false
+    state.port = null
+    state.currentPort = CONFIG.basePort
+    state.connectionStatus = 'connecting'
+    state.connectionError = ''
     setBadgeState('connecting')
 
     // 启动 offscreen 并开始连接
@@ -1455,7 +1860,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         type: 'connect',
         basePort: CONFIG.basePort,
         token: CONFIG.token,
-        maxPortRetries: CONFIG.maxPortRetries,
       }).catch(() => {})
     })
 
@@ -1467,7 +1871,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'disconnect') {
     state.enabled = false
     state.connected = false
-    state.scanRound = 0
+    state.port = null
+    state.currentPort = null
+    state.connectionStatus = 'disconnected'
+    state.connectionError = ''
     setBadgeState('off')
     detachAllTargets().catch(() => {})
 

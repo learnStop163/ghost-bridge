@@ -23,7 +23,7 @@ program
 
 program
   .command('init')
-  .description('Initialize Ghost Bridge: Configure Claude MCP and setup extension')
+  .description('Initialize Ghost Bridge: Configure supported MCP clients and setup extension')
   .option('--dry-run', 'Show what would be done without making changes')
   .action(async (options) => {
     try {

@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ghost Bridge — 把 AI 接进你当前的 Chrome</title>
+  </head>
+  <body style="margin:0; color:#1c2628; font-family:-apple-system,'PingFang SC','Hiragino Sans GB','Noto Sans CJK SC','Microsoft YaHei',sans-serif; background:#f7f3ed; line-height:1.8; font-size:16px; -webkit-font-smoothing:antialiased;">
+
+    <article style="max-width:760px; margin:0 auto; background:#fffcf8; min-height:100vh; box-shadow:0 0 0 1px rgba(28,38,40,0.08), 0 40px 80px -20px rgba(28,38,40,0.1);">
+
+      <!-- Hero -->
+      <header style="padding:36px 48px 32px; background:linear-gradient(160deg, rgba(26,107,90,0.06) 0%, transparent 50%), linear-gradient(200deg, rgba(196,116,62,0.05) 0%, transparent 40%); border-bottom:1px solid rgba(28,38,40,0.08);">
+        <h1 style="margin:0 0 14px; font-family:'Source Han Serif SC','Songti SC','Noto Serif CJK SC',Georgia,serif; font-size:34px; font-weight:700; letter-spacing:-0.02em; line-height:1.2;">Ghost Bridge</h1>
+        <p style="margin:0 0 12px; font-size:14px; line-height:1.8; color:#52656a;">
+          一个 Chrome 扩展 + MCP 服务。它把 AI（Claude、Cursor、Codex 等 MCP 客户端）直接连接到你当前正在使用的 Chrome——不重启浏览器、不重新登录，AI 就能看到你的页面、操作元素、检查网络请求和错误。
+        </p>
+        <p style="margin:0; font-size:15px; line-height:1.8; color:#52656a;">
+          无论你是产品、前端、后端还是测试，都可以把它当成当前页面里的 AI 助手，不同角色有不同的使用方式。
+        </p>
+      </header>
+
+      <!-- Body -->
+      <div style="padding:0 48px;">
+
+        <!-- Section: Opening -->
+        <div style="padding:32px 0; border-bottom:1px solid rgba(28,38,40,0.08);">
+          <p style="margin:0 0 12px; font-size:15px; line-height:1.8;">
+            很多浏览器能力强的 AI 工具，默认都会重新启动一个新的浏览器环境。这个方式当然能工作，但在真实协作场景里，经常会先撞上一个更实际的问题——真正有价值的上下文，往往已经在你当前打开的 Chrome 里了。
+          </p>
+          <p style="margin:0 0 12px; font-size:15px; line-height:1.8;">
+            那里可能有已经登录好的账号、刚刚复现出来的异常状态、一串失败的请求、一个走到一半的复杂流程，或者一份只有当前浏览器环境里才看得见的数据。
+          </p>
+          <div style="margin:16px 0; padding:14px 18px; border-left:3px solid #1a6b5a; background:rgba(26,107,90,0.07); border-radius:0 8px 8px 0; font-size:14px; line-height:1.8; color:#1a6b5a;">
+            Ghost Bridge 不是再给 AI 准备一套新的浏览器，而是把 AI 的观察、交互和诊断能力，直接接入你当前正在使用的 Chrome。
+          </div>
+          <div style="display:flex; align-items:center; gap:12px; margin:16px 0; padding:12px 16px; background:#f7f3ed; border-radius:8px;">
+            <code style="flex:1; font-family:'SF Mono','Fira Code','Consolas',monospace; font-size:14px; color:#1c2628; letter-spacing:0.01em;">npm install -g ghost-bridge</code>
+            <a href="https://www.npmjs.com/package/ghost-bridge" target="_blank" rel="noopener" style="flex-shrink:0; padding:6px 14px; border-radius:6px; background:#1a6b5a; color:#fff; font-size:12px; font-weight:500; text-decoration:none;">查看安装和使用 &rarr;</a>
+          </div>
+          <p style="margin:0; font-size:15px; line-height:1.8;">
+            这也是为什么它不该被限定成只给某一种角色使用的工具。你可以先把它理解成"让 AI 进入当前页面"，后面的使用方式再由角色和任务自然分化出来。
+          </p>
+        </div>
+
+        <!-- Section: Roles -->
+        <div style="padding:32px 0; border-bottom:1px solid rgba(28,38,40,0.08);">
+          <h2 style="margin:0 0 14px; font-family:'Source Han Serif SC','Songti SC','Noto Serif CJK SC',Georgia,serif; font-size:22px; line-height:1.35; letter-spacing:-0.01em; font-weight:700;">不同角色，都能从同一个页面现场里拿到价值</h2>
+          <p style="margin:0 0 12px; font-size:15px; line-height:1.8;">
+            Ghost Bridge 不只是一个"前端调试工具"。它更像是把当前页面交给 AI 一起处理，所以产品、前端、后端、测试都能找到适合自己的入口。
+          </p>
+          <div style="display:grid; grid-template-columns:repeat(2, 1fr); gap:10px; margin:16px 0;">
+            <div style="padding:16px; background:#f7f3ed; border-radius:8px;">
+              <strong style="display:flex; align-items:center; gap:6px; margin-bottom:6px; font-size:14px; color:#1c2628;"><span style="display:inline-block; width:8px; height:8px; border-radius:2px; background:#c4743e; flex-shrink:0;"></span>产品</strong>
+              <p style="margin:0; font-size:13px; line-height:1.7; color:#52656a;">快速总结页面内容、梳理流程、识别明显的交互问题，把"我感觉这里不对"变成更具体的结论。</p>
+            </div>
+            <div style="padding:16px; background:#f7f3ed; border-radius:8px;">
+              <strong style="display:flex; align-items:center; gap:6px; margin-bottom:6px; font-size:14px; color:#1c2628;"><span style="display:inline-block; width:8px; height:8px; border-radius:2px; background:#c4743e; flex-shrink:0;"></span>测试</strong>
+              <p style="margin:0; font-size:13px; line-height:1.7; color:#52656a;">让 AI 协助填写表单、重复录入、执行固定流程，并基于当前页面现场补充复现信息和截图。</p>
+            </div>
+            <div style="padding:16px; background:#f7f3ed; border-radius:8px;">
+              <strong style="display:flex; align-items:center; gap:6px; margin-bottom:6px; font-size:14px; color:#1c2628;"><span style="display:inline-block; width:8px; height:8px; border-radius:2px; background:#c4743e; flex-shrink:0;"></span>后端</strong>
+              <p style="margin:0; font-size:13px; line-height:1.7; color:#52656a;">直接查看真实页面、接口请求和返回结果，不用先完整理解前端代码，也能更快知道问题落在哪一层。</p>
+            </div>
+            <div style="padding:16px; background:#f7f3ed; border-radius:8px;">
+              <strong style="display:flex; align-items:center; gap:6px; margin-bottom:6px; font-size:14px; color:#1c2628;"><span style="display:inline-block; width:8px; height:8px; border-radius:2px; background:#c4743e; flex-shrink:0;"></span>前端</strong>
+              <p style="margin:0; font-size:13px; line-height:1.7; color:#52656a;">让 AI 参与联调、看错误、看网络、读脚本和分析性能——这部分价值最完整。</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Section: Enter the scene -->
+        <div style="padding:32px 0; border-bottom:1px solid rgba(28,38,40,0.08);">
+          <h2 style="margin:0 0 14px; font-family:'Source Han Serif SC','Songti SC','Noto Serif CJK SC',Georgia,serif; font-size:22px; line-height:1.35; letter-spacing:-0.01em; font-weight:700;">它先解决的不是操作，而是进入现场</h2>
+          <p style="margin:0 0 12px; font-size:15px; line-height:1.8;">
+            很多效率损失，并不是出在"不会点按钮"，而是出在重新搭环境、重新登录、重新走流程、重新复现问题。你本来已经把现场准备好了，结果为了让 AI 参与，又得从头来一遍。
+          </p>
+          <p style="margin:0 0 12px; font-size:15px; line-height:1.8;">
+            Ghost Bridge 让 AI 可以直接进入当前页面，先看懂页面内容，再决定要不要截图、要不要提取结构、要不要点击输入、要不要继续看错误、网络和脚本。整个过程不需要换环境，也不会强迫用户按某一种角色来使用它。
+          </p>
+          <blockquote style="margin:20px 0; padding:18px 22px; background:linear-gradient(135deg, rgba(26,107,90,0.07), transparent); border-radius:10px; font-family:'Source Han Serif SC','Songti SC','Noto Serif CJK SC',Georgia,serif; font-size:17px; line-height:1.75; color:#1c2628;">
+            你可以把它当成页面总结工具、表单填写工具、截图工具，也可以把它当成一个能进入真实调试现场的浏览器助手。
+          </blockquote>
+        </div>
+
+        <!-- Section: Scenarios -->
+        <div style="padding:32px 0; border-bottom:1px solid rgba(28,38,40,0.08);">
+          <h2 style="margin:0 0 14px; font-family:'Source Han Serif SC','Songti SC','Noto Serif CJK SC',Georgia,serif; font-size:22px; line-height:1.35; letter-spacing:-0.01em; font-weight:700;">对前端来说，最好用的还是这些场景</h2>
+          <p style="margin:0 0 12px; font-size:15px; line-height:1.8;">
+            前端很多问题本来就不只存在于代码里，而是存在于浏览器现场、请求链路、页面状态和脚本执行结果里。下面这些场景，比单纯"让 AI 帮我写代码"更能体现 Ghost Bridge 的实际价值。
+          </p>
+
+          <!-- Scenario 1 -->
+          <div style="margin-top:24px;">
+            <div style="display:inline-block; padding:2px 8px; border-radius:4px; background:rgba(196,116,62,0.08); color:#c4743e; font-size:12px; font-weight:700; letter-spacing:0.04em; margin-bottom:6px;">场景 1</div>
+            <h3 style="margin:0 0 10px; font-size:18px; line-height:1.4; font-weight:600;">重复填充数据</h3>
+            <p style="margin:0 0 10px; font-size:15px; line-height:1.8;">
+              很多业务系统里都有一类低技术含量、但非常消耗时间的工作：重复录入、重复配置、重复表单填写、重复点击确认。尤其是在测试环境、运营后台或者低代码场景里，这类事情出现得非常频繁。
+            </p>
+            <p style="margin:0 0 10px; font-size:15px; line-height:1.8;">
+              如果让 AI 在一个全新的浏览器里从头开始，它首先要面对的往往不是"怎么填数据"，而是"怎么重新进入这个页面"。登录、权限、菜单路径、前置状态，任何一步不一致，都会影响后面的执行。
+            </p>
+            <p style="margin:0 0 10px; font-size:15px; line-height:1.8;">
+              Ghost Bridge 直接接入你已经打开好的页面。AI 先看清当前页面，再识别可交互元素，然后基于当前上下文去执行输入、点击、滚动等操作。
+            </p>
+            <div style="display:grid; grid-template-columns:repeat(2, 1fr); gap:10px; margin:16px 0;">
+              <figure style="margin:0; overflow:hidden; border-radius:8px; background:#f7f3ed; border:1px solid rgba(28,38,40,0.08);">
+                <img src="https://alidocs.oss-cn-zhangjiakou.aliyuncs.com/res/4jKqm0bx779bLnw1/img/7bdae367-6603-48ea-b5ac-a99c57f97ff4.png" alt="重复填充数据示例 1" loading="lazy" style="display:block; width:100%; height:auto;" />
+                <figcaption style="padding:8px 12px; font-size:12px; color:#8a9a9e;">AI 识别表单结构后自动填充</figcaption>
+              </figure>
+              <figure style="margin:0; overflow:hidden; border-radius:8px; background:#f7f3ed; border:1px solid rgba(28,38,40,0.08);">
+                <img src="https://alidocs.oss-cn-zhangjiakou.aliyuncs.com/res/4jKqm0bx779bLnw1/img/199e3125-e0e5-4d2f-ab61-496bf20252b1.png" alt="重复填充数据示例 2" loading="lazy" style="display:block; width:100%; height:auto;" />
+                <figcaption style="padding:8px 12px; font-size:12px; color:#8a9a9e;">在当前页面上下文中完成操作</figcaption>
+              </figure>
+            </div>
+          </div>
+
+          <!-- Scenario 2 -->
+          <div style="margin-top:28px; padding-top:28px; border-top:1px dashed rgba(28,38,40,0.1);">
+            <div style="display:inline-block; padding:2px 8px; border-radius:4px; background:rgba(196,116,62,0.08); color:#c4743e; font-size:12px; font-weight:700; letter-spacing:0.04em; margin-bottom:6px;">场景 2</div>
+            <h3 style="margin:0 0 10px; font-size:18px; line-height:1.4; font-weight:600;">主子应用映射配置错误定位</h3>
+            <p style="margin:0 0 10px; font-size:15px; line-height:1.8;">
+              这类问题在微前端、主子应用集成或者复杂平台化项目里很常见。表面现象可能只是页面空白、模块没有加载出来、跳转异常，或者资源命中了错误的地址，但真正的问题往往藏在配置映射、资源引用、入口绑定关系里。
+            </p>
+            <p style="margin:0 0 10px; font-size:15px; line-height:1.8;">
+              这类问题很少只靠页面视觉就能判断。你通常需要把几个维度放在一起看：当前页面结构、控制台报错、网络请求、脚本加载情况，以及页面当前到底跑的是哪一套资源。
+            </p>
+            <p style="margin:0 0 10px; font-size:15px; line-height:1.8;">
+              Ghost Bridge 把"看页面""看错误""看网络""看脚本"这些动作串成一个连续过程。AI 可以先理解当前页面状态，再结合请求和错误信息去推断问题更可能出在哪一层。
+            </p>
+            <div style="display:grid; gap:10px; margin:16px 0;">
+              <figure style="margin:0; overflow:hidden; border-radius:8px; background:#f7f3ed; border:1px solid rgba(28,38,40,0.08);">
+                <img src="https://alidocs.oss-cn-zhangjiakou.aliyuncs.com/res/MAeqxebr6LyGdO8j/img/75a75efa-13b2-4b31-b5be-4dd0f792b362.png" alt="主子应用映射配置错误定位" loading="lazy" style="display:block; width:100%; height:auto;" />
+                <figcaption style="padding:8px 12px; font-size:12px; color:#8a9a9e;">串联页面结构、网络请求和脚本信息定位配置问题</figcaption>
+              </figure>
+            </div>
+          </div>
+
+          <!-- Scenario 3 -->
+          <div style="margin-top:28px; padding-top:28px; border-top:1px dashed rgba(28,38,40,0.1);">
+            <div style="display:inline-block; padding:2px 8px; border-radius:4px; background:rgba(196,116,62,0.08); color:#c4743e; font-size:12px; font-weight:700; letter-spacing:0.04em; margin-bottom:6px;">场景 3</div>
+            <h3 style="margin:0 0 10px; font-size:18px; line-height:1.4; font-weight:600;">页面性能分析</h3>
+            <p style="margin:0 0 10px; font-size:15px; line-height:1.8;">
+              性能问题是另一类很适合让 AI 参与的工作，但前提是 AI 能拿到足够接近现场的信息。
+            </p>
+            <p style="margin:0 0 10px; font-size:15px; line-height:1.8;">
+              很多性能问题并不是一句"页面卡"就能定位出来的。你需要知道当前页面加载过程中发生了什么，请求是不是异常，资源是不是过大，脚本是不是执行过重，Web Vitals 指标表现怎么样，页面是不是存在明显的长任务或者 DOM 体量问题。
+            </p>
+            <p style="margin:0 0 10px; font-size:15px; line-height:1.8;">
+              Ghost Bridge 基于当前页面现场去拿具体信息。AI 可以结合页面内容、截图、网络请求和性能指标，判断问题更像是资源加载、脚本执行、渲染阻塞，还是某段页面逻辑本身导致的卡顿。
+            </p>
+            <div style="display:grid; grid-template-columns:repeat(2, 1fr); gap:10px; margin:16px 0;">
+              <figure style="margin:0; overflow:hidden; border-radius:8px; background:#f7f3ed; border:1px solid rgba(28,38,40,0.08);">
+                <img src="https://alidocs.oss-cn-zhangjiakou.aliyuncs.com/res/4jKqm0bx779bLnw1/img/19b23e08-3e8d-460f-9926-b270f79aa4ce.png" alt="页面性能分析示例 1" loading="lazy" style="display:block; width:100%; height:auto;" />
+                <figcaption style="padding:8px 12px; font-size:12px; color:#8a9a9e;">采集 Web Vitals 和性能指标</figcaption>
+              </figure>
+              <figure style="margin:0; overflow:hidden; border-radius:8px; background:#f7f3ed; border:1px solid rgba(28,38,40,0.08);">
+                <img src="https://alidocs.oss-cn-zhangjiakou.aliyuncs.com/res/4jKqm0bx779bLnw1/img/32c708bf-d819-4744-9c25-bed4bed3026b.png" alt="页面性能分析示例 2" loading="lazy" style="display:block; width:100%; height:auto;" />
+                <figcaption style="padding:8px 12px; font-size:12px; color:#8a9a9e;">结合现场信息定位性能瓶颈</figcaption>
+              </figure>
+            </div>
+          </div>
+
+          <!-- Scenario 4 -->
+          <div style="margin-top:28px; padding-top:28px; border-top:1px dashed rgba(28,38,40,0.1);">
+            <div style="display:inline-block; padding:2px 8px; border-radius:4px; background:rgba(196,116,62,0.08); color:#c4743e; font-size:12px; font-weight:700; letter-spacing:0.04em; margin-bottom:6px;">场景 4</div>
+            <h3 style="margin:0 0 10px; font-size:18px; line-height:1.4; font-weight:600;">翻译文案错误排查</h3>
+            <p style="margin:0 0 10px; font-size:15px; line-height:1.8;">
+              国际化问题也是一个非常典型的场景。页面上有一段文案没有翻译，或者翻译资源明明改了但页面上还是旧文案。根因可能在很多地方：文案 key 写错、资源文件没加载到、语言切换状态不对、缓存没刷新、渲染逻辑没有走到预期分支，甚至是某段脚本里写死了文案。
+            </p>
+            <p style="margin:0 0 10px; font-size:15px; line-height:1.8;">
+              Ghost Bridge 的做法更贴近真实排查过程。AI 可以先读取当前页面上的实际文案，再结合网络请求、错误信息和脚本内容搜索，判断这是资源缺失、映射错误，还是前端逻辑本身的问题。
+            </p>
+            <div style="margin:16px 0; padding:14px 18px; border-left:3px solid #1a6b5a; background:rgba(26,107,90,0.07); border-radius:0 8px 8px 0; font-size:14px; line-height:1.8; color:#1a6b5a;">
+              典型现象：部分文案未翻译，或已翻译但未生效。
+            </div>
+            <div style="display:grid; gap:10px; margin:16px 0;">
+              <figure style="margin:0; overflow:hidden; border-radius:8px; background:#f7f3ed; border:1px solid rgba(28,38,40,0.08);">
+                <img src="https://alidocs.oss-cn-zhangjiakou.aliyuncs.com/res/4jKqm0bx779bLnw1/img/ef7150fb-b222-4efb-8681-d96c84766cb1.png" alt="翻译文案错误排查示例 1" loading="lazy" style="display:block; width:100%; height:auto;" />
+                <figcaption style="padding:8px 12px; font-size:12px; color:#8a9a9e;">读取当前页面实际文案</figcaption>
+              </figure>
+            </div>
+            <div style="display:grid; grid-template-columns:repeat(2, 1fr); gap:10px; margin:16px 0;">
+              <figure style="margin:0; overflow:hidden; border-radius:8px; background:#f7f3ed; border:1px solid rgba(28,38,40,0.08);">
+                <img src="https://alidocs.oss-cn-zhangjiakou.aliyuncs.com/res/4jKqm0bx779bLnw1/img/fafea1f7-9051-4e10-ad51-59e3939adc8e.png" alt="翻译文案错误排查示例 2" loading="lazy" style="display:block; width:100%; height:auto;" />
+                <figcaption style="padding:8px 12px; font-size:12px; color:#8a9a9e;">结合网络请求和脚本分析根因</figcaption>
+              </figure>
+              <figure style="margin:0; overflow:hidden; border-radius:8px; background:#f7f3ed; border:1px solid rgba(28,38,40,0.08);">
+                <img src="https://alidocs.oss-cn-zhangjiakou.aliyuncs.com/res/4jKqm0bx779bLnw1/img/25fbe462-c8ab-4b6c-943d-175759503579.png" alt="翻译文案错误排查示例 3" loading="lazy" style="display:block; width:100%; height:auto;" />
+                <figcaption style="padding:8px 12px; font-size:12px; color:#8a9a9e;">定位资源缺失或映射错误</figcaption>
+              </figure>
+            </div>
+          </div>
+        </div>
+
+        <!-- Section: Common thread -->
+        <div style="padding:32px 0;">
+          <h2 style="margin:0 0 14px; font-family:'Source Han Serif SC','Songti SC','Noto Serif CJK SC',Georgia,serif; font-size:22px; line-height:1.35; letter-spacing:-0.01em; font-weight:700;">这些场景背后的共同点</h2>
+          <p style="margin:0; font-size:15px; line-height:1.8;">
+            问题的关键上下文不在代码仓库里，而在浏览器现场里。
+          </p>
+        </div>
+
+      </div>
+
+      <!-- Footer -->
+      <footer style="margin:0; padding:32px 48px; background:linear-gradient(135deg, #14332e, #1d4a42); color:rgba(255,255,255,0.88);">
+        <h2 style="margin:0 0 10px; font-family:'Source Han Serif SC','Songti SC','Noto Serif CJK SC',Georgia,serif; font-size:20px; color:#fff;">结语</h2>
+        <p style="margin:0 0 8px; font-size:14px; line-height:1.85;">
+          真正能留下来的工具，未必是演示时最惊艳的工具，而更可能是那些能安静嵌进日常工作流、在关键时刻减少摩擦的工具。
+        </p>
+        <a href="https://www.npmjs.com/package/ghost-bridge" target="_blank" rel="noopener" style="display:inline-block; margin-top:14px; padding:8px 18px; border-radius:6px; background:rgba(255,255,255,0.12); color:rgba(255,255,255,0.85); font-size:13px; font-weight:500; text-decoration:none; letter-spacing:0.02em;">npm install -g ghost-bridge &rarr;</a>
+      </footer>
+
+    </article>
+  </body>
+</html>

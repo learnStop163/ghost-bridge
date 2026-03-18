@@ -8,9 +8,9 @@ import net from "net"
 import fs from "fs"
 import os from "os"
 import path from "path"
+import { GHOST_BRIDGE_VERSION } from "../lib/version.js"
 
 const BASE_PORT = Number(process.env.GHOST_BRIDGE_PORT || 33333)
-const MAX_PORT_RETRIES = 10
 // 使用当月1号0点的时间戳作为 token，确保同月内的服务器和插件自动匹配
 function getMonthlyToken() {
   const now = new Date()
@@ -52,6 +52,10 @@ function getExistingService() {
     if (!fs.existsSync(PORT_INFO_FILE)) return null
     const info = JSON.parse(fs.readFileSync(PORT_INFO_FILE, "utf-8"))
     if (!info.pid || !info.port) return null
+    if (info.port !== BASE_PORT) {
+      fs.unlinkSync(PORT_INFO_FILE)
+      return null
+    }
     // 检查进程是否还在运行
     if (!isProcessRunning(info.pid)) {
       log(`旧服务 PID ${info.pid} 已不存在，清理旧信息`)
@@ -117,22 +121,15 @@ function isPortAvailable(port) {
  * 寻找可用端口并启动 WebSocket 服务器
  */
 async function startWebSocketServer() {
-  for (let i = 0; i < MAX_PORT_RETRIES; i++) {
-    const port = BASE_PORT + i
-    const available = await isPortAvailable(port)
-    if (available) {
-      actualPort = port
-      const wss = new WebSocketServer({ port })
-      if (port !== BASE_PORT) {
-        log(`⚠️ 端口 ${BASE_PORT} 被占用，已切换到端口 ${port}`)
-      }
-      log(`🚀 WebSocket 服务已启动，端口 ${port}${WS_TOKEN ? "（启用 token 校验）" : ""}`)
-      return wss
-    } else {
-      log(`端口 ${port} 被占用，尝试下一个...`)
-    }
+  const available = await isPortAvailable(BASE_PORT)
+  if (!available) {
+    throw new Error(`固定端口 ${BASE_PORT} 不可用，请释放该端口或通过 GHOST_BRIDGE_PORT 指定其他端口`)
   }
-  throw new Error(`无法找到可用端口（已尝试 ${BASE_PORT} - ${BASE_PORT + MAX_PORT_RETRIES - 1}）`)
+
+  actualPort = BASE_PORT
+  const wss = new WebSocketServer({ port: BASE_PORT })
+  log(`🚀 WebSocket 服务已启动，端口 ${BASE_PORT}${WS_TOKEN ? "（启用 token 校验）" : ""}`)
+  return wss
 }
 
 /**
@@ -153,6 +150,17 @@ async function initWebSocketService() {
       log(`❌ 现有服务验证失败，启动新服务...`)
       try { fs.unlinkSync(PORT_INFO_FILE) } catch {}
     }
+  }
+
+  if (!(await isPortAvailable(BASE_PORT))) {
+    const valid = await verifyExistingService(BASE_PORT)
+    if (valid) {
+      actualPort = BASE_PORT
+      isMainInstance = false
+      log(`✅ 复用固定端口上的现有服务，端口 ${actualPort}`)
+      return null
+    }
+    throw new Error(`固定端口 ${BASE_PORT} 已被其他进程占用，请释放该端口或通过 GHOST_BRIDGE_PORT 指定其他端口`)
   }
 
   // 启动新的 WebSocket 服务器
@@ -351,9 +359,19 @@ function connectToMainInstance() {
 }
 
 function failAllPending(message) {
-  pendingRequests.forEach(({ reject, timer }) => {
-    clearTimeout(timer)
-    reject(new Error(message))
+  pendingRequests.forEach((pending, id) => {
+    if (pending.reject) {
+      // 本地请求：{ resolve, reject, timer }
+      clearTimeout(pending.timer)
+      pending.reject(new Error(message))
+    } else if (pending.source) {
+      // MCP 客户端转发的请求：{ source: ws }，回传错误
+      try {
+        if (pending.source.readyState === WebSocket.OPEN) {
+          pending.source.send(JSON.stringify({ id, error: message }))
+        }
+      } catch {}
+    }
   })
   pendingRequests.clear()
 }
@@ -426,7 +444,7 @@ async function askChrome(command, params = {}, options = {}) {
 }
 
 function jsonText(data) {
-  return typeof data === "string" ? data : JSON.stringify(data, null, 2)
+  return typeof data === "string" ? data : JSON.stringify(data)
 }
 
 function buildSnippet(source, line, column, { beautifyEnabled = true, contextLines = 20 } = {}) {
@@ -470,12 +488,36 @@ function buildSnippet(source, line, column, { beautifyEnabled = true, contextLin
 }
 
 const server = new Server(
-  { name: "ghost-bridge", version: "0.4.0" },
+  { name: "ghost-bridge", version: GHOST_BRIDGE_VERSION },
   { capabilities: { tools: {} } }
 )
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
+    {
+      name: "inspect_page",
+      description:
+        "【页面分析入口】当用户要求分析当前页面/网站/网页、理解页面结构、快速查看当前标签内容时，优先使用此工具。" +
+        "无需用户显式提到 ghost-bridge。" +
+        "默认返回页面元数据、结构化内容摘要和可交互元素概览，适合作为后续截图、交互、网络排查前的第一步。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "CSS 选择器，限定分析范围。不指定则分析整个页面",
+          },
+          includeInteractive: {
+            type: "boolean",
+            description: "是否包含交互元素概览，默认 true",
+          },
+          maxElements: {
+            type: "number",
+            description: "交互元素概览的最大数量，默认 30",
+          },
+        },
+      },
+    },
     {
       name: "get_server_info",
       description: "获取 ghost-bridge 服务器状态，包括当前 WebSocket 端口、连接状态等",
@@ -483,8 +525,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_last_error",
-      description: "获取当前标签最近的异常/报错堆栈与元数据（无 sourcemap 友好）",
-      inputSchema: { type: "object", properties: {} },
+      description: "获取当前标签最近的异常/报错堆栈与元数据（无 sourcemap 友好）。默认只返回 error 级别的最近 20 条。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          severity: {
+            type: "string",
+            enum: ["error", "warn", "info", "all"],
+            description: "日志级别过滤，默认 error",
+          },
+          limit: {
+            type: "number",
+            description: "返回条数限制，默认 20，最大 100",
+          },
+        },
+      },
     },
     {
       name: "get_script_source",
@@ -543,7 +598,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "list_network_requests",
       description:
-        "列出捕获的网络请求，支持按 URL、方法、状态、类型过滤",
+        "列出捕获的网络请求，支持按 URL、方法、状态、类型过滤。默认按排障优先级排序：失败请求、进行中请求、XHR/Fetch 会优先展示。为避免上下文膨胀，data URL 和超长 URL 会自动摘要化。",
       inputSchema: {
         type: "object",
         properties: {
@@ -552,13 +607,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           status: { type: "string", description: "状态：success/error/failed/pending" },
           resourceType: { type: "string", description: "资源类型：XHR/Fetch/Script/Image 等" },
           limit: { type: "number", description: "返回数量限制，默认 50" },
+          priorityMode: {
+            type: "string",
+            enum: ["debug", "api", "recent"],
+            description: "排序模式：debug=排障优先（默认），api=接口优先，recent=按时间倒序",
+          },
         },
       },
     },
     {
       name: "get_network_detail",
       description:
-        "获取单个网络请求的详细信息，包括请求头、响应头，可选获取响应体",
+        "获取单个网络请求的详细信息，包括请求头、响应头，可选获取响应体。为避免上下文膨胀，data URL 和超长 URL 会自动摘要化。",
       inputSchema: {
         type: "object",
         properties: {
@@ -599,7 +659,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "【推荐用于视觉分析】截取当前页面的截图，返回 base64 图片。" +
         "适用于：1) 查看页面实际视觉效果 2) 排查 UI/样式/布局/颜色问题 " +
         "3) 验证页面渲染 4) 分析元素位置和间距 5) 查看图片/图标等视觉内容。" +
+        "当用户说“看看这个页面长什么样”“帮我分析界面/布局/样式”时，应优先使用此工具，" +
+        "无需用户显式提到 ghost-bridge。" +
         "当需要看到页面「长什么样」时使用此工具。" +
+        "默认优先使用更省传输的 JPEG：普通截图默认 quality 80，完整长截图默认 quality 70。" +
+        "当需要检查文字清晰度、1px 细线、图标边缘、透明背景或像素级细节时，应优先使用 PNG。" +
         "如仅需文本/链接等信息，建议使用更快的 get_page_content。",
       inputSchema: {
         type: "object",
@@ -607,11 +671,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           format: {
             type: "string",
             enum: ["png", "jpeg"],
-            description: "图片格式，默认 png（无损），jpeg 更小"
+            description: "图片格式。默认使用 jpeg；需要高保真文字、细线、透明背景时用 png"
           },
           quality: {
             type: "number",
-            description: "JPEG 质量 (0-100)，仅当 format 为 jpeg 时有效，建议 80"
+            description: "JPEG 质量 (0-100)，仅当 format 为 jpeg 时有效。默认普通截图 80，完整长截图 70"
           },
           fullPage: {
             type: "boolean",
@@ -637,6 +701,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "比 capture_screenshot 更快更轻量，适用于：" +
         "1) 获取页面文字内容 2) 提取链接/按钮/表单等元素 " +
         "3) 分析 DOM 结构 4) 获取页面元数据（title/description）。" +
+        "当用户说“分析这个页面/网站”“看看页面里有什么内容”且不强调视觉效果时，优先使用此工具，" +
+        "无需用户显式提到 ghost-bridge。" +
         "当需要文本信息而非视觉效果时，优先使用此工具。" +
         "注意：不支持 iframe 内容，不反映 CSS 样式。",
       inputSchema: {
@@ -670,6 +736,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "【操作页面前必须先调用】扫描当前页面所有可见的可交互元素（按钮/链接/输入框/下拉框等），" +
         "返回带有 ref 短标识（如 e1, e2, e3）的精简列表，包含元素类型、文本和位置。" +
         "Token 极省（通常 < 1000 tokens），专为 AI 操作页面而设计。" +
+        "当用户要求点击、输入、登录、提交表单、打开菜单等操作时，应主动使用此工具开始定位元素，" +
+        "无需用户显式提到 ghost-bridge。" +
         "获取后可通过 dispatch_action 工具使用 ref 标识来点击、填写、按键等。" +
         "支持 Shadow DOM 穿透。\n" +
         "⚠️ 仅用于交互操作前的元素定位。如需排查 UI/CSS 布局问题，请使用 capture_screenshot 或 get_page_content。",
@@ -697,6 +765,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "【操作页面元素】对 get_interactive_snapshot 返回的元素执行动作。" +
         "通过 ref 标识（如 e1, e5）精准定位元素，使用 CDP 物理级模拟执行操作，" +
         "兼容所有前端框架（React/Vue/Angular），成功率极高。\n" +
+        "当用户明确希望在页面上执行点击、输入、回车、滚动、选择等操作时，应结合 get_interactive_snapshot 主动使用此工具，" +
+        "无需用户显式提到 ghost-bridge。\n" +
         "支持的动作：click（点击）、fill（填写输入框）、press（按键如 Enter）、" +
         "scroll（滚动）、select（下拉选择）、hover（悬停）、focus（聚焦）。\n" +
         "⚠️ 使用前必须先调用 get_interactive_snapshot 获取元素列表。" +
@@ -744,6 +814,49 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const name = request.params.name
   const args = request.params.arguments || {}
   try {
+    if (name === "inspect_page") {
+      const { selector, includeInteractive = true, maxElements = 30 } = args
+      const snapshot = await askChrome("inspectPageSnapshot", {
+        selector,
+        includeInteractive,
+        maxElements,
+      })
+      const page = snapshot?.page
+      const interactive = snapshot?.interactive ?? null
+
+      const links = page?.counts?.links
+      const buttons = page?.counts?.buttons
+      const forms = page?.counts?.forms
+      const interactiveCount = Array.isArray(interactive?.elements)
+        ? interactive.elements.length
+        : Array.isArray(interactive)
+          ? interactive.length
+          : undefined
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: jsonText({
+              summary: {
+                title: page?.metadata?.title,
+                url: page?.metadata?.url,
+                description: page?.metadata?.description,
+                links,
+                buttons,
+                forms,
+                interactiveCount,
+              },
+              page,
+              interactive,
+              nextStepHint:
+                "如果需要看视觉效果，继续用 capture_screenshot；如果需要点击或输入，继续用 dispatch_action；如果需要排查请求或性能，继续用 list_network_requests / perf_metrics。",
+            }),
+          },
+        ],
+      }
+    }
+
     if (name === "get_server_info") {
       let chromeOk, clientsCount
 
@@ -768,7 +881,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             type: "text",
             text: jsonText({
               service: "ghost-bridge",
-              version: "0.3.0",
+              version: GHOST_BRIDGE_VERSION,
               role: isMainInstance ? "主实例 (WebSocket Server)" : "客户端 (连接到主实例)",
               wsPort: actualPort,
               wsUrl: `ws://localhost:${actualPort}`,
@@ -786,7 +899,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (name === "get_last_error") {
-      const data = await askChrome("getLastError")
+      const { severity = "error", limit = 20 } = args
+      const data = await askChrome("getLastError", { severity, limit })
       return { content: [{ type: "text", text: jsonText(data) }] }
     }
 
@@ -849,8 +963,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (name === "list_network_requests") {
-      const { filter, method, status, resourceType, limit } = args
-      const res = await askChrome("listNetworkRequests", { filter, method, status, resourceType, limit })
+      const { filter, method, status, resourceType, limit, priorityMode = "debug" } = args
+      const res = await askChrome("listNetworkRequests", { filter, method, status, resourceType, limit, priorityMode })
       return { content: [{ type: "text", text: jsonText(res) }] }
     }
 
@@ -891,6 +1005,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // 添加元数据文本
       const metadata = {
         format: res.format,
+        ...(res.quality !== undefined ? { quality: res.quality } : {}),
         fullPage: res.fullPage,
         width: res.width,
         height: res.height,
