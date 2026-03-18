@@ -1,0 +1,200 @@
+lib/clients.js
+  14b2c66dd41df7a6 1-201
+lib/init.js
+  14b2c66dd41df7a6 6-7,24-25,33-34,38,44-45,49-51,53
+docs/community-share-article.html
+  0e5c8d8c34a72de9 6-8,10,12-18,21,23-29,31,34,37-42,44,46-50,52-55,57-59,61-63,65-67,70,72-76,78,81,84,86-90,93-97,100-101,103-104,106-109,111-113,116-122,125-126,128-129,131-134,137-143,146-147,149-150,152-155,157-159,162-169,171,174-175,177-180,182-186,188-190,194,196-199,202,204-209,212-215
+dist/cli.js
+  14b2c66dd41df7a6 937-938,1761-1764,1775,1779,1784,1791,2574,2588-2590,3350,3352,3354-3355,3357-3376,3379,3382-3383,3386,3390,3397,3413,3415,3423,3428,3432-3433,3438,3448-3452,3460-3461,3468-3469,3473,3478,3482,3488-3491,3496-3497,3503-3504,3508,3513,3517,3522-3523,3526,3533,3543,3552,3562,3582,3588,3617,3622-3623,3626,3660,3671-3672,3674,3699,3734,3766,3768-3769,3771,3783-3784,3786,3793,3796-3797,3803,3805-3808,3810-3817,3820-3822,3824,3832-3834,3837-3839,3841,3849,3851-3852,3855-3857,3859,3867,3869,3887-3888,3890,3893-3895,3900-3902,3908-3909,3914,3929,3933,3938,3943,3953,3964,3975,3985,4005,4023-4024,4026-4027,4029-4031,4034-4036,4038,4046,4050,4056-4059,4067,4069,4091,4106,4147,4149,4151,4155,4158,4163,4166,4174,4177,4185,4188,4196,4199,4205-4206,4221,4224,4239,4248,4255,4287-4289,4293,4302,4304-4305,4308,4311,4320-4323,4336-4337,4340,4351,4365-4366,4388-4389,4408-4410,4413,4424-4426,4429,4443-4444,4496-4497,4520,4532,4544,4552,4557,4560,4566,4570,4572-4574,4582,4586,4588,4591,4595,4597,4601,4611-4612,4622-4623,4644-4645,4649,4664,4671,4686,4689,4697,4702,4713-4714,4720,4722,4725,4729,4731,4735,4749-4750,4772,4774-4775,4777-4778,4792-4793,4799,4803,4808,4813,4831-4832,4837,4841,4844,4848,4855,4857,4863,4867,4869-4870,4876,4890-4891,4898,4903,4909,4914,4919,4923,4929-4931,4933,4946-4947,4951,4953,4963-4964,4973,4980,4984-4985,4992-4994,5001,5005,5019,5025,5035,5053-5054,5063,5068-5069,5076,5080,5085,5089-5090,5096-5098,5100,5167,5169,5189,5192,5205,5207,5211,5213,5244-5245,5249,5253,5256-5257,5260,5319-5320,5330-5331,5346,5371-5372,5382,5386-5387,5396,5401,5474-5481,5488-5662,5671,5673,5675,5686-5687,5691-5692,5695,5700,5704-5707,5724-5725,5738,5743,5746,5749,5759-5761,5763-5765,5772,5789,5794,5805,5807,5810,5813-5814,5816-5817,5819-5821,5825-5827,5836,5849,5855,5859,5861,5885-5886,5888,5890,5894,5915-5916,5919-5920
+extension/manifest.json
+  5cc090aaf6cd09e3 4
+src/server.js
+  5e574efe69fe15df 665-666,674,678,819,824-825,1008
+  da8a0cc6b93ac175 362-374,820-821,823
+  5cc090aaf6cd09e3 601,621
+bin/ghost-bridge.js
+  14b2c66dd41df7a6 26
+docs/ghost-bridge-share.md
+  b540685264d6dc10 1,9,15,17,19,21,25,29,33,37,39,41,49,51,61,65,77,89,97,99
+  d28fcb80a77ed7df 3-7,11,13,23,31,35,43,55,67,69,71,73,75,83
+dist/server.js
+  5e574efe69fe15df 28816-28827,29080,29087,29091,29204,29206,29208-29210,29362
+  5cc090aaf6cd09e3 29027,29046
+lib/utils.js
+  14b2c66dd41df7a6 29-37
+lib/status.js
+  14b2c66dd41df7a6 3-4,9,11,16,19,23-24,26-28,32,41
+README.md
+  6deb6270f2bff42b 7,9,11,13,15-19,32-34,41,43-46,48,50,52-61,63,65-69,72,74-77,79,81-83,85,87-90,92,94-97,99,101-114,116,118-119,121-122,128,130-134,136,139-147,150,152-155,157
+  5e574efe69fe15df 25-31,120
+  f97d33bcb2d5827a 4
+  5cc090aaf6cd09e3 21,23-24,124,126
+lib/postinstall.js
+  14b2c66dd41df7a6 7
+extension/background.js
+  da8a0cc6b93ac175 476-478,480-484,498-499,501-502,515-517,523-525,1354-1358,1361-1363,1365-1366,1369-1372,1374-1392,1395-1411,1427
+  5cc090aaf6cd09e3 318-392,755,768-780
+  5e574efe69fe15df 968-972,1020,1039,1046-1236,1647
+package.json
+  5cc090aaf6cd09e3 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.10",
+  "base_commit_sha": "97d446db3e733eee0569e9a66d1d5f6791766d7d",
+  "prompts": {
+    "0e5c8d8c34a72de9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a5e8fff1-ad29-4c9c-b3af-d5b644a5ccaa",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "jiuban <learnStop@163.com>",
+      "messages": [],
+      "total_additions": 750,
+      "total_deletions": 1094,
+      "accepted_lines": 148,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/1949f8b524ce68d5a206bd6e4cc98c461e7441e5ac6d3cb182c9922ccc2de25b"
+    },
+    "14b2c66dd41df7a6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019cf56a-a949-75e1-80fa-edb2dac007bb",
+        "model": "gpt-5.4"
+      },
+      "human_author": "jiuban <learnStop@163.com>",
+      "messages": [],
+      "total_additions": 885,
+      "total_deletions": 504,
+      "accepted_lines": 847,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/e8d17b34968e8d46e0de1eb0a466e328bf269dad68697edfd466fa23fb9b9fd3"
+    },
+    "21227270eca59882": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019cfae6-3519-7a92-becd-e7aa953a86d7",
+        "model": "unknown"
+      },
+      "human_author": "jiuban <learnStop@163.com>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 4,
+      "accepted_lines": 0,
+      "overriden_lines": 0
+    },
+    "3aea74a9a8b97c72": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019cf990-1793-74c3-bd45-334ad012d05b",
+        "model": "gpt-5.4"
+      },
+      "human_author": "jiuban <learnStop@163.com>",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 1,
+      "accepted_lines": 0,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/0fdd80a0000e0a3176d588be2bd7a25e48e5d099e2c7910365fc6836cf3eb870"
+    },
+    "5cc090aaf6cd09e3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019cffa4-1b71-7640-9c84-5940ec8c7a61",
+        "model": "gpt-5.4"
+      },
+      "human_author": "jiuban <learnStop@163.com>",
+      "messages": [],
+      "total_additions": 104,
+      "total_deletions": 21,
+      "accepted_lines": 103,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/791e96da81fe1a0958ad404d9b4db55c8c8c9734448c325e8fac5c220a064cb9"
+    },
+    "5e574efe69fe15df": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019cfaf2-2b4b-7100-bf59-e8d8124ed016",
+        "model": "gpt-5.4"
+      },
+      "human_author": "jiuban <learnStop@163.com>",
+      "messages": [],
+      "total_additions": 271,
+      "total_deletions": 65,
+      "accepted_lines": 238,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/486cf4ea89d06febd851bd140fdeb700312f7349580c9704b1daf050a28ac289"
+    },
+    "6deb6270f2bff42b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019cfae5-8ccb-7ee2-8b30-38dcab963607",
+        "model": "gpt-5.4"
+      },
+      "human_author": "jiuban <learnStop@163.com>",
+      "messages": [],
+      "total_additions": 238,
+      "total_deletions": 279,
+      "accepted_lines": 115,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/6f862e72c2c4fe721ddf3ef1bb77069e29f9942b9f5978551c2dd5fcc59d9cf4"
+    },
+    "b540685264d6dc10": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bbbd3f27-ddec-41ac-9ebd-028a6baa4b7a",
+        "model": "glm-4.7"
+      },
+      "human_author": "jiuban <learnStop@163.com>",
+      "messages": [],
+      "total_additions": 41,
+      "total_deletions": 47,
+      "accepted_lines": 20,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/6aa4d9472954e45b082e8ca4d2918343f266ef5f5ba0a4fd46a1f01536902357"
+    },
+    "d28fcb80a77ed7df": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019cf62d-65dc-7a63-bc9b-e162ca52197a",
+        "model": "gpt-5.4"
+      },
+      "human_author": "jiuban <learnStop@163.com>",
+      "messages": [],
+      "total_additions": 19,
+      "total_deletions": 21,
+      "accepted_lines": 18,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/17a238f71bebb4dbc23f44e4ca1cf13506ec1481380de414a95cf6ce241facad"
+    },
+    "da8a0cc6b93ac175": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e73c07d2-b601-42de-93cc-d8adeaf11607",
+        "model": "<synthetic>"
+      },
+      "human_author": "jiuban <learnStop@163.com>",
+      "messages": [],
+      "total_additions": 130,
+      "total_deletions": 118,
+      "accepted_lines": 86,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/2228e721aaf8a44f71e95773a5e96af8401787a8d50b28ec043977261bc9f3f2"
+    },
+    "f97d33bcb2d5827a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019cf637-2034-7361-95a1-279b2250d152",
+        "model": "gpt-5.4"
+      },
+      "human_author": "jiuban <learnStop@163.com>",
+      "messages": [],
+      "total_additions": 2,
+      "total_deletions": 0,
+      "accepted_lines": 1,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/fd50fbd4aed0eda48635a457a3457c083a7623d150716b06905a66d5d722501d"
+    }
+  }
+}
