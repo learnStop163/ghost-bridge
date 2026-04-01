@@ -28544,6 +28544,7 @@ function getMonthlyToken() {
 var WS_TOKEN = process.env.GHOST_BRIDGE_TOKEN || getMonthlyToken();
 var RESPONSE_TIMEOUT = 8e3;
 var PORT_INFO_FILE = path2.join(os.tmpdir(), "ghost-bridge-port.json");
+var SERVER_STARTED_AT = (/* @__PURE__ */ new Date()).toISOString();
 var chromeConnection = null;
 var activeConnection = null;
 var actualPort = BASE_PORT;
@@ -28580,34 +28581,86 @@ function getExistingService() {
     return null;
   }
 }
-function verifyExistingService(port) {
+function probeExistingService(port) {
   return new Promise((resolve) => {
     const url2 = new URL(`ws://localhost:${port}`);
-    if (WS_TOKEN) url2.searchParams.set("token", WS_TOKEN);
+    url2.searchParams.set("role", "probe");
     const ws = new import_websocket.default(url2.toString());
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      try {
+        if (ws.readyState === import_websocket.default.CONNECTING || ws.readyState === import_websocket.default.OPEN) {
+          ws.close();
+        }
+      } catch {
+      }
+      resolve(result);
+    };
     const timeout = setTimeout(() => {
-      ws.close();
-      resolve(false);
+      finish(null);
     }, 2e3);
     ws.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString());
         if (msg.type === "identity" && msg.service === "ghost-bridge") {
-          clearTimeout(timeout);
-          ws.close();
-          resolve(true);
+          finish(msg);
         }
       } catch {
       }
     });
     ws.on("error", () => {
-      clearTimeout(timeout);
-      resolve(false);
+      finish(null);
     });
     ws.on("close", () => {
-      clearTimeout(timeout);
+      finish(null);
     });
   });
+}
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+async function waitForPortAvailable(port, timeoutMs = 5e3) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await isPortAvailable(port)) {
+      return true;
+    }
+    await sleep(100);
+  }
+  return isPortAvailable(port);
+}
+async function stopExistingService(pid, port) {
+  if (!pid || pid === process.pid) {
+    return false;
+  }
+  log(`\u68C0\u6D4B\u5230\u65E7\u5B9E\u4F8B token \u4E0D\u4E00\u81F4\uFF0C\u51C6\u5907\u505C\u6B62\u65E7\u5B9E\u4F8B (PID: ${pid})`);
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (e) {
+    if (e.code === "ESRCH") {
+      log(`\u65E7\u5B9E\u4F8B PID ${pid} \u5DF2\u4E0D\u5B58\u5728`);
+      return true;
+    }
+    throw e;
+  }
+  const released = await waitForPortAvailable(port, 5e3);
+  if (!released) {
+    throw new Error(`\u65E7\u5B9E\u4F8B (PID: ${pid}) \u672A\u5728\u9884\u671F\u65F6\u95F4\u5185\u91CA\u653E\u7AEF\u53E3 ${port}`);
+  }
+  if (fs2.existsSync(PORT_INFO_FILE)) {
+    try {
+      const info = JSON.parse(fs2.readFileSync(PORT_INFO_FILE, "utf-8"));
+      if (info.pid === pid) {
+        fs2.unlinkSync(PORT_INFO_FILE);
+      }
+    } catch {
+    }
+  }
+  log(`\u2705 \u65E7\u5B9E\u4F8B\u5DF2\u9000\u51FA\uFF0C\u7AEF\u53E3 ${port} \u53EF\u7531\u65B0\u5B9E\u4F8B\u63A5\u7BA1`);
+  return true;
 }
 function isPortAvailable(port) {
   return new Promise((resolve) => {
@@ -28634,12 +28687,16 @@ async function initWebSocketService() {
   const existing = getExistingService();
   if (existing) {
     log(`\u68C0\u6D4B\u5230\u73B0\u6709\u670D\u52A1 (PID: ${existing.pid}, \u7AEF\u53E3: ${existing.port})\uFF0C\u9A8C\u8BC1\u4E2D...`);
-    const valid = await verifyExistingService(existing.port);
-    if (valid) {
-      actualPort = existing.port;
-      isMainInstance = false;
-      log(`\u2705 \u590D\u7528\u73B0\u6709\u670D\u52A1\uFF0C\u7AEF\u53E3 ${actualPort}`);
-      return null;
+    const probe = await probeExistingService(existing.port);
+    if (probe?.service === "ghost-bridge") {
+      if (probe.token === WS_TOKEN) {
+        actualPort = existing.port;
+        isMainInstance = false;
+        log(`\u2705 \u590D\u7528\u73B0\u6709\u670D\u52A1\uFF0C\u7AEF\u53E3 ${actualPort}`);
+        return null;
+      }
+      const oldPid = Number(probe.pid) || existing.pid;
+      await stopExistingService(oldPid, existing.port);
     } else {
       log(`\u274C \u73B0\u6709\u670D\u52A1\u9A8C\u8BC1\u5931\u8D25\uFF0C\u542F\u52A8\u65B0\u670D\u52A1...`);
       try {
@@ -28649,14 +28706,19 @@ async function initWebSocketService() {
     }
   }
   if (!await isPortAvailable(BASE_PORT)) {
-    const valid = await verifyExistingService(BASE_PORT);
-    if (valid) {
-      actualPort = BASE_PORT;
-      isMainInstance = false;
-      log(`\u2705 \u590D\u7528\u56FA\u5B9A\u7AEF\u53E3\u4E0A\u7684\u73B0\u6709\u670D\u52A1\uFF0C\u7AEF\u53E3 ${actualPort}`);
-      return null;
+    const probe = await probeExistingService(BASE_PORT);
+    if (probe?.service === "ghost-bridge") {
+      if (probe.token === WS_TOKEN) {
+        actualPort = BASE_PORT;
+        isMainInstance = false;
+        log(`\u2705 \u590D\u7528\u56FA\u5B9A\u7AEF\u53E3\u4E0A\u7684\u73B0\u6709\u670D\u52A1\uFF0C\u7AEF\u53E3 ${actualPort}`);
+        return null;
+      }
+      await stopExistingService(Number(probe.pid), BASE_PORT);
     }
-    throw new Error(`\u56FA\u5B9A\u7AEF\u53E3 ${BASE_PORT} \u5DF2\u88AB\u5176\u4ED6\u8FDB\u7A0B\u5360\u7528\uFF0C\u8BF7\u91CA\u653E\u8BE5\u7AEF\u53E3\u6216\u901A\u8FC7 GHOST_BRIDGE_PORT \u6307\u5B9A\u5176\u4ED6\u7AEF\u53E3`);
+    if (!await isPortAvailable(BASE_PORT)) {
+      throw new Error(`\u56FA\u5B9A\u7AEF\u53E3 ${BASE_PORT} \u5DF2\u88AB\u5176\u4ED6\u8FDB\u7A0B\u5360\u7528\uFF0C\u8BF7\u91CA\u653E\u8BE5\u7AEF\u53E3\u6216\u901A\u8FC7 GHOST_BRIDGE_PORT \u6307\u5B9A\u5176\u4ED6\u7AEF\u53E3`);
+    }
   }
   const wss2 = await startWebSocketServer();
   isMainInstance = true;
@@ -28666,7 +28728,7 @@ async function initWebSocketService() {
       port: actualPort,
       wsUrl: `ws://localhost:${actualPort}`,
       pid: process.pid,
-      startedAt: (/* @__PURE__ */ new Date()).toISOString()
+      startedAt: SERVER_STARTED_AT
     }, null, 2)
   );
   log(`\u{1F4DD} \u7AEF\u53E3\u4FE1\u606F\u5DF2\u5199\u5165: ${PORT_INFO_FILE}`);
@@ -28678,6 +28740,18 @@ if (wss) {
     const url2 = new URL(req.url || "/", "http://localhost");
     const token = url2.searchParams.get("token") || "";
     const role = url2.searchParams.get("role") || "";
+    if (role === "probe") {
+      ws.send(JSON.stringify({
+        type: "identity",
+        service: "ghost-bridge",
+        token: WS_TOKEN,
+        pid: process.pid,
+        port: actualPort,
+        startedAt: SERVER_STARTED_AT
+      }));
+      ws.close(1e3, "Probe complete");
+      return;
+    }
     if (WS_TOKEN && token !== WS_TOKEN) {
       log(`\u62D2\u7EDD\u8FDE\u63A5\uFF1Atoken \u4E0D\u5339\u914D (\u6536\u5230: ${token}, \u671F\u671B: ${WS_TOKEN})`);
       ws.close(1008, "Bad token");

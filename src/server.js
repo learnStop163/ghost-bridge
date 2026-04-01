@@ -20,6 +20,7 @@ function getMonthlyToken() {
 const WS_TOKEN = process.env.GHOST_BRIDGE_TOKEN || getMonthlyToken()
 const RESPONSE_TIMEOUT = 8000
 const PORT_INFO_FILE = path.join(os.tmpdir(), "ghost-bridge-port.json")
+const SERVER_STARTED_AT = new Date().toISOString()
 
 let chromeConnection = null   // Chrome 扩展的连接
 let activeConnection = null   // 当前用于发送请求的连接（主实例用 chromeConnection，非主实例用到主实例的连接）
@@ -69,37 +70,99 @@ function getExistingService() {
 }
 
 /**
- * 验证现有服务是否是 ghost-bridge
+ * 主动探测端口上的服务身份
  */
-function verifyExistingService(port) {
+function probeExistingService(port) {
   return new Promise((resolve) => {
     const url = new URL(`ws://localhost:${port}`)
-    if (WS_TOKEN) url.searchParams.set("token", WS_TOKEN)
+    url.searchParams.set("role", "probe")
 
     const ws = new WebSocket(url.toString())
+    let settled = false
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      try {
+        if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) {
+          ws.close()
+        }
+      } catch {}
+      resolve(result)
+    }
+
     const timeout = setTimeout(() => {
-      ws.close()
-      resolve(false)
+      finish(null)
     }, 2000)
 
     ws.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString())
         if (msg.type === "identity" && msg.service === "ghost-bridge") {
-          clearTimeout(timeout)
-          ws.close()
-          resolve(true)
+          finish(msg)
         }
       } catch {}
     })
     ws.on("error", () => {
-      clearTimeout(timeout)
-      resolve(false)
+      finish(null)
     })
     ws.on("close", () => {
-      clearTimeout(timeout)
+      finish(null)
     })
   })
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitForPortAvailable(port, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await isPortAvailable(port)) {
+      return true
+    }
+    await sleep(100)
+  }
+  return isPortAvailable(port)
+}
+
+/**
+ * 停止旧实例，让新实例接管固定端口
+ */
+async function stopExistingService(pid, port) {
+  if (!pid || pid === process.pid) {
+    return false
+  }
+
+  log(`检测到旧实例 token 不一致，准备停止旧实例 (PID: ${pid})`)
+
+  try {
+    process.kill(pid, "SIGTERM")
+  } catch (e) {
+    if (e.code === "ESRCH") {
+      log(`旧实例 PID ${pid} 已不存在`)
+      return true
+    }
+    throw e
+  }
+
+  const released = await waitForPortAvailable(port, 5000)
+  if (!released) {
+    throw new Error(`旧实例 (PID: ${pid}) 未在预期时间内释放端口 ${port}`)
+  }
+
+  if (fs.existsSync(PORT_INFO_FILE)) {
+    try {
+      const info = JSON.parse(fs.readFileSync(PORT_INFO_FILE, "utf-8"))
+      if (info.pid === pid) {
+        fs.unlinkSync(PORT_INFO_FILE)
+      }
+    } catch {}
+  }
+
+  log(`✅ 旧实例已退出，端口 ${port} 可由新实例接管`)
+  return true
 }
 
 /**
@@ -140,12 +203,17 @@ async function initWebSocketService() {
   const existing = getExistingService()
   if (existing) {
     log(`检测到现有服务 (PID: ${existing.pid}, 端口: ${existing.port})，验证中...`)
-    const valid = await verifyExistingService(existing.port)
-    if (valid) {
-      actualPort = existing.port
-      isMainInstance = false
-      log(`✅ 复用现有服务，端口 ${actualPort}`)
-      return null // 不启动新的 WebSocket 服务器
+    const probe = await probeExistingService(existing.port)
+    if (probe?.service === "ghost-bridge") {
+      if (probe.token === WS_TOKEN) {
+        actualPort = existing.port
+        isMainInstance = false
+        log(`✅ 复用现有服务，端口 ${actualPort}`)
+        return null // 不启动新的 WebSocket 服务器
+      }
+
+      const oldPid = Number(probe.pid) || existing.pid
+      await stopExistingService(oldPid, existing.port)
     } else {
       log(`❌ 现有服务验证失败，启动新服务...`)
       try { fs.unlinkSync(PORT_INFO_FILE) } catch {}
@@ -153,14 +221,21 @@ async function initWebSocketService() {
   }
 
   if (!(await isPortAvailable(BASE_PORT))) {
-    const valid = await verifyExistingService(BASE_PORT)
-    if (valid) {
-      actualPort = BASE_PORT
-      isMainInstance = false
-      log(`✅ 复用固定端口上的现有服务，端口 ${actualPort}`)
-      return null
+    const probe = await probeExistingService(BASE_PORT)
+    if (probe?.service === "ghost-bridge") {
+      if (probe.token === WS_TOKEN) {
+        actualPort = BASE_PORT
+        isMainInstance = false
+        log(`✅ 复用固定端口上的现有服务，端口 ${actualPort}`)
+        return null
+      }
+
+      await stopExistingService(Number(probe.pid), BASE_PORT)
     }
-    throw new Error(`固定端口 ${BASE_PORT} 已被其他进程占用，请释放该端口或通过 GHOST_BRIDGE_PORT 指定其他端口`)
+
+    if (!(await isPortAvailable(BASE_PORT))) {
+      throw new Error(`固定端口 ${BASE_PORT} 已被其他进程占用，请释放该端口或通过 GHOST_BRIDGE_PORT 指定其他端口`)
+    }
   }
 
   // 启动新的 WebSocket 服务器
@@ -174,7 +249,7 @@ async function initWebSocketService() {
       port: actualPort,
       wsUrl: `ws://localhost:${actualPort}`,
       pid: process.pid,
-      startedAt: new Date().toISOString()
+      startedAt: SERVER_STARTED_AT
     }, null, 2)
   )
   log(`📝 端口信息已写入: ${PORT_INFO_FILE}`)
@@ -190,6 +265,19 @@ if (wss) {
     const url = new URL(req.url || "/", "http://localhost")
     const token = url.searchParams.get("token") || ""
     const role = url.searchParams.get("role") || ""
+
+    if (role === "probe") {
+      ws.send(JSON.stringify({
+        type: "identity",
+        service: "ghost-bridge",
+        token: WS_TOKEN,
+        pid: process.pid,
+        port: actualPort,
+        startedAt: SERVER_STARTED_AT,
+      }))
+      ws.close(1000, "Probe complete")
+      return
+    }
 
     if (WS_TOKEN && token !== WS_TOKEN) {
       log(`拒绝连接：token 不匹配 (收到: ${token}, 期望: ${WS_TOKEN})`)
