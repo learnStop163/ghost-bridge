@@ -1,0 +1,26 @@
+dist/server.js
+  572a8507858423a8 28547,28584,28587,28589-28601,28603,28609,28615,28618,28622-28663,28690-28692,28696-28699,28709-28711,28715-28717,28719,28731,28743-28754
+src/server.js
+  572a8507858423a8 23,73,75,78,81-93,95,102,107,110,115-165,206-208,213-216,224-226,231-237,252,269-280
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.10",
+  "base_commit_sha": "1c4504a3e2c89653b3b605b54adb2125fe79b079",
+  "prompts": {
+    "572a8507858423a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019d479b-117d-7ea0-8fbf-421832e7495c",
+        "model": "gpt-5.4"
+      },
+      "human_author": "jiuban <learnStop@163.com>",
+      "messages": [],
+      "total_additions": 211,
+      "total_deletions": 76,
+      "accepted_lines": 196,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/7e6e95a5c2b78555a6500b2c698f0b492d63344c2598a4df2a3f4cc31b34d4fb"
+    }
+  }
+}
