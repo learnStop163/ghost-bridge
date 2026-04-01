@@ -1,0 +1,22 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.10",
+  "base_commit_sha": "7b73e229c3b64840aa7f1b7842dcfd94c1707d64",
+  "prompts": {
+    "572a8507858423a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019d479b-117d-7ea0-8fbf-421832e7495c",
+        "model": "gpt-5.4"
+      },
+      "human_author": "jiuban <learnStop@163.com>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 27,
+      "accepted_lines": 0,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/d60f0fde973f4eff48d6d97e201bf3c73bfece9535ab72a6f9d2521359643850"
+    }
+  }
+}
