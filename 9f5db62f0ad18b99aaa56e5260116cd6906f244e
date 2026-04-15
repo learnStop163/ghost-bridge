@@ -1,0 +1,72 @@
+extension/manifest.json
+  2e0d7e35393464d7 4
+extension/offscreen.js
+  47175bddb3f64323 18,73-75,160
+extension/background.js
+  2e0d7e35393464d7 1-3,7,241,245,570,577,590,871,885,901
+.gitignore
+  2a12a5ecec3ce2ec 2
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "9f5db62f0ad18b99aaa56e5260116cd6906f244e",
+  "prompts": {
+    "2a12a5ecec3ce2ec": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f9b952c9-285a-44f9-b1a6-b8787c99d9a1",
+        "model": "glm-5-turbo"
+      },
+      "human_author": "jiuban",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 0,
+      "accepted_lines": 1,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/7be605ce91eb590c7ef4604a1f10589f3e4347bebb40a5a7fc262c7f88ab2eb4"
+    },
+    "2e0d7e35393464d7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019d8fbb-a54c-7391-b8cb-2e6db108ff4f",
+        "model": "gpt-5.4"
+      },
+      "human_author": "jiuban",
+      "messages": [],
+      "total_additions": 47,
+      "total_deletions": 36080,
+      "accepted_lines": 17,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/6f9611dec3724f27c40acf28ec0e4cea6ab87b53abcaeaa88c42b07811832d68"
+    },
+    "47175bddb3f64323": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019d47b2-1a4c-7da1-a14f-c9946b3c0a69",
+        "model": "gpt-5.4"
+      },
+      "human_author": "jiuban",
+      "messages": [],
+      "total_additions": 23,
+      "total_deletions": 29,
+      "accepted_lines": 5,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/1d8c4185546aa4a38ef108ddcd54f203d943666403bce1edaa75fec465bb7bbb"
+    },
+    "54b1522e7f95da5c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "64f7ba3c-7e03-4ae9-b6cb-98d1c50e58ef",
+        "model": "glm-5-turbo"
+      },
+      "human_author": "jiuban",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 2,
+      "accepted_lines": 0,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/0c45722e8551fb5b6e7c9b83f6264330f06bbcfc19de751dd940b3e5c9f58ed8"
+    }
+  }
+}
