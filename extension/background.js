@@ -1,13 +1,10 @@
-// 使用当月1号0点的时间戳作为 token，确保同月内的服务器和插件自动匹配
-function getMonthlyToken() {
-  const now = new Date()
-  const firstDayOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0)
-  return String(firstDayOfMonth.getTime())
-}
+importScripts('bg-network.js', 'bg-dom.js')
+
+const DEFAULT_TOKEN = 'ghost-bridge-local'
 
 const CONFIG = {
   basePort: 33333,
-  token: getMonthlyToken(),
+  token: DEFAULT_TOKEN,
   autoDetach: false,
   maxErrors: 100,
   maxStackFrames: 20,
@@ -240,187 +237,12 @@ function pushNetworkRequest(entry) {
   trimNetworkRequests()
 }
 
-function getApiSignalScore(entry) {
-  const url = (entry.url || '').toLowerCase()
-  let score = 0
-  if (url.includes('/api/')) score += 80
-  if (url.includes('graphql')) score += 80
-  if (url.includes('/rpc/')) score += 60
-  if (url.includes('/rest/')) score += 40
-  if ((entry.method || 'GET').toUpperCase() !== 'GET') score += 25
-  return score
-}
-
-function getResourceTypeScore(entry, mode = 'debug') {
-  const type = (entry.resourceType || '').toLowerCase()
-  const debugScores = {
-    fetch: 140,
-    xhr: 140,
-    websocket: 120,
-    document: 90,
-    script: 45,
-    stylesheet: 25,
-    other: 0,
-    image: -40,
-    font: -40,
-    media: -50,
-  }
-  const apiScores = {
-    fetch: 220,
-    xhr: 220,
-    websocket: 160,
-    document: 40,
-    script: -10,
-    stylesheet: -20,
-    other: 0,
-    image: -80,
-    font: -80,
-    media: -90,
-  }
-  const table = mode === 'api' ? apiScores : debugScores
-  return table[type] ?? table.other
-}
-
-function getStatusScore(entry) {
-  if (entry.status === 'failed') return 360
-  if (entry.status === 'error') return 330
-  if (entry.status === 'pending') return 280
-  if ((entry.statusCode || 0) >= 500) return 340
-  if ((entry.statusCode || 0) >= 400) return 300
-  return 80
-}
-
-function getNetworkPriorityScore(entry, mode = 'debug') {
-  if (mode === 'recent') {
-    return entry.timestamp || 0
-  }
-
-  let score = getStatusScore(entry)
-  score += getResourceTypeScore(entry, mode)
-  score += getApiSignalScore(entry)
-
-  if (entry.fromCache) score -= 20
-  if ((entry.encodedDataLength || 0) === 0 && entry.status === 'success') score -= 10
-
-  return score
-}
-
-function compareNetworkEntries(a, b, mode = 'debug') {
-  if (mode === 'recent') {
-    return (b.timestamp || 0) - (a.timestamp || 0)
-  }
-
-  const scoreDiff = getNetworkPriorityScore(b, mode) - getNetworkPriorityScore(a, mode)
-  if (scoreDiff !== 0) return scoreDiff
-  return (b.timestamp || 0) - (a.timestamp || 0)
-}
-
-const MAX_NETWORK_URL_OUTPUT_LENGTH = 240
-const NETWORK_URL_HEAD_LENGTH = 180
-const NETWORK_URL_TAIL_LENGTH = 40
-const MAX_DATA_URL_OUTPUT_LENGTH = 256
-
-function summarizeNetworkUrl(url) {
-  if (!url) return { displayUrl: url }
-
-  const urlOriginalLength = url.length
-  const schemeMatch = /^([a-z][a-z0-9+.-]*):/i.exec(url)
-  const urlScheme = schemeMatch?.[1]?.toLowerCase()
-
-  if (urlScheme === 'data') {
-    const commaIndex = url.indexOf(',')
-    const meta = commaIndex >= 0 ? url.slice(5, commaIndex) : url.slice(5)
-    const dataUrlMimeType = (meta.split(';')[0] || 'text/plain').toLowerCase()
-    const isBase64 = meta.includes(';base64')
-
-    if (!isBase64 && urlOriginalLength <= MAX_DATA_URL_OUTPUT_LENGTH) {
-      return {
-        displayUrl: url,
-        urlOriginalLength,
-        urlScheme,
-        urlTruncated: false,
-        dataUrlMimeType,
-      }
-    }
-
-    return {
-      displayUrl: `data:${dataUrlMimeType}${isBase64 ? ';base64' : ''},<omitted ${urlOriginalLength} chars>`,
-      urlOriginalLength,
-      urlScheme,
-      urlTruncated: true,
-      dataUrlMimeType,
-    }
-  }
-
-  if (urlOriginalLength > MAX_NETWORK_URL_OUTPUT_LENGTH) {
-    return {
-      displayUrl: `${url.slice(0, NETWORK_URL_HEAD_LENGTH)}...${url.slice(-NETWORK_URL_TAIL_LENGTH)}`,
-      urlOriginalLength,
-      urlScheme,
-      urlTruncated: true,
-    }
-  }
-
-  return {
-    displayUrl: url,
-    urlOriginalLength,
-    urlScheme,
-    urlTruncated: false,
-  }
-}
-
-function buildNetworkRequestSummary(entry) {
-  const urlMeta = summarizeNetworkUrl(entry.url)
-  return {
-    requestId: entry.requestId,
-    url: urlMeta.displayUrl,
-    ...(urlMeta.urlTruncated ? { urlTruncated: true, urlOriginalLength: urlMeta.urlOriginalLength } : {}),
-    ...(urlMeta.urlScheme ? { urlScheme: urlMeta.urlScheme } : {}),
-    ...(urlMeta.dataUrlMimeType ? { dataUrlMimeType: urlMeta.dataUrlMimeType } : {}),
-    method: entry.method,
-    status: entry.status,
-    statusCode: entry.statusCode,
-    resourceType: entry.resourceType,
-    mimeType: entry.mimeType,
-    duration: entry.duration,
-    encodedDataLength: entry.encodedDataLength,
-    fromCache: entry.fromCache,
-    timestamp: entry.timestamp,
-    errorText: entry.errorText,
-  }
-}
-
 function trimNetworkRequests() {
-  while (networkRequests.length > CONFIG.maxRequestsTracked) {
-    let worstIndex = 0
-    for (let i = 1; i < networkRequests.length; i++) {
-      const candidate = networkRequests[i]
-      const worst = networkRequests[worstIndex]
-      const cmp = compareNetworkEntries(candidate, worst, 'debug')
-      if (cmp < 0 || (cmp === 0 && (candidate.timestamp || 0) < (worst.timestamp || 0))) {
-        worstIndex = i
-      }
-    }
-    networkRequests.splice(worstIndex, 1)
-  }
+  GhostBridgeNetwork.trimTrackedRequests(networkRequests, CONFIG.maxRequestsTracked)
 }
 
 function trimPendingRequests() {
-  while (requestMap.size > CONFIG.maxRequestsTracked * 2) {
-    const entries = [...requestMap.entries()]
-    let worstKey = entries[0]?.[0]
-    let worstValue = entries[0]?.[1]
-    for (let i = 1; i < entries.length; i++) {
-      const [key, value] = entries[i]
-      const cmp = compareNetworkEntries(value, worstValue, 'debug')
-      if (cmp < 0 || (cmp === 0 && (value.timestamp || 0) < (worstValue.timestamp || 0))) {
-        worstKey = key
-        worstValue = value
-      }
-    }
-    if (!worstKey) break
-    requestMap.delete(worstKey)
-  }
+  GhostBridgeNetwork.trimPendingRequestMap(requestMap, CONFIG.maxRequestsTracked * 2)
 }
 
 chrome.debugger.onDetach.addListener((source, reason) => {
@@ -745,14 +567,14 @@ async function handleListNetworkRequests(params = {}) {
     results = results.filter(r => r.resourceType?.toLowerCase() === lowerType)
   }
 
-  results.sort((a, b) => compareNetworkEntries(a, b, priorityMode))
+  results.sort((a, b) => GhostBridgeNetwork.compareNetworkEntries(a, b, priorityMode))
   results = results.slice(0, limit)
 
   return {
     total: networkRequests.length + requestMap.size,
     filtered: results.length,
     priorityMode,
-    requests: results.map(buildNetworkRequestSummary),
+    requests: results.map((entry) => GhostBridgeNetwork.buildNetworkRequestSummary(entry)),
   }
 }
 
@@ -765,7 +587,7 @@ async function handleGetNetworkDetail(params = {}) {
   if (!entry) entry = networkRequests.find(r => r.requestId === requestId)
   if (!entry) throw new Error(`未找到请求: ${requestId}`)
 
-  const urlMeta = summarizeNetworkUrl(entry.url)
+  const urlMeta = GhostBridgeNetwork.summarizeNetworkUrl(entry.url)
   const result = {
     ...entry,
     url: urlMeta.displayUrl,
@@ -1046,186 +868,7 @@ async function handleCaptureScreenshot(params = {}) {
 async function handleInspectPageSnapshot(params = {}) {
   const target = await ensureAttached()
   const { selector, includeInteractive = true, maxElements = 30 } = params
-
-  const selectorStr = selector ? JSON.stringify(selector) : 'null'
-
-  const expression = `(function() {
-    try {
-      if (document.readyState === 'loading') {
-        return { error: '页面尚未加载完成，请稍后重试', readyState: document.readyState };
-      }
-
-      const includeInteractive = ${includeInteractive};
-      const maxEls = ${maxElements};
-      const selector = ${selectorStr};
-      const result = {};
-      let targetElement = document.body;
-
-      if (selector) {
-        try {
-          targetElement = document.querySelector(selector);
-          if (!targetElement) {
-            return { error: '选择器未匹配到任何元素', selector: selector, suggestion: '请检查选择器是否正确' };
-          }
-          result.selector = selector;
-          result.matchedTag = targetElement.tagName.toLowerCase();
-        } catch (e) {
-          return { error: '无效的 CSS 选择器: ' + e.message, selector: selector };
-        }
-      }
-
-      result.metadata = {
-        title: document.title || '',
-        url: window.location.href,
-        description: document.querySelector('meta[name="description"]')?.content || '',
-        keywords: document.querySelector('meta[name="keywords"]')?.content || '',
-        charset: document.characterSet,
-        language: document.documentElement.lang || '',
-      };
-
-      const structured = {};
-      const headings = targetElement.querySelectorAll('h1,h2,h3,h4,h5,h6');
-      structured.headings = Array.from(headings).slice(0, 50).map(h => ({
-        level: parseInt(h.tagName[1]),
-        text: h.innerText.trim().slice(0, 200)
-      }));
-      const links = targetElement.querySelectorAll('a[href]');
-      structured.links = Array.from(links).slice(0, 100).map(a => ({
-        text: (a.innerText || '').trim().slice(0, 100),
-        href: a.href
-      })).filter(l => l.href && !l.href.startsWith('javascript:'));
-      const buttons = targetElement.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]');
-      structured.buttons = Array.from(buttons).slice(0, 50).map(b => ({
-        text: (b.innerText || b.value || b.getAttribute('aria-label') || '').trim().slice(0, 100),
-        type: b.type || 'button',
-        disabled: b.disabled || false
-      }));
-      const forms = targetElement.querySelectorAll('form');
-      structured.forms = Array.from(forms).slice(0, 20).map(f => {
-        const fields = Array.from(f.querySelectorAll('input, select, textarea')).slice(0, 30);
-        return {
-          action: f.action || '',
-          method: (f.method || 'GET').toUpperCase(),
-          fieldCount: fields.length,
-          fields: fields.map(field => ({
-            tag: field.tagName.toLowerCase(),
-            type: field.type || '',
-            name: field.name || '',
-            placeholder: field.placeholder || '',
-            required: field.required || false
-          }))
-        };
-      });
-      const images = targetElement.querySelectorAll('img');
-      structured.images = Array.from(images).slice(0, 50).map(img => ({
-        alt: img.alt || '',
-        src: img.src ? img.src.slice(0, 200) : ''
-      })).filter(img => img.src);
-      const tables = targetElement.querySelectorAll('table');
-      structured.tables = Array.from(tables).slice(0, 10).map(table => {
-        const headers = Array.from(table.querySelectorAll('th')).map(th => th.innerText.trim().slice(0, 50));
-        const rows = table.querySelectorAll('tr');
-        return { headers: headers.slice(0, 20), rowCount: rows.length };
-      });
-
-      result.page = {
-        metadata: result.metadata,
-        ...(result.selector ? { selector: result.selector, matchedTag: result.matchedTag } : {}),
-        structured,
-        counts: {
-          headings: structured.headings.length,
-          links: structured.links.length,
-          buttons: structured.buttons.length,
-          forms: structured.forms.length,
-          images: structured.images.length,
-          tables: structured.tables.length
-        },
-        mode: 'structured'
-      };
-
-      if (!includeInteractive) {
-        result.interactive = null;
-        return result;
-      }
-
-      let refCounter = 0;
-      const elements = [];
-      const INTERACTIVE_SELECTOR = 'a,button,input,select,textarea,[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="checkbox"],[role="radio"],[role="switch"],[role="combobox"],[tabindex]:not([tabindex="-1"]),[contenteditable="true"],[onclick]';
-
-      function isVisible(el) {
-        const style = window.getComputedStyle(el);
-        if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) return null;
-        if (!el.offsetParent && el.tagName !== 'HTML' && el.tagName !== 'BODY' &&
-            style.position !== 'fixed' && style.position !== 'sticky') return null;
-        const rect = el.getBoundingClientRect();
-        if (rect.width === 0 && rect.height === 0) return null;
-        return rect;
-      }
-
-      function buildEntry(el, rect) {
-        refCounter++;
-        const ref = 'e' + refCounter;
-        el.setAttribute('data-ghost-ref', ref);
-        const tag = el.tagName.toLowerCase();
-        const entry = { ref, tag, cx: Math.round(rect.left + rect.width / 2), cy: Math.round(rect.top + rect.height / 2) };
-        if (el.type) entry.type = el.type;
-        if (el.name) entry.name = el.name;
-        if (el.getAttribute('role')) entry.role = el.getAttribute('role');
-        if (el.placeholder) entry.placeholder = el.placeholder.slice(0, 80);
-        if (el.value && tag !== 'textarea') entry.value = el.value.slice(0, 80);
-        if (tag === 'a') entry.href = (el.href || '').slice(0, 150);
-        if (tag === 'select') {
-          entry.options = Array.from(el.options).slice(0, 10).map(o => ({
-            value: o.value, text: o.text.slice(0, 50), selected: o.selected
-          }));
-        }
-        const text = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim();
-        if (text && text.length <= 100) entry.text = text;
-        else if (text) entry.text = text.slice(0, 97) + '...';
-        if (el.disabled) entry.disabled = true;
-        return entry;
-      }
-
-      function scanRoot(root) {
-        const candidates = root.querySelectorAll(INTERACTIVE_SELECTOR);
-        for (let i = 0; i < candidates.length && elements.length < maxEls; i++) {
-          const rect = isVisible(candidates[i]);
-          if (rect) elements.push(buildEntry(candidates[i], rect));
-        }
-        if (elements.length < maxEls) {
-          const all = root.querySelectorAll('*');
-          for (let i = 0; i < all.length && elements.length < maxEls; i++) {
-            const el = all[i];
-            if (el.shadowRoot) scanRoot(el.shadowRoot);
-            if (el.onclick && !el.hasAttribute('data-ghost-ref')) {
-              const rect = isVisible(el);
-              if (rect) elements.push(buildEntry(el, rect));
-            }
-          }
-        }
-      }
-
-      document.querySelectorAll('[data-ghost-ref]').forEach(el => el.removeAttribute('data-ghost-ref'));
-      scanRoot(targetElement);
-
-      result.interactive = {
-        url: window.location.href,
-        title: document.title,
-        elementCount: elements.length,
-        viewport: {
-          width: window.innerWidth,
-          height: window.innerHeight,
-          scrollX: Math.round(window.scrollX),
-          scrollY: Math.round(window.scrollY),
-        },
-        elements
-      };
-
-      return result;
-    } catch (e) {
-      return { error: e.message };
-    }
-  })()`
+  const expression = GhostBridgeDom.buildInspectPageExpression({ selector, includeInteractive, maxElements })
 
   const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
     expression,
@@ -1239,95 +882,7 @@ async function handleInspectPageSnapshot(params = {}) {
 async function handleGetPageContent(params = {}) {
   const target = await ensureAttached()
   const { mode = "text", selector, maxLength = 50000, includeMetadata = true } = params
-
-  const selectorStr = selector ? JSON.stringify(selector) : 'null'
-  const modeStr = JSON.stringify(mode)
-
-  const expression = `(function() {
-    try {
-      const result = {};
-      if (document.readyState === 'loading') {
-        return { error: '页面尚未加载完成，请稍后重试', readyState: document.readyState };
-      }
-      let targetElement = document.body;
-      const selector = ${selectorStr};
-      if (selector) {
-        try {
-          targetElement = document.querySelector(selector);
-          if (!targetElement) {
-            return { error: '选择器未匹配到任何元素', selector: selector, suggestion: '请检查选择器是否正确' };
-          }
-          result.selector = selector;
-          result.matchedTag = targetElement.tagName.toLowerCase();
-        } catch (e) {
-          return { error: '无效的 CSS 选择器: ' + e.message, selector: selector };
-        }
-      }
-      const includeMetadata = ${includeMetadata};
-      if (includeMetadata) {
-        result.metadata = {
-          title: document.title || '',
-          url: window.location.href,
-          description: document.querySelector('meta[name="description"]')?.content || '',
-          keywords: document.querySelector('meta[name="keywords"]')?.content || '',
-          charset: document.characterSet,
-          language: document.documentElement.lang || '',
-        };
-      }
-      const mode = ${modeStr};
-      const maxLength = ${maxLength};
-      if (mode === 'text') {
-        let text = targetElement.innerText || targetElement.textContent || '';
-        text = text.replace(/\\n{3,}/g, '\\n\\n').trim();
-        result.contentLength = text.length;
-        if (text.length > maxLength) {
-          result.content = text.slice(0, maxLength);
-          result.truncated = true;
-        } else {
-          result.content = text;
-          result.truncated = false;
-        }
-      } else if (mode === 'html') {
-        let html = targetElement.outerHTML || '';
-        result.contentLength = html.length;
-        if (html.length > maxLength) {
-          result.content = html.slice(0, maxLength);
-          result.truncated = true;
-          result.note = 'HTML 已截断，可能不完整';
-        } else {
-          result.content = html;
-          result.truncated = false;
-        }
-      } else if (mode === 'structured') {
-        const structured = {};
-        const headings = targetElement.querySelectorAll('h1,h2,h3,h4,h5,h6');
-        structured.headings = Array.from(headings).slice(0, 50).map(h => ({ level: parseInt(h.tagName[1]), text: h.innerText.trim().slice(0, 200) }));
-        const links = targetElement.querySelectorAll('a[href]');
-        structured.links = Array.from(links).slice(0, 100).map(a => ({ text: (a.innerText || '').trim().slice(0, 100), href: a.href })).filter(l => l.href && !l.href.startsWith('javascript:'));
-        const buttons = targetElement.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]');
-        structured.buttons = Array.from(buttons).slice(0, 50).map(b => ({ text: (b.innerText || b.value || b.getAttribute('aria-label') || '').trim().slice(0, 100), type: b.type || 'button', disabled: b.disabled || false }));
-        const forms = targetElement.querySelectorAll('form');
-        structured.forms = Array.from(forms).slice(0, 20).map(f => {
-          const fields = Array.from(f.querySelectorAll('input, select, textarea')).slice(0, 30);
-          return { action: f.action || '', method: (f.method || 'GET').toUpperCase(), fieldCount: fields.length, fields: fields.map(field => ({ tag: field.tagName.toLowerCase(), type: field.type || '', name: field.name || '', placeholder: field.placeholder || '', required: field.required || false })) };
-        });
-        const images = targetElement.querySelectorAll('img');
-        structured.images = Array.from(images).slice(0, 50).map(img => ({ alt: img.alt || '', src: img.src ? img.src.slice(0, 200) : '' })).filter(img => img.src);
-        const tables = targetElement.querySelectorAll('table');
-        structured.tables = Array.from(tables).slice(0, 10).map(table => {
-          const headers = Array.from(table.querySelectorAll('th')).map(th => th.innerText.trim().slice(0, 50));
-          const rows = table.querySelectorAll('tr');
-          return { headers: headers.slice(0, 20), rowCount: rows.length };
-        });
-        result.structured = structured;
-        result.counts = { headings: structured.headings.length, links: structured.links.length, buttons: structured.buttons.length, forms: structured.forms.length, images: structured.images.length, tables: structured.tables.length };
-      }
-      result.mode = mode;
-      return result;
-    } catch (e) {
-      return { error: e.message };
-    }
-  })()`
+  const expression = GhostBridgeDom.buildPageContentExpression({ mode, selector, maxLength, includeMetadata })
 
   const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
     expression,
@@ -1343,103 +898,7 @@ async function handleGetPageContent(params = {}) {
 async function handleGetInteractiveSnapshot(params = {}) {
   const target = await ensureAttached()
   const { selector, includeText = true, maxElements = 100 } = params
-
-  const selectorStr = selector ? JSON.stringify(selector) : 'null'
-
-  const expression = `(function() {
-    try {
-      let refCounter = 0;
-      const elements = [];
-
-      const maxEls = ${maxElements};
-      // 候选集选择器——用浏览器原生选择器引擎代替全树 JS 递归
-      const INTERACTIVE_SELECTOR = 'a,button,input,select,textarea,[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="checkbox"],[role="radio"],[role="switch"],[role="combobox"],[tabindex]:not([tabindex="-1"]),[contenteditable="true"],[onclick]';
-
-      // 可见性检测（单次 getComputedStyle，返回 rect 复用）
-      function isVisible(el) {
-        const style = window.getComputedStyle(el);
-        if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) return null;
-        if (!el.offsetParent && el.tagName !== 'HTML' && el.tagName !== 'BODY' &&
-            style.position !== 'fixed' && style.position !== 'sticky') return null;
-        const rect = el.getBoundingClientRect();
-        if (rect.width === 0 && rect.height === 0) return null;
-        return rect;
-      }
-
-      function buildEntry(el, rect) {
-        refCounter++;
-        const ref = 'e' + refCounter;
-        el.setAttribute('data-ghost-ref', ref);
-        const tag = el.tagName.toLowerCase();
-        const entry = { ref, tag, cx: Math.round(rect.left + rect.width / 2), cy: Math.round(rect.top + rect.height / 2) };
-        if (el.type) entry.type = el.type;
-        if (el.name) entry.name = el.name;
-        if (el.getAttribute('role')) entry.role = el.getAttribute('role');
-        if (${includeText}) {
-          if (el.placeholder) entry.placeholder = el.placeholder.slice(0, 80);
-          if (el.value && tag !== 'textarea') entry.value = el.value.slice(0, 80);
-          if (tag === 'a') entry.href = (el.href || '').slice(0, 150);
-          if (tag === 'select') {
-            entry.options = Array.from(el.options).slice(0, 10).map(o => ({
-              value: o.value, text: o.text.slice(0, 50), selected: o.selected
-            }));
-          }
-          const text = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim();
-          if (text && text.length <= 100) entry.text = text;
-          else if (text) entry.text = text.slice(0, 97) + '...';
-        }
-        if (el.disabled) entry.disabled = true;
-        return entry;
-      }
-
-      // 候选集扫描（含 Shadow DOM 穿透）
-      function scanRoot(root) {
-        const candidates = root.querySelectorAll(INTERACTIVE_SELECTOR);
-        for (let i = 0; i < candidates.length && elements.length < maxEls; i++) {
-          const rect = isVisible(candidates[i]);
-          if (rect) elements.push(buildEntry(candidates[i], rect));
-        }
-        // 穿透 Shadow DOM + 兜底检测 el.onclick = fn 形式的 JS 属性绑定
-        if (elements.length < maxEls) {
-          const all = root.querySelectorAll('*');
-          for (let i = 0; i < all.length && elements.length < maxEls; i++) {
-            const el = all[i];
-            if (el.shadowRoot) scanRoot(el.shadowRoot);
-            // CSS 选择器只能匹配 [onclick] 属性，这里兜住 el.onclick = fn 的情况
-            if (el.onclick && !el.hasAttribute('data-ghost-ref')) {
-              const rect = isVisible(el);
-              if (rect) elements.push(buildEntry(el, rect));
-            }
-          }
-        }
-      }
-
-      // 清理旧的 ref 标记
-      document.querySelectorAll('[data-ghost-ref]').forEach(el => el.removeAttribute('data-ghost-ref'));
-
-      let rootEl = document.body;
-      const sel = ${selectorStr};
-      if (sel) {
-        rootEl = document.querySelector(sel);
-        if (!rootEl) return { error: '选择器未匹配到任何元素', selector: sel };
-      }
-
-      scanRoot(rootEl);
-
-      return {
-        url: window.location.href,
-        title: document.title,
-        elementCount: elements.length,
-        viewport: {
-          width: window.innerWidth,
-          height: window.innerHeight,
-          scrollX: Math.round(window.scrollX),
-          scrollY: Math.round(window.scrollY),
-        },
-        elements: elements,
-      };
-    } catch (e) { return { error: e.message }; }
-  })()`
+  const expression = GhostBridgeDom.buildInteractiveSnapshotExpression({ selector, includeText, maxElements })
 
   const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
     expression,

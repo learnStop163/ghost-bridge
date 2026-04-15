@@ -11,13 +11,8 @@ import path from "path"
 import { GHOST_BRIDGE_VERSION } from "../lib/version.js"
 
 const BASE_PORT = Number(process.env.GHOST_BRIDGE_PORT || 33333)
-// 使用当月1号0点的时间戳作为 token，确保同月内的服务器和插件自动匹配
-function getMonthlyToken() {
-  const now = new Date()
-  const firstDayOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0)
-  return String(firstDayOfMonth.getTime())
-}
-const WS_TOKEN = process.env.GHOST_BRIDGE_TOKEN || getMonthlyToken()
+const DEFAULT_WS_TOKEN = "ghost-bridge-local"
+const WS_TOKEN = process.env.GHOST_BRIDGE_TOKEN || DEFAULT_WS_TOKEN
 const RESPONSE_TIMEOUT = 8000
 const PORT_INFO_FILE = path.join(os.tmpdir(), "ghost-bridge-port.json")
 const SERVER_STARTED_AT = new Date().toISOString()
@@ -585,9 +580,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "inspect_page",
       description:
-        "【页面分析入口】当用户要求分析当前页面/网站/网页、理解页面结构、快速查看当前标签内容时，优先使用此工具。" +
-        "无需用户显式提到 ghost-bridge。" +
-        "默认返回页面元数据、结构化内容摘要和可交互元素概览，适合作为后续截图、交互、网络排查前的第一步。",
+        "页面分析入口。返回页面元数据、结构化摘要和可交互元素概览，适合先快速了解当前页面。",
       inputSchema: {
         type: "object",
         properties: {
@@ -613,7 +606,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_last_error",
-      description: "获取当前标签最近的异常/报错堆栈与元数据（无 sourcemap 友好）。默认只返回 error 级别的最近 20 条。",
+      description:
+        "获取当前标签最近的控制台、异常和网络错误事件。默认只返回 error；如需查看 console.log / console.warn，请传 severity=info / warn / all。",
       inputSchema: {
         type: "object",
         properties: {
@@ -632,7 +626,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_script_source",
       description:
-        "抓取目标脚本源码（压缩版），返回定位片段与可选 beautify，支持按 URL 片段筛选",
+        "抓取目标脚本源码片段，支持按 URL 片段筛选和可选 beautify。",
       inputSchema: {
         type: "object",
         properties: {
@@ -657,7 +651,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "find_by_string",
       description:
-        "在当前页面脚本内按字符串搜索，返回匹配的上下文片段（用于压缩代码定位）",
+        "在当前页面脚本内按字符串搜索，返回匹配上下文。",
       inputSchema: {
         type: "object",
         properties: {
@@ -686,7 +680,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "list_network_requests",
       description:
-        "列出捕获的网络请求，支持按 URL、方法、状态、类型过滤。默认按排障优先级排序：失败请求、进行中请求、XHR/Fetch 会优先展示。为避免上下文膨胀，data URL 和超长 URL 会自动摘要化。",
+        "列出捕获的网络请求，支持按 URL、方法、状态和类型过滤。默认按排障优先级排序；data URL 和超长 URL 会自动摘要化。",
       inputSchema: {
         type: "object",
         properties: {
@@ -706,7 +700,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_network_detail",
       description:
-        "获取单个网络请求的详细信息，包括请求头、响应头，可选获取响应体。为避免上下文膨胀，data URL 和超长 URL 会自动摘要化。",
+        "获取单个网络请求详情，包括请求头、响应头和可选响应体；超长 URL 会自动摘要化。",
       inputSchema: {
         type: "object",
         properties: {
@@ -724,9 +718,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "perf_metrics",
       description:
-        "获取页面性能指标：包含引擎级指标（JS堆内存、DOM节点数、Layout次数、脚本执行时间）、" +
-        "Web Vitals（FCP、TTFB、DOMContentLoaded、Long Tasks）和资源加载摘要。" +
-        "用于诊断页面卡顿、内存占用过高、加载缓慢等性能问题。",
+        "获取页面性能指标，包括引擎级指标、Web Vitals 和资源加载摘要。",
       inputSchema: {
         type: "object",
         properties: {
@@ -744,15 +736,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "capture_screenshot",
       description:
-        "【推荐用于视觉分析】截取当前页面的截图，返回 base64 图片。" +
-        "适用于：1) 查看页面实际视觉效果 2) 排查 UI/样式/布局/颜色问题 " +
-        "3) 验证页面渲染 4) 分析元素位置和间距 5) 查看图片/图标等视觉内容。" +
-        "当用户说“看看这个页面长什么样”“帮我分析界面/布局/样式”时，应优先使用此工具，" +
-        "无需用户显式提到 ghost-bridge。" +
-        "当需要看到页面「长什么样」时使用此工具。" +
-        "默认优先使用更省传输的 JPEG：普通截图默认 quality 80，完整长截图默认 quality 70。" +
-        "当需要检查文字清晰度、1px 细线、图标边缘、透明背景或像素级细节时，应优先使用 PNG。" +
-        "如仅需文本/链接等信息，建议使用更快的 get_page_content。",
+        "截取当前页面截图，适合看页面实际视觉效果、UI 样式和布局。默认优先使用 JPEG；需要文字、细线或透明背景细节时改用 PNG。",
       inputSchema: {
         type: "object",
         properties: {
@@ -785,14 +769,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_page_content",
       description:
-        "【推荐用于快速获取页面内容】提取当前页面的文本、HTML 或结构化数据。" +
-        "比 capture_screenshot 更快更轻量，适用于：" +
-        "1) 获取页面文字内容 2) 提取链接/按钮/表单等元素 " +
-        "3) 分析 DOM 结构 4) 获取页面元数据（title/description）。" +
-        "当用户说“分析这个页面/网站”“看看页面里有什么内容”且不强调视觉效果时，优先使用此工具，" +
-        "无需用户显式提到 ghost-bridge。" +
-        "当需要文本信息而非视觉效果时，优先使用此工具。" +
-        "注意：不支持 iframe 内容，不反映 CSS 样式。",
+        "提取当前页面的文本、HTML 或结构化数据。比截图更轻量，适合先看文字、DOM 结构和页面元数据；不反映 CSS，也不含 iframe 内容。",
       inputSchema: {
         type: "object",
         properties: {
@@ -821,14 +798,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_interactive_snapshot",
       description:
-        "【操作页面前必须先调用】扫描当前页面所有可见的可交互元素（按钮/链接/输入框/下拉框等），" +
-        "返回带有 ref 短标识（如 e1, e2, e3）的精简列表，包含元素类型、文本和位置。" +
-        "Token 极省（通常 < 1000 tokens），专为 AI 操作页面而设计。" +
-        "当用户要求点击、输入、登录、提交表单、打开菜单等操作时，应主动使用此工具开始定位元素，" +
-        "无需用户显式提到 ghost-bridge。" +
-        "获取后可通过 dispatch_action 工具使用 ref 标识来点击、填写、按键等。" +
-        "支持 Shadow DOM 穿透。\n" +
-        "⚠️ 仅用于交互操作前的元素定位。如需排查 UI/CSS 布局问题，请使用 capture_screenshot 或 get_page_content。",
+        "扫描当前页面可见的可交互元素，返回带 ref 的精简列表，供后续 dispatch_action 使用。支持 Shadow DOM；仅用于交互定位。",
       inputSchema: {
         type: "object",
         properties: {
@@ -850,15 +820,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "dispatch_action",
       description:
-        "【操作页面元素】对 get_interactive_snapshot 返回的元素执行动作。" +
-        "通过 ref 标识（如 e1, e5）精准定位元素，使用 CDP 物理级模拟执行操作，" +
-        "兼容所有前端框架（React/Vue/Angular），成功率极高。\n" +
-        "当用户明确希望在页面上执行点击、输入、回车、滚动、选择等操作时，应结合 get_interactive_snapshot 主动使用此工具，" +
-        "无需用户显式提到 ghost-bridge。\n" +
-        "支持的动作：click（点击）、fill（填写输入框）、press（按键如 Enter）、" +
-        "scroll（滚动）、select（下拉选择）、hover（悬停）、focus（聚焦）。\n" +
-        "⚠️ 使用前必须先调用 get_interactive_snapshot 获取元素列表。" +
-        "操作后建议用 capture_screenshot 或再次 get_interactive_snapshot 验证结果。",
+        "对 get_interactive_snapshot 返回的元素执行点击、输入、按键、滚动、选择、悬停或聚焦。⚠️ 使用前必须先调用 get_interactive_snapshot 获取 ref；操作后建议再验证页面状态。",
       inputSchema: {
         type: "object",
         properties: {
