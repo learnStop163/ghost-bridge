@@ -18,17 +18,6 @@ Most browser-capable AI tools start a separate browser. Ghost Bridge connects AI
 - Click, type, scroll, and submit forms on the current page
 - Share one Chrome transport across multiple MCP clients
 
-## What's New in 0.6.1
-
-- `list_network_requests` and `get_network_detail` now summarize `data:` URLs and oversized URLs so inline images and long query strings do not overwhelm model context
-
-## What's New in 0.6.0
-
-- `inspect_page` now collects structured page data and interactive elements in one browser-side snapshot, reducing duplicate DOM scans and cutting one round-trip from the hot path
-- `capture_screenshot` now defaults to JPEG for better transfer efficiency: visible viewport screenshots default to `quality: 80`, and `fullPage` screenshots default to `quality: 70`
-- Use `format: "png"` when you need high-fidelity text rendering, 1px lines, icon edges, transparency, or pixel-level UI inspection
-- Attachment and request cleanup paths are more robust under concurrent usage and multi-client reconnect scenarios
-
 ## Quick Start
 
 ### 1. Install
@@ -107,7 +96,7 @@ Typical prompts:
 | `dispatch_action` | Click, fill, press, scroll, hover, select |
 | `list_network_requests` | Inspect captured network traffic |
 | `get_network_detail` | Read one request in detail |
-| `get_last_error` | Inspect recent errors and exceptions |
+| `get_last_error` | Inspect recent console, exception, and network error events |
 | `get_script_source` | Extract page scripts |
 | `find_by_string` | Search within bundled script content |
 | `coverage_snapshot` | Identify active scripts quickly |

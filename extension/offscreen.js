@@ -15,11 +15,7 @@ function log(msg) {
   chrome.runtime.sendMessage({ type: 'log', msg }).catch(() => {})
 }
 
-function getMonthlyToken() {
-  const now = new Date()
-  const firstDayOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0)
-  return String(firstDayOfMonth.getTime())
-}
+const DEFAULT_TOKEN = 'ghost-bridge-local'
 
 // 连接到服务器
 function connect() {
@@ -74,7 +70,9 @@ function connect() {
             port: port,
           }).catch(() => {})
         } else {
-          terminalErrorMessage = `Port ${port} is occupied by a non-matching service, or the token does not match.`
+          terminalErrorMessage = msg.service === 'ghost-bridge'
+            ? `Port ${port} is running ghost-bridge, but the token does not match.`
+            : `Port ${port} is occupied by a non-matching service.`
           log('身份验证失败，将在固定端口上重试...')
           chrome.runtime.sendMessage({
             type: 'status',
@@ -159,7 +157,7 @@ function disconnect() {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'connect') {
     config.basePort = message.basePort || 33333
-    config.token = message.token || getMonthlyToken()
+    config.token = message.token || DEFAULT_TOKEN
     disconnect()
     manualDisconnect = false  // 用户重新连接，清除断开标志
     connect()
