@@ -1,0 +1,51 @@
+plan.md
+  4d673b7a77719513 1,5,7-33,39-40,47,49-59,61-62,64-68,71,74-76,79-80,85-96,98-117,122-124,126-130,135-136,138-152,156-158,162-163,170-202,207-215,221,223-227,229-233,236-240,242,244-245,247,250-251,254,260-261,266-283,286-293,297-299,302,304-305,307,309-323,325-327,329-331,333-336,339,344-345,351-352,359,361-388,390-395,400-406,409-443,445-448
+  7f1d891a0899533c 2-4,6,34-38,41-46,48,60,63,69-70,72-73,77-78,81-84,97,118-121,125,131-134,137,153-155,159-161,164-169,203-206,216-220,222,228,234-235,241,243,246,248-249,252-253,255-259,262-265,284-285,294-296,300-301,303,306,308,324,328,332,337-338,340-343,346-350,353-358,360,389,396-399,407-408,444
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "62d0277864d331e70e76dd76d6006c7da4ad7b7b",
+  "prompts": {
+    "2e0d7e35393464d7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019d8fbb-a54c-7391-b8cb-2e6db108ff4f",
+        "model": "gpt-5.4"
+      },
+      "human_author": "jiuban",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 3,
+      "overriden_lines": 1,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/6f9611dec3724f27c40acf28ec0e4cea6ab87b53abcaeaa88c42b07811832d68"
+    },
+    "4d673b7a77719513": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019d90c3-f0fd-75c3-a871-9edfb8bbfadf",
+        "model": "gpt-5.4"
+      },
+      "human_author": "jiuban",
+      "messages": [],
+      "total_additions": 329,
+      "total_deletions": 111,
+      "accepted_lines": 329,
+      "overriden_lines": 0
+    },
+    "7f1d891a0899533c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e9a2b3b-42b6-44e4-a9dd-abbad8fb10df",
+        "model": "glm-5.1"
+      },
+      "human_author": "jiuban",
+      "messages": [],
+      "total_additions": 230,
+      "total_deletions": 0,
+      "accepted_lines": 119,
+      "overriden_lines": 0
+    }
+  }
+}
