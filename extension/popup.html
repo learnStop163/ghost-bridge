@@ -165,7 +165,15 @@
     .status-row {
       display: flex;
       align-items: center;
+      justify-content: space-between;
       gap: 12px;
+    }
+
+    .status-main {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
     }
 
     /* Modern Ripple/Pulse Animations */
@@ -200,6 +208,58 @@
       font-weight: 600;
       letter-spacing: 0.3px;
       transition: color 0.3s ease;
+      white-space: nowrap;
+    }
+
+    .target-toggle {
+      flex: 0 0 auto;
+      min-width: 72px;
+      height: 28px;
+      padding: 0 10px;
+      border: 1px solid rgba(0, 210, 255, 0.28);
+      border-radius: 999px;
+      background: rgba(0, 210, 255, 0.08);
+      color: #9deaff;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.2px;
+      cursor: pointer;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+    }
+
+    .target-toggle:hover:not(:disabled) {
+      background: rgba(0, 210, 255, 0.16);
+      border-color: rgba(0, 210, 255, 0.5);
+      color: #ffffff;
+      box-shadow: 0 0 14px rgba(0, 210, 255, 0.16);
+    }
+
+    .target-toggle:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      box-shadow: none;
+    }
+
+    .target-toggle.pinned {
+      background: rgba(255, 159, 10, 0.13);
+      border-color: rgba(255, 159, 10, 0.5);
+      color: #ffc56b;
+      box-shadow: 0 0 16px rgba(255, 159, 10, 0.12);
+    }
+
+    .target-toggle.pinned:hover:not(:disabled) {
+      background: rgba(255, 159, 10, 0.2);
+      border-color: rgba(255, 159, 10, 0.72);
+      color: #fff3d6;
+    }
+
+    .target-toggle .target-icon {
+      font-size: 12px;
+      line-height: 1;
     }
 
     .status-detail-container {
@@ -260,50 +320,6 @@
 
     .detail-value.warning {
       color: #ff9f0a;
-    }
-
-    .error-list {
-      max-height: 180px;
-      overflow-y: auto;
-      margin-top: 12px;
-      padding: 8px;
-      background: rgba(0, 0, 0, 0.4);
-      border-radius: 8px;
-      border: 1px solid rgba(255, 59, 48, 0.2);
-      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-      opacity: 1;
-    }
-    .error-list.collapsed {
-      max-height: 0;
-      opacity: 0;
-      margin-top: 0;
-      padding-top: 0;
-      padding-bottom: 0;
-      border-color: transparent;
-      overflow: hidden;
-    }
-    
-    .error-item {
-      font-size: 11px;
-      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-      padding: 6px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-      word-break: break-work;
-      color: #e2e8f0;
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-    .error-item:last-child {
-      border-bottom: none;
-    }
-    .error-item .err-msg {
-      color: #ff8a8a;
-      white-space: pre-wrap;
-    }
-    .error-item .err-loc {
-      color: #64748b;
-      font-size: 10px;
     }
 
     .btn-row {
@@ -432,10 +448,16 @@
 
     <div class="status-card" id="statusCard">
       <div class="status-row">
-        <div class="status-dot-wrapper" id="dotWrapper">
-          <div class="status-dot"></div>
+        <div class="status-main">
+          <div class="status-dot-wrapper" id="dotWrapper">
+            <div class="status-dot"></div>
+          </div>
+          <span class="status-text" id="statusText">Checking...</span>
         </div>
-        <span class="status-text" id="statusText">Checking...</span>
+        <button class="target-toggle" id="targetBtn" type="button" title="Pin current tab">
+          <span class="target-icon" id="targetIcon">○</span>
+          <span id="targetBtnText">Pin</span>
+        </button>
       </div>
       
       <div class="status-detail-container" id="detailContainer">
@@ -447,14 +469,10 @@
           <span class="detail-label">Target Tab</span>
           <span class="detail-value" id="tabVal" title="">-</span>
         </div>
-        <div class="detail-row clickable" id="errorRow" title="Click to view recent errors">
-          <span class="detail-label">Rec. Errors</span>
-          <span class="detail-value warning" id="errorVal">0</span>
+        <div class="detail-row hidden" id="viewingRow">
+          <span class="detail-label">Viewing Now</span>
+          <span class="detail-value" id="viewingVal" title="">-</span>
         </div>
-      </div>
-      
-      <div id="errorList" class="error-list collapsed">
-        <!-- JS dynamically injects errors here -->
       </div>
     </div>
 

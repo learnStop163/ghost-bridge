@@ -16,6 +16,7 @@ Most browser-capable AI tools start a separate browser. Ghost Bridge connects AI
 - Inspect page structure, text, screenshots, errors, and network traffic
 - Search and extract script sources, even in production bundles
 - Click, type, scroll, and submit forms on the current page
+- Bind multiple Chrome tabs as named targets and operate them independently
 - Share one Chrome transport across multiple MCP clients
 
 ## Quick Start
@@ -94,6 +95,14 @@ Typical prompts:
 | `get_page_content` | Text, HTML, and structured DOM extraction |
 | `get_interactive_snapshot` | Find clickable and editable elements |
 | `dispatch_action` | Click, fill, press, scroll, hover, select |
+| `bind_tab` | Bind a Chrome tab as a named target such as `cases` or `app` |
+| `unbind_tab` | Remove a named target binding |
+| `list_targets` | Show named targets and their per-tab session status |
+| `pin_current_tab` | Keep Ghost Bridge attached to the current tab while you browse elsewhere |
+| `pin_tab` | Pin a target tab by tab ID, URL fragment, or title fragment |
+| `unpin_tab` | Return to following the focused tab |
+| `get_target_tab` | Show the current target mode and tab |
+| `list_tabs` | List available Chrome tabs |
 | `list_network_requests` | Inspect captured network traffic |
 | `get_network_detail` | Read one request in detail |
 | `get_last_error` | Inspect recent console, exception, and network error events |
@@ -112,7 +121,18 @@ Recommended flow:
 
 Notes:
 
+- Use `bind_tab` when a workflow spans multiple pages. For example, bind a checklist page as `cases` and a business page as `app`, then call tools with `target: "cases"` or `target: "app"`.
+- All browser tools accept an optional `target` parameter. When named targets are bound, `dispatch_action` requires `target` so refs from one page are not accidentally used on another page.
+- Use `pin_current_tab` when you are debugging a page and need to switch to other tabs without changing the AI target. Use `unpin_tab` to restore the original follow-focused-tab behavior.
 - `list_network_requests` and `get_network_detail` automatically summarize `data:` URLs and very long URLs so inline images or oversized query strings do not overwhelm model context
+
+Multi-page example:
+
+```text
+Bind the current checklist tab as cases.
+Bind the tab whose title contains "Orders" as app.
+Read the next case from target cases, operate target app, then mark the case passed or failed back on target cases.
+```
 
 ## Configuration
 
@@ -129,12 +149,23 @@ flowchart LR
     A["AI Client<br/>Claude / Codex / Cursor"]
     B["Ghost Bridge MCP Server<br/>server.js"]
     C["Chrome Extension<br/>background.js"]
-    D["Browser Tab<br/>Target Context"]
+    D["Browser Tabs<br/>Target Sessions"]
 
     A <-->|"stdio"| B
     B <-->|"WebSocket"| C
     C <-->|"CDP"| D
 ```
+
+## Troubleshooting
+
+If the popup shows `No Bridge` / `Not Found`, it means the Chrome extension could not find a Ghost Bridge WebSocket service on the configured port. It does not necessarily mean your AI client is closed.
+
+Run `ghost-bridge status` and check:
+
+- `Active WebSocket Service`: the running server path should match the CLI/package you expect
+- `Chrome Extension > Sync`: the installed extension should match the current package
+
+If either is out of sync, run `ghost-bridge init`, reload the Chrome extension, and restart the MCP client so the browser, extension copy, and server process all point at the same build.
 
 ## Limitations
 

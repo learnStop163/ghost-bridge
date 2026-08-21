@@ -8,6 +8,7 @@ import net from "net"
 import fs from "fs"
 import os from "os"
 import path from "path"
+import { fileURLToPath } from "url"
 import { GHOST_BRIDGE_VERSION } from "../lib/version.js"
 
 const BASE_PORT = Number(process.env.GHOST_BRIDGE_PORT || 33333)
@@ -16,6 +17,7 @@ const WS_TOKEN = process.env.GHOST_BRIDGE_TOKEN || DEFAULT_WS_TOKEN
 const RESPONSE_TIMEOUT = 8000
 const PORT_INFO_FILE = path.join(os.tmpdir(), "ghost-bridge-port.json")
 const SERVER_STARTED_AT = new Date().toISOString()
+const SERVER_ENTRY_PATH = fileURLToPath(import.meta.url)
 
 let chromeConnection = null   // Chrome 扩展的连接
 let activeConnection = null   // 当前用于发送请求的连接（主实例用 chromeConnection，非主实例用到主实例的连接）
@@ -23,9 +25,38 @@ let actualPort = BASE_PORT
 let isMainInstance = false    // 是否是主实例（启动了 WebSocket 服务器）
 const pendingRequests = new Map()
 const mcpClients = new Set()  // 连接到主实例的其他 MCP 客户端
+let mcpClientSeq = 0          // MCP 客户端 clientId 序号（c1、c2…），进程生命周期内不复用
+const LOCAL_CLIENT_ID = "local" // 主实例本地（stdio）会话的 clientId
 
 function log(msg) {
   console.error(`[ghost-bridge] ${msg}`)
+}
+
+function buildIdentityPayload() {
+  return {
+    type: "identity",
+    service: "ghost-bridge",
+    token: WS_TOKEN,
+    pid: process.pid,
+    port: actualPort,
+    version: GHOST_BRIDGE_VERSION,
+    serverPath: SERVER_ENTRY_PATH,
+    startedAt: SERVER_STARTED_AT,
+    capabilities: ["heartbeat"],
+  }
+}
+
+function getServiceMismatch(probe) {
+  if (!probe || probe.service !== "ghost-bridge") return null
+  if (!probe.version) return "旧服务缺少版本元数据"
+  if (probe.version !== GHOST_BRIDGE_VERSION) {
+    return `版本不一致（旧: ${probe.version}, 新: ${GHOST_BRIDGE_VERSION}）`
+  }
+  if (!probe.serverPath) return "旧服务缺少路径元数据"
+  if (path.resolve(probe.serverPath) !== path.resolve(SERVER_ENTRY_PATH)) {
+    return `路径不一致（旧: ${probe.serverPath}, 新: ${SERVER_ENTRY_PATH}）`
+  }
+  return null
 }
 
 /**
@@ -125,12 +156,12 @@ async function waitForPortAvailable(port, timeoutMs = 5000) {
 /**
  * 停止旧实例，让新实例接管固定端口
  */
-async function stopExistingService(pid, port) {
+async function stopExistingService(pid, port, reason = "需要由新实例接管") {
   if (!pid || pid === process.pid) {
     return false
   }
 
-  log(`检测到旧实例 token 不一致，准备停止旧实例 (PID: ${pid})`)
+  log(`检测到旧实例需要替换：${reason}，准备停止旧实例 (PID: ${pid})`)
 
   try {
     process.kill(pid, "SIGTERM")
@@ -201,14 +232,18 @@ async function initWebSocketService() {
     const probe = await probeExistingService(existing.port)
     if (probe?.service === "ghost-bridge") {
       if (probe.token === WS_TOKEN) {
-        actualPort = existing.port
-        isMainInstance = false
-        log(`✅ 复用现有服务，端口 ${actualPort}`)
-        return null // 不启动新的 WebSocket 服务器
+        const mismatch = getServiceMismatch(probe)
+        if (!mismatch) {
+          actualPort = existing.port
+          isMainInstance = false
+          log(`✅ 复用现有服务，端口 ${actualPort}`)
+          return null // 不启动新的 WebSocket 服务器
+        }
+        await stopExistingService(Number(probe.pid) || existing.pid, existing.port, mismatch)
+      } else {
+        const oldPid = Number(probe.pid) || existing.pid
+        await stopExistingService(oldPid, existing.port, "token 不一致")
       }
-
-      const oldPid = Number(probe.pid) || existing.pid
-      await stopExistingService(oldPid, existing.port)
     } else {
       log(`❌ 现有服务验证失败，启动新服务...`)
       try { fs.unlinkSync(PORT_INFO_FILE) } catch {}
@@ -219,13 +254,17 @@ async function initWebSocketService() {
     const probe = await probeExistingService(BASE_PORT)
     if (probe?.service === "ghost-bridge") {
       if (probe.token === WS_TOKEN) {
-        actualPort = BASE_PORT
-        isMainInstance = false
-        log(`✅ 复用固定端口上的现有服务，端口 ${actualPort}`)
-        return null
+        const mismatch = getServiceMismatch(probe)
+        if (!mismatch) {
+          actualPort = BASE_PORT
+          isMainInstance = false
+          log(`✅ 复用固定端口上的现有服务，端口 ${actualPort}`)
+          return null
+        }
+        await stopExistingService(Number(probe.pid), BASE_PORT, mismatch)
+      } else {
+        await stopExistingService(Number(probe.pid), BASE_PORT, "token 不一致")
       }
-
-      await stopExistingService(Number(probe.pid), BASE_PORT)
     }
 
     if (!(await isPortAvailable(BASE_PORT))) {
@@ -244,6 +283,8 @@ async function initWebSocketService() {
       port: actualPort,
       wsUrl: `ws://localhost:${actualPort}`,
       pid: process.pid,
+      version: GHOST_BRIDGE_VERSION,
+      serverPath: SERVER_ENTRY_PATH,
       startedAt: SERVER_STARTED_AT
     }, null, 2)
   )
@@ -254,22 +295,25 @@ async function initWebSocketService() {
 
 const wss = await initWebSocketService()
 
+// 协议层心跳定时器：主动 ping 所有连接，超时未响应的视为死连接并踢除
+let wsPingInterval = null
+const WS_PING_INTERVAL_MS = 30000
+
 // 如果是主实例，设置 WebSocket 服务器的连接处理
 if (wss) {
   wss.on("connection", (ws, req) => {
+    // 标记连接活性，配合下方 ping 定时器检测半开死连接（系统休眠唤醒后常见）
+    ws.isAlive = true
+    ws.on("pong", () => {
+      ws.isAlive = true
+    })
+
     const url = new URL(req.url || "/", "http://localhost")
     const token = url.searchParams.get("token") || ""
     const role = url.searchParams.get("role") || ""
 
     if (role === "probe") {
-      ws.send(JSON.stringify({
-        type: "identity",
-        service: "ghost-bridge",
-        token: WS_TOKEN,
-        pid: process.pid,
-        port: actualPort,
-        startedAt: SERVER_STARTED_AT,
-      }))
+      ws.send(JSON.stringify(buildIdentityPayload()))
       ws.close(1000, "Probe complete")
       return
     }
@@ -282,10 +326,12 @@ if (wss) {
     log(`连接验证通过 (token: ${token})`)
 
     if (role === "mcp-client") {
-      // 其他 MCP 实例的连接
-      log("📡 MCP 客户端已连接")
+      // 其他 MCP 实例的连接：分配 clientId，其 pin/bind 的 target 命名空间在扩展端按它隔离
+      const clientId = `c${++mcpClientSeq}`
+      ws.ghostClientId = clientId
+      log(`📡 MCP 客户端已连接 (${clientId})`)
       mcpClients.add(ws)
-      ws.send(JSON.stringify({ type: "identity", service: "ghost-bridge", token: WS_TOKEN }))
+      ws.send(JSON.stringify(buildIdentityPayload()))
 
       ws.on("message", (data) => {
         try {
@@ -298,7 +344,11 @@ if (wss) {
               result: {
                 chromeConnected: !!chromeConnection,
                 mcpClientsCount: mcpClients.size,
-                port: actualPort
+                port: actualPort,
+                version: GHOST_BRIDGE_VERSION,
+                serverPath: SERVER_ENTRY_PATH,
+                pid: process.pid,
+                startedAt: SERVER_STARTED_AT,
               }
             }))
             return
@@ -311,17 +361,29 @@ if (wss) {
             }
             return
           }
-          // 记录请求来源，以便响应时转发回去
           if (msg.id) {
-            pendingRequests.set(msg.id, { source: ws })
+            // 改写为 "clientId:原id" 复合 id：不同 MCP 客户端的 id 序列（多为小整数）互不冲突，
+            // 响应回来时按前缀路由回来源并还原原 id
+            const wireId = `${clientId}:${msg.id}`
+            pendingRequests.set(wireId, { source: ws, originalId: msg.id })
+            chromeConnection.send(JSON.stringify({
+              id: wireId,
+              command: msg.command,
+              params: msg.params,
+              clientId,
+              ...(WS_TOKEN ? { token: WS_TOKEN } : {}),
+            }))
+          } else {
+            chromeConnection.send(data)
           }
-          chromeConnection.send(data)
         } catch {}
       })
 
       ws.on("close", () => {
-        log("📡 MCP 客户端已断开")
+        log(`📡 MCP 客户端已断开 (${ws.ghostClientId})`)
         mcpClients.delete(ws)
+        // 通知扩展清理该会话的 target 命名空间（连接可能已不在，失败忽略）
+        askChrome("_clientDisconnected", { clientId: ws.ghostClientId }, { timeoutMs: 3000 }).catch(() => {})
       })
     } else {
       // Chrome 扩展的连接
@@ -337,19 +399,25 @@ if (wss) {
       log("🌐 Chrome 扩展已连接")
       chromeConnection = ws
       activeConnection = ws
-      ws.send(JSON.stringify({ type: "identity", service: "ghost-bridge", token: WS_TOKEN }))
+      ws.send(JSON.stringify(buildIdentityPayload()))
 
       ws.on("message", (data) => {
         // 检查是否需要转发响应到 MCP 客户端
         try {
           const msg = JSON.parse(data.toString())
+          if (msg.type === "heartbeat") {
+            ws.send(JSON.stringify({ type: "heartbeat_ack", ts: msg.ts || Date.now() }))
+            return
+          }
           if (msg.id && pendingRequests.has(msg.id)) {
             const pending = pendingRequests.get(msg.id)
             // 区分：来自其他 MCP 客户端的请求 vs 本地请求
-            if (pending.source && pending.source.readyState === WebSocket.OPEN) {
-              // 来自其他 MCP 客户端，转发响应
+            if (pending.source) {
               pendingRequests.delete(msg.id)
-              pending.source.send(data)
+              // 还原为该客户端的原始 id 后转发
+              if (pending.source.readyState === WebSocket.OPEN) {
+                pending.source.send(JSON.stringify({ ...msg, id: pending.originalId }))
+              }
               return
             }
             // 本地请求，直接处理（不要在这里删除）
@@ -359,14 +427,41 @@ if (wss) {
         handleIncoming(data)
       })
 
-      ws.on("close", () => {
-        log("🌐 Chrome 连接已关闭")
+      ws.on("close", (code, reason) => {
+        const reasonText = reason ? reason.toString() : ""
+        log(`🌐 Chrome 连接已关闭 (code=${code}${reasonText ? ` reason="${reasonText}"` : ""})`)
+        if (chromeConnection !== ws) {
+          log("忽略旧 Chrome 连接的关闭事件")
+          return
+        }
         chromeConnection = null
-        activeConnection = null
+        if (activeConnection === ws) {
+          activeConnection = null
+        }
         failAllPending("Chrome 连接断开")
+      })
+
+      ws.on("error", (err) => {
+        log(`🌐 Chrome 连接错误: ${err.message}`)
       })
     }
   })
+
+  // 每 30 秒 ping 一次所有连接；连续一轮未回 pong 即 terminate，
+  // 立即触发 close 事件清理 chromeConnection，客户端随之快速重连
+  wsPingInterval = setInterval(() => {
+    for (const client of wss.clients) {
+      if (client.isAlive === false) {
+        log("🌐 心跳超时，主动断开死连接")
+        client.terminate()
+        continue
+      }
+      client.isAlive = false
+      try {
+        client.ping()
+      } catch {}
+    }
+  }, WS_PING_INTERVAL_MS)
 } else {
   // 非主实例：作为客户端连接到主实例
   log(`📡 作为客户端连接到主实例 (端口 ${actualPort})...`)
@@ -504,7 +599,7 @@ async function askMainInstance(command, params = {}) {
 async function askChrome(command, params = {}, options = {}) {
   if (!activeConnection) throw new Error("Chrome 未连接，请确认浏览器开启且扩展已启用")
   const id = crypto.randomUUID()
-  const payload = { id, command, params }
+  const payload = { id, command, params, clientId: LOCAL_CLIENT_ID }
   if (WS_TOKEN) payload.token = WS_TOKEN
   const timeoutMs = options.timeoutMs || RESPONSE_TIMEOUT
 
@@ -528,6 +623,11 @@ async function askChrome(command, params = {}, options = {}) {
 
 function jsonText(data) {
   return typeof data === "string" ? data : JSON.stringify(data)
+}
+
+const TARGET_ARG = {
+  type: "string",
+  description: "命名浏览器目标，如 cases/app。先用 bind_tab 绑定；不指定则使用默认 focused/pinned 目标。绑定与 pin 均按会话隔离",
 }
 
 function buildSnippet(source, line, column, { beautifyEnabled = true, contextLines = 20 } = {}) {
@@ -584,6 +684,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
+          target: TARGET_ARG,
           selector: {
             type: "string",
             description: "CSS 选择器，限定分析范围。不指定则分析整个页面",
@@ -605,12 +706,75 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: { type: "object", properties: {} },
     },
     {
-      name: "get_last_error",
-      description:
-        "获取当前标签最近的控制台、异常和网络错误事件。默认只返回 error；如需查看 console.log / console.warn，请传 severity=info / warn / all。",
+      name: "list_tabs",
+      description: "列出当前 Chrome 标签页，并返回 Ghost Bridge 当前目标模式与目标标签页。",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "bind_tab",
+      description: "按 tabId、URL 片段或标题片段把 Chrome 标签页绑定为命名 target，例如 cases 或 app。target 命名空间按 MCP 会话隔离：多个 Agent / 同一 Agent 的多个会话各自绑定的 target（含同名）互不干扰。",
       inputSchema: {
         type: "object",
         properties: {
+          name: { type: "string", description: "target 名称，如 cases/app。只能包含字母、数字、下划线和连字符" },
+          tabId: { type: "number", description: "Chrome 标签页 ID，优先使用" },
+          urlContains: { type: "string", description: "URL 片段。未提供 tabId 时按它匹配" },
+          titleContains: { type: "string", description: "标题片段。可与 urlContains 同时使用" },
+        },
+        required: ["name"],
+      },
+    },
+    {
+      name: "unbind_tab",
+      description: "解绑一个命名 target。若该 tab 没有其他 target 引用，会释放对应 debugger session。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "要解绑的 target 名称" },
+        },
+        required: ["name"],
+      },
+    },
+    {
+      name: "list_targets",
+      description: "查看当前已绑定的命名 targets，以及默认 focused/pinned 目标状态。",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "get_target_tab",
+      description: "查看 Ghost Bridge 当前操作目标。目标模式为 focused 时跟随当前聚焦标签页；pinned 时锁定指定标签页。",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "pin_current_tab",
+      description: "锁定当前聚焦的 Chrome 标签页。锁定后用户切换到其他页面也不会改变 Ghost Bridge 的操作目标。",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "pin_tab",
+      description: "按 tabId、URL 片段或标题片段锁定 Chrome 标签页。pin 状态按 MCP 会话隔离：多个 Agent / 多个会话各自 pin 的页面互不覆盖。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          tabId: { type: "number", description: "Chrome 标签页 ID，优先使用" },
+          urlContains: { type: "string", description: "URL 片段。未提供 tabId 时按它匹配" },
+          titleContains: { type: "string", description: "标题片段。可与 urlContains 同时使用" },
+        },
+      },
+    },
+    {
+      name: "unpin_tab",
+      description: "解除锁定，恢复跟随当前聚焦标签页。",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "get_last_error",
+      description:
+        "获取目标标签页最近的控制台、异常和网络错误事件。默认只返回 error；如需查看 console.log / console.warn，请传 severity=info / warn / all。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          target: TARGET_ARG,
           severity: {
             type: "string",
             enum: ["error", "warn", "info", "all"],
@@ -626,10 +790,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_script_source",
       description:
-        "抓取目标脚本源码片段，支持按 URL 片段筛选和可选 beautify。",
+        "抓取目标标签页的脚本源码片段，支持按 URL 片段筛选和可选 beautify。",
       inputSchema: {
         type: "object",
         properties: {
+          target: TARGET_ARG,
           scriptUrlContains: { type: "string" },
           line: { type: "number" },
           column: { type: "number" },
@@ -644,6 +809,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
+          target: TARGET_ARG,
           durationMs: { type: "number", description: "默认 1500ms" },
         },
       },
@@ -651,10 +817,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "find_by_string",
       description:
-        "在当前页面脚本内按字符串搜索，返回匹配上下文。",
+        "在目标标签页脚本内按字符串搜索，返回匹配上下文。",
       inputSchema: {
         type: "object",
         properties: {
+          target: TARGET_ARG,
           query: { type: "string" },
           scriptUrlContains: { type: "string" },
           maxMatches: { type: "number" },
@@ -666,24 +833,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: "symbolic_hints",
       description:
         "收集页面的资源、全局符号与 UA/URL 线索，帮助推断版本与模块归属",
-      inputSchema: { type: "object", properties: {} },
+      inputSchema: { type: "object", properties: { target: TARGET_ARG } },
     },
     {
       name: "eval_script",
-      description: "在当前页面执行只读 JS 表达式（谨慎使用）",
+      description: "在目标标签页执行只读 JS 表达式（谨慎使用）",
       inputSchema: {
         type: "object",
-        properties: { code: { type: "string" } },
+        properties: { target: TARGET_ARG, code: { type: "string" } },
         required: ["code"],
       },
     },
     {
       name: "list_network_requests",
       description:
-        "列出捕获的网络请求，支持按 URL、方法、状态和类型过滤。默认按排障优先级排序；data URL 和超长 URL 会自动摘要化。",
+        "列出目标标签页捕获的网络请求，支持按 URL、方法、状态和类型过滤。默认按排障优先级排序；data URL 和超长 URL 会自动摘要化。",
       inputSchema: {
         type: "object",
         properties: {
+          target: TARGET_ARG,
           filter: { type: "string", description: "URL 关键词过滤" },
           method: { type: "string", description: "请求方法：GET/POST/PUT/DELETE 等" },
           status: { type: "string", description: "状态：success/error/failed/pending" },
@@ -704,6 +872,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
+          target: TARGET_ARG,
           requestId: { type: "string", description: "请求 ID（从 list_network_requests 获取）" },
           includeBody: { type: "boolean", description: "是否包含响应体，默认 false" },
         },
@@ -713,7 +882,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "clear_network_requests",
       description: "清空已捕获的网络请求记录",
-      inputSchema: { type: "object", properties: {} },
+      inputSchema: { type: "object", properties: { target: TARGET_ARG } },
     },
     {
       name: "perf_metrics",
@@ -722,6 +891,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
+          target: TARGET_ARG,
           includeTimings: {
             type: "boolean",
             description: "是否包含 Navigation Timing 和 Web Vitals，默认 true",
@@ -736,10 +906,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "capture_screenshot",
       description:
-        "截取当前页面截图，适合看页面实际视觉效果、UI 样式和布局。默认优先使用 JPEG；需要文字、细线或透明背景细节时改用 PNG。",
+        "截取目标标签页截图，适合看页面实际视觉效果、UI 样式和布局。默认优先使用 JPEG；需要文字、细线或透明背景细节时改用 PNG。",
       inputSchema: {
         type: "object",
         properties: {
+          target: TARGET_ARG,
           format: {
             type: "string",
             enum: ["png", "jpeg"],
@@ -769,10 +940,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_page_content",
       description:
-        "提取当前页面的文本、HTML 或结构化数据。比截图更轻量，适合先看文字、DOM 结构和页面元数据；不反映 CSS，也不含 iframe 内容。",
+        "提取目标标签页的文本、HTML 或结构化数据。比截图更轻量，适合先看文字、DOM 结构和页面元数据；不反映 CSS，也不含 iframe 内容。",
       inputSchema: {
         type: "object",
         properties: {
+          target: TARGET_ARG,
           mode: {
             type: "string",
             enum: ["text", "html", "structured"],
@@ -802,6 +974,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
+          target: TARGET_ARG,
           selector: {
             type: "string",
             description: "CSS 选择器，限定扫描范围。不指定则扫描整个页面",
@@ -824,6 +997,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
+          target: TARGET_ARG,
           ref: {
             type: "string",
             description: "目标元素的 ref 标识，如 'e1'、'e5'（从 get_interactive_snapshot 获取）",
@@ -865,8 +1039,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const args = request.params.arguments || {}
   try {
     if (name === "inspect_page") {
-      const { selector, includeInteractive = true, maxElements = 30 } = args
+      const { target, selector, includeInteractive = true, maxElements = 30 } = args
       const snapshot = await askChrome("inspectPageSnapshot", {
+        target,
         selector,
         includeInteractive,
         maxElements,
@@ -908,15 +1083,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (name === "get_server_info") {
-      let chromeOk, clientsCount
+      let chromeOk, clientsCount, mainStatus
 
       if (isMainInstance) {
         chromeOk = !!chromeConnection
         clientsCount = mcpClients.size
+        mainStatus = {
+          pid: process.pid,
+          version: GHOST_BRIDGE_VERSION,
+          serverPath: SERVER_ENTRY_PATH,
+          startedAt: SERVER_STARTED_AT,
+        }
       } else {
         // 非主实例：查询主实例的状态
         try {
-          const mainStatus = await askMainInstance("_getMainStatus")
+          mainStatus = await askMainInstance("_getMainStatus")
           chromeOk = mainStatus.chromeConnected
           clientsCount = mainStatus.mcpClientsCount
         } catch {
@@ -936,6 +1117,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               wsPort: actualPort,
               wsUrl: `ws://localhost:${actualPort}`,
               pid: process.pid,
+              serverPath: SERVER_ENTRY_PATH,
+              mainPid: mainStatus?.pid,
+              mainVersion: mainStatus?.version,
+              mainServerPath: mainStatus?.serverPath,
+              mainStartedAt: mainStatus?.startedAt,
               chromeConnected: chromeOk,
               mcpClientsCount: clientsCount,
               portInfoFile: PORT_INFO_FILE,
@@ -948,14 +1134,58 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
     }
 
+    if (name === "list_tabs") {
+      const res = await askChrome("listTabs")
+      return { content: [{ type: "text", text: jsonText(res) }] }
+    }
+
+    if (name === "bind_tab") {
+      const { name: targetName, tabId, urlContains, titleContains } = args
+      const res = await askChrome("bindTab", { name: targetName, tabId, urlContains, titleContains }, { timeoutMs: 10000 })
+      return { content: [{ type: "text", text: jsonText(res) }] }
+    }
+
+    if (name === "unbind_tab") {
+      const { name: targetName } = args
+      const res = await askChrome("unbindTab", { name: targetName }, { timeoutMs: 10000 })
+      return { content: [{ type: "text", text: jsonText(res) }] }
+    }
+
+    if (name === "list_targets") {
+      const res = await askChrome("listTargets")
+      return { content: [{ type: "text", text: jsonText(res) }] }
+    }
+
+    if (name === "get_target_tab") {
+      const res = await askChrome("getTargetTab")
+      return { content: [{ type: "text", text: jsonText(res) }] }
+    }
+
+    if (name === "pin_current_tab") {
+      const res = await askChrome("pinCurrentTab", {}, { timeoutMs: 10000 })
+      return { content: [{ type: "text", text: jsonText(res) }] }
+    }
+
+    if (name === "pin_tab") {
+      const { tabId, urlContains, titleContains } = args
+      const res = await askChrome("pinTab", { tabId, urlContains, titleContains }, { timeoutMs: 10000 })
+      return { content: [{ type: "text", text: jsonText(res) }] }
+    }
+
+    if (name === "unpin_tab") {
+      const res = await askChrome("unpinTab", {}, { timeoutMs: 10000 })
+      return { content: [{ type: "text", text: jsonText(res) }] }
+    }
+
     if (name === "get_last_error") {
-      const { severity = "error", limit = 20 } = args
-      const data = await askChrome("getLastError", { severity, limit })
+      const { target, severity = "error", limit = 20 } = args
+      const data = await askChrome("getLastError", { target, severity, limit })
       return { content: [{ type: "text", text: jsonText(data) }] }
     }
 
     if (name === "get_script_source") {
       const {
+        target,
         scriptUrlContains,
         line,
         column,
@@ -964,6 +1194,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       } = args
       const res = await askChrome("getScriptSource", {
         scriptUrlContains,
+        target,
         line,
         column,
       })
@@ -991,54 +1222,55 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (name === "coverage_snapshot") {
+      const { target } = args
       const durationMs = args.durationMs || 1500
-      const res = await askChrome("coverageSnapshot", { durationMs }, { timeoutMs: durationMs + 4000 })
+      const res = await askChrome("coverageSnapshot", { target, durationMs }, { timeoutMs: durationMs + 4000 })
       return { content: [{ type: "text", text: jsonText(res) }] }
     }
 
     if (name === "find_by_string") {
-      const { query, scriptUrlContains, maxMatches = 5 } = args
-      const res = await askChrome("findByString", { query, scriptUrlContains, maxMatches })
+      const { target, query, scriptUrlContains, maxMatches = 5 } = args
+      const res = await askChrome("findByString", { target, query, scriptUrlContains, maxMatches })
       return { content: [{ type: "text", text: jsonText(res) }] }
     }
 
     if (name === "symbolic_hints") {
-      const res = await askChrome("symbolicHints")
+      const res = await askChrome("symbolicHints", { target: args.target })
       return { content: [{ type: "text", text: jsonText(res) }] }
     }
 
     if (name === "eval_script") {
-      const res = await askChrome("eval", { code: args.code })
+      const res = await askChrome("eval", { target: args.target, code: args.code })
       return { content: [{ type: "text", text: jsonText(res) }] }
     }
 
     if (name === "list_network_requests") {
-      const { filter, method, status, resourceType, limit, priorityMode = "debug" } = args
-      const res = await askChrome("listNetworkRequests", { filter, method, status, resourceType, limit, priorityMode })
+      const { target, filter, method, status, resourceType, limit, priorityMode = "debug" } = args
+      const res = await askChrome("listNetworkRequests", { target, filter, method, status, resourceType, limit, priorityMode })
       return { content: [{ type: "text", text: jsonText(res) }] }
     }
 
     if (name === "get_network_detail") {
-      const { requestId, includeBody } = args
-      const res = await askChrome("getNetworkDetail", { requestId, includeBody })
+      const { target, requestId, includeBody } = args
+      const res = await askChrome("getNetworkDetail", { target, requestId, includeBody })
       return { content: [{ type: "text", text: jsonText(res) }] }
     }
 
     if (name === "clear_network_requests") {
-      const res = await askChrome("clearNetworkRequests")
+      const res = await askChrome("clearNetworkRequests", { target: args.target })
       return { content: [{ type: "text", text: jsonText(res) }] }
     }
 
     if (name === "perf_metrics") {
-      const { includeTimings, includeResources } = args
-      const res = await askChrome("perfMetrics", { includeTimings, includeResources })
+      const { target, includeTimings, includeResources } = args
+      const res = await askChrome("perfMetrics", { target, includeTimings, includeResources })
       return { content: [{ type: "text", text: jsonText(res) }] }
     }
 
     if (name === "capture_screenshot") {
-      const { format, quality, fullPage, clip } = args
+      const { target, format, quality, fullPage, clip } = args
       // 截图可能需要更长时间（特别是完整页面截图）
-      const res = await askChrome("captureScreenshot", { format, quality, fullPage, clip }, { timeoutMs: 15000 })
+      const res = await askChrome("captureScreenshot", { target, format, quality, fullPage, clip }, { timeoutMs: 15000 })
       
       // 返回图片内容（MCP 支持 image 类型）
       const contents = []
@@ -1070,7 +1302,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (name === "get_page_content") {
-      const { mode = "text", selector, maxLength = 50000, includeMetadata = true } = args
+      const { target, mode = "text", selector, maxLength = 50000, includeMetadata = true } = args
 
       const validModes = ["text", "html", "structured"]
       if (mode && !validModes.includes(mode)) {
@@ -1082,19 +1314,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
 
-      const res = await askChrome("getPageContent", { mode, selector, maxLength, includeMetadata })
+      const res = await askChrome("getPageContent", { target, mode, selector, maxLength, includeMetadata })
       return { content: [{ type: "text", text: jsonText(res) }] }
     }
 
     if (name === "get_interactive_snapshot") {
-      const { selector, includeText, maxElements } = args
-      const res = await askChrome("getInteractiveSnapshot", { selector, includeText, maxElements })
+      const { target, selector, includeText, maxElements } = args
+      const res = await askChrome("getInteractiveSnapshot", { target, selector, includeText, maxElements })
       return { content: [{ type: "text", text: jsonText(res) }] }
     }
 
     if (name === "dispatch_action") {
-      const { ref, action, value, key, deltaX, deltaY, waitMs } = args
-      const res = await askChrome("dispatchAction", { ref, action, value, key, deltaX, deltaY, waitMs }, { timeoutMs: 10000 })
+      const { target, ref, action, value, key, deltaX, deltaY, waitMs } = args
+      const res = await askChrome("dispatchAction", { target, ref, action, value, key, deltaX, deltaY, waitMs }, { timeoutMs: 10000 })
       return { content: [{ type: "text", text: jsonText(res) }] }
     }
 
@@ -1167,6 +1399,10 @@ function cleanup() {
     }
 
     // 关闭 WebSocket 服务器
+    if (wsPingInterval) {
+      clearInterval(wsPingInterval)
+      wsPingInterval = null
+    }
     if (wss) {
       wss.close(() => {
         log("🔌 WebSocket 服务器已关闭")

@@ -12,17 +12,82 @@ const CONFIG = {
   maxRequestBodySize: 500000, // 提升至 500KB，容纳较大的 API 请求
 }
 
-let attachedTabId = null
-let scriptMap = new Map()
-let scriptSourceCache = new Map()
-let lastErrors = []
-let lastErrorLocation = null
-let requestMap = new Map()
-let networkRequests = []
-let state = { enabled: false, connected: false, port: null, currentPort: null, connectionStatus: 'disconnected', connectionError: '' }
+let attachedTabId = null // Last touched attached tab, kept for popup/backward-compatible status.
+let focusedTabId = null
+const sessionsByTabId = new Map() // tabId -> per-tab debugger state
+
+// 每个服务器侧 MCP 连接（会话）独立的 target 命名空间：
+// pin 状态与 bind 的命名 target 互不可见，多 Agent / 同 Agent 多会话不会互相覆盖。
+// 服务器在每条命令上带 clientId；不带时（本地会话）落到 'local' 桶
+const clientSessions = new Map() // clientId -> { targetMode, pinnedTabId, namedTargets: Map }
+const DEFAULT_CLIENT_ID = 'local'
+
+function getClientSession(clientId) {
+  const key = clientId || DEFAULT_CLIENT_ID
+  let client = clientSessions.get(key)
+  if (!client) {
+    client = { targetMode: 'focused', pinnedTabId: null, namedTargets: new Map() }
+    clientSessions.set(key, client)
+  }
+  return client
+}
+
+async function cleanupClientSession(clientId) {
+  const client = clientSessions.get(clientId)
+  if (!client) return
+  clientSessions.delete(clientId)
+  // 释放仅被该会话 pin/bind 且无其他会话引用、也非当前跟随页的调试 session
+  const candidateTabIds = new Set([client.pinnedTabId, ...client.namedTargets.values()])
+  for (const tabId of candidateTabIds) {
+    if (tabId === null || tabId === undefined) continue
+    if (isTabReferenced(tabId)) continue
+    if (tabId === attachedTabId) continue
+    const session = getSession(tabId, { create: false })
+    if (session) {
+      await detachSession(session)
+      sessionsByTabId.delete(tabId)
+    }
+  }
+  log(`已清理会话 "${clientId}" 的 target 命名空间`)
+}
+
+let state = { enabled: false, connected: false, port: null, currentPort: null, connectionStatus: 'disconnected', connectionError: '', serverInfo: null }
 
 // 待处理的请求（等待 offscreen 响应）
 const pendingRequests = new Map()
+
+function createSession(tabId) {
+  return {
+    tabId,
+    attached: false,
+    scriptMap: new Map(),
+    scriptSourceCache: new Map(),
+    lastErrors: [],
+    lastErrorLocation: null,
+    requestMap: new Map(),
+    networkRequests: [],
+  }
+}
+
+function getSession(tabId, { create = true } = {}) {
+  if (tabId === undefined || tabId === null) return null
+  const numericTabId = Number(tabId)
+  if (!Number.isInteger(numericTabId)) return null
+  let session = sessionsByTabId.get(numericTabId)
+  if (!session && create) {
+    session = createSession(numericTabId)
+    sessionsByTabId.set(numericTabId, session)
+  }
+  return session
+}
+
+function resetDebuggerState(session) {
+  if (!session) return
+  session.scriptMap = new Map()
+  session.scriptSourceCache = new Map()
+  session.networkRequests = []
+  session.requestMap = new Map()
+}
 
 function setBadgeState(status) {
   const map = {
@@ -88,14 +153,77 @@ async function closeOffscreenDocument() {
   }
 }
 
+async function startBridgeConnection({ persist = false } = {}) {
+  state.enabled = true
+  state.connected = false
+  state.port = null
+  state.currentPort = CONFIG.basePort
+  state.connectionStatus = 'connecting'
+  state.connectionError = ''
+  state.serverInfo = null
+  setBadgeState('connecting')
+
+  if (persist) {
+    await chrome.storage.local.set({ bridgeEnabled: true, basePort: CONFIG.basePort })
+  }
+
+  await setupOffscreenDocument()
+  await chrome.runtime.sendMessage({
+    type: 'connect',
+    basePort: CONFIG.basePort,
+    token: CONFIG.token,
+  }).catch(() => {})
+  broadcastStatus()
+}
+
+async function stopBridgeConnection({ persist = false } = {}) {
+  state.enabled = false
+  state.connected = false
+  state.port = null
+  state.currentPort = null
+  state.connectionStatus = 'disconnected'
+  state.connectionError = ''
+  state.serverInfo = null
+  focusedTabId = null
+  clientSessions.clear()
+  setBadgeState('off')
+
+  if (persist) {
+    await chrome.storage.local.set({ bridgeEnabled: false })
+  }
+
+  await detachAllTargets().catch(() => {})
+  await chrome.runtime.sendMessage({ type: 'disconnect' }).catch(() => {})
+  await closeOffscreenDocument().catch(() => {})
+  broadcastStatus()
+}
+
+async function restoreBridgeConnection() {
+  try {
+    const result = await chrome.storage.local.get(['basePort', 'bridgeEnabled'])
+    if (result.basePort) {
+      CONFIG.basePort = result.basePort
+    }
+    if (result.bridgeEnabled) {
+      await startBridgeConnection()
+    } else {
+      setBadgeState('off')
+    }
+  } catch (e) {
+    log(`恢复连接状态失败：${e.message}`)
+    setBadgeState('off')
+  }
+}
+
 // ========== Chrome Debugger 事件处理 ==========
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
-  if (source.tabId !== attachedTabId) return
+  const session = getSession(source.tabId, { create: false })
+  if (!session) return
   if (!state.enabled) return
 
   if (method === "Debugger.scriptParsed") {
-    scriptMap.set(params.scriptId, { url: params.url || "(inline)" })
+    session.scriptMap.set(params.scriptId, { url: params.url || "(inline)" })
   }
 
   if (method === "Runtime.exceptionThrown") {
@@ -112,18 +240,18 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       stack: compactStack(detail.stackTrace),
       timestamp: Date.now(),
     }
-    lastErrorLocation = {
+    session.lastErrorLocation = {
       url: entry.url,
       line: entry.line,
       column: entry.column,
       scriptId: entry.scriptId,
     }
-    pushError(entry)
+    pushError(session, entry)
   }
 
   if (method === "Log.entryAdded") {
     const entry = params?.entry || {}
-    pushError({
+    pushError(session, {
       type: entry.level || "log",
       severity: entry.level === "warning" ? "warn" : entry.level === "error" ? "error" : "info",
       url: entry.source || entry.url,
@@ -136,7 +264,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
   if (method === "Runtime.consoleAPICalled") {
     const args = (params.args || []).map((a) => a.description || a.value).filter(Boolean)
-    pushError({
+    pushError(session, {
       type: params.type || "console",
       severity: params.type === "error" ? "error" : params.type === "warning" ? "warn" : "info",
       url: params.stackTrace?.callFrames?.[0]?.url,
@@ -151,6 +279,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   if (method === "Network.requestWillBeSent") {
     const req = params.request || {}
     const entry = {
+      tabId: source.tabId,
       requestId: params.requestId,
       url: req.url,
       method: req.method || "GET",
@@ -162,13 +291,13 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       timestamp: Date.now(),
       status: "pending",
     }
-    requestMap.set(params.requestId, entry)
-    trimPendingRequests()
+    session.requestMap.set(params.requestId, entry)
+    trimPendingRequests(session)
   }
 
   if (method === "Network.responseReceived") {
     const res = params.response || {}
-    const entry = requestMap.get(params.requestId)
+    const entry = session.requestMap.get(params.requestId)
     if (entry) {
       entry.status = res.status >= 400 ? "error" : "success"
       entry.statusCode = res.status
@@ -181,7 +310,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       entry.timing = res.timing
       entry.encodedDataLength = params.encodedDataLength
       if (res.status >= 400) {
-        pushError({
+        pushError(session, {
           type: "network",
           severity: "error",
           url: res.url || entry.url,
@@ -197,7 +326,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   }
 
   if (method === "Network.loadingFinished") {
-    const entry = requestMap.get(params.requestId)
+    const entry = session.requestMap.get(params.requestId)
     if (entry) {
       entry.endTime = params.timestamp
       entry.encodedDataLength = params.encodedDataLength
@@ -205,19 +334,19 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         ? Math.round((entry.endTime - entry.startTime) * 1000)
         : null
       if (entry.status === "pending") entry.status = "success"
-      pushNetworkRequest(entry)
-      requestMap.delete(params.requestId)
+      pushNetworkRequest(session, entry)
+      session.requestMap.delete(params.requestId)
     }
   }
 
   if (method === "Network.loadingFailed") {
-    const entry = requestMap.get(params.requestId)
+    const entry = session.requestMap.get(params.requestId)
     if (entry) {
       entry.status = "failed"
       entry.errorText = params.errorText
       entry.canceled = params.canceled
       entry.blockedReason = params.blockedReason
-      pushError({
+      pushError(session, {
         type: "network",
         severity: "error",
         url: entry.url,
@@ -226,32 +355,31 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         text: params.errorText,
         timestamp: Date.now(),
       })
-      pushNetworkRequest(entry)
-      requestMap.delete(params.requestId)
+      pushNetworkRequest(session, entry)
+      session.requestMap.delete(params.requestId)
     }
   }
 })
 
-function pushNetworkRequest(entry) {
-  networkRequests.unshift(entry)
-  trimNetworkRequests()
+function pushNetworkRequest(session, entry) {
+  session.networkRequests.unshift(entry)
+  trimNetworkRequests(session)
 }
 
-function trimNetworkRequests() {
-  GhostBridgeNetwork.trimTrackedRequests(networkRequests, CONFIG.maxRequestsTracked)
+function trimNetworkRequests(session) {
+  GhostBridgeNetwork.trimTrackedRequests(session.networkRequests, CONFIG.maxRequestsTracked)
 }
 
-function trimPendingRequests() {
-  GhostBridgeNetwork.trimPendingRequestMap(requestMap, CONFIG.maxRequestsTracked * 2)
+function trimPendingRequests(session) {
+  GhostBridgeNetwork.trimPendingRequestMap(session.requestMap, CONFIG.maxRequestsTracked * 2)
 }
 
 chrome.debugger.onDetach.addListener((source, reason) => {
-  if (source.tabId && source.tabId === attachedTabId) {
-    attachedTabId = null
-    scriptMap = new Map()
-    scriptSourceCache = new Map()
-    networkRequests = []
-    requestMap = new Map()
+  const session = getSession(source.tabId, { create: false })
+  if (source.tabId && session) {
+    session.attached = false
+    if (source.tabId === attachedTabId) attachedTabId = null
+    resetDebuggerState(session)
     
     if (!state.enabled) return
     if (reason === "canceled_by_user") {
@@ -271,15 +399,15 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   }
 })
 
-function pushError(entry) {
-  lastErrors.unshift(entry)
-  if (lastErrors.length > CONFIG.maxErrors) {
-    const dropIdx = lastErrors
+function pushError(session, entry) {
+  session.lastErrors.unshift(entry)
+  if (session.lastErrors.length > CONFIG.maxErrors) {
+    const dropIdx = session.lastErrors
       .map((e, i) => ({ sev: e.severity || "info", i }))
       .reverse()
       .find((e) => e.sev !== "error")?.i
-    if (dropIdx !== undefined) lastErrors.splice(dropIdx, 1)
-    else lastErrors.pop()
+    if (dropIdx !== undefined) session.lastErrors.splice(dropIdx, 1)
+    else session.lastErrors.pop()
   }
 }
 
@@ -295,27 +423,129 @@ function compactStack(stackTrace) {
 
 // ========== Debugger 操作 ==========
 
+function summarizeTab(tab) {
+  if (!tab) return null
+  return {
+    id: tab.id,
+    windowId: tab.windowId,
+    index: tab.index,
+    active: !!tab.active,
+    title: tab.title || '',
+    url: tab.url || '',
+  }
+}
+
+async function getFocusedTabOrThrow() {
+  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+  if (!tab || tab.id === undefined) throw new Error("没有激活的标签页")
+  return tab
+}
+
+async function getTabOrThrow(tabId) {
+  if (!Number.isInteger(tabId) || tabId < 0) throw new Error("需要提供有效的 tabId")
+  try {
+    const tab = await chrome.tabs.get(tabId)
+    if (!tab || tab.id === undefined) throw new Error("标签页不可用")
+    return tab
+  } catch (e) {
+    throw new Error(`标签页 ${tabId} 不可用：${e.message}`)
+  }
+}
+
+function normalizeTargetName(name, field = 'target') {
+  const value = String(name || '').trim()
+  if (!value) throw new Error(`需要提供 ${field}`)
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(value)) {
+    throw new Error(`${field} 只能包含字母、数字、下划线和连字符，长度 1-64`)
+  }
+  return value
+}
+
+function getNamesForTab(tabId) {
+  const names = []
+  for (const client of clientSessions.values()) {
+    for (const [name, boundTabId] of client.namedTargets.entries()) {
+      if (boundTabId === tabId) names.push(name)
+    }
+  }
+  return names
+}
+
+function isTabReferenced(tabId) {
+  for (const client of clientSessions.values()) {
+    if (client.pinnedTabId === tabId) return true
+    for (const boundTabId of client.namedTargets.values()) {
+      if (boundTabId === tabId) return true
+    }
+  }
+  return false
+}
+
+async function findTabByParams(params = {}) {
+  if (params.tabId !== undefined) {
+    return getTabOrThrow(Number(params.tabId))
+  }
+  const urlContains = String(params.urlContains || '')
+  const titleContains = String(params.titleContains || '')
+  if (!urlContains && !titleContains) {
+    throw new Error("需要提供 tabId、urlContains 或 titleContains")
+  }
+
+  const tabs = await chrome.tabs.query({})
+  const matches = tabs.filter((tab) => {
+    const urlOk = !urlContains || (tab.url || '').includes(urlContains)
+    const titleOk = !titleContains || (tab.title || '').includes(titleContains)
+    return tab.id !== undefined && urlOk && titleOk
+  })
+  if (matches.length === 0) throw new Error("没有找到匹配的标签页")
+
+  matches.sort((a, b) => Number(b.active) - Number(a.active) || (a.windowId - b.windowId) || (a.index - b.index))
+  return matches[0]
+}
+
+async function resolveTargetTab(params = {}) {
+  const client = getClientSession(params.clientId)
+  if (params.target !== undefined && params.target !== null && String(params.target).trim() !== '') {
+    const targetName = normalizeTargetName(params.target)
+    const tabId = client.namedTargets.get(targetName)
+    if (tabId === undefined) throw new Error(`未绑定 target "${targetName}"，请先调用 bind_tab`)
+    return getTabOrThrow(tabId)
+  }
+  if (params.tabId !== undefined) {
+    return getTabOrThrow(Number(params.tabId))
+  }
+  if (client.targetMode === 'pinned') {
+    if (client.pinnedTabId === null) throw new Error("锁定的标签页不可用，请重新 pin")
+    return getTabOrThrow(client.pinnedTabId)
+  }
+  return getFocusedTabOrThrow()
+}
+
 // attach 互斥锁：防止并发调用 ensureAttached 导致重复 attach / 状态竞态
 let _attachLock = Promise.resolve()
 
-async function ensureAttached() {
+async function ensureAttachedSession(params = {}) {
   let _release
   const _prev = _attachLock
   _attachLock = new Promise(r => _release = r)
   await _prev
   try {
     if (!state.enabled) throw new Error("扩展已暂停，点击图标开启后再试")
-    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
-    if (!tab) throw new Error("没有激活的标签页")
-    if (attachedTabId !== tab.id) {
-      if (attachedTabId) {
-        try { await chrome.debugger.detach({ tabId: attachedTabId }) } catch (e) {}
-      }
+    const tab = await resolveTargetTab(params)
+    const client = getClientSession(params.clientId)
+    const isFocusedDefaultTarget = !params.target && params.tabId === undefined && client.targetMode === 'focused'
+    if (isFocusedDefaultTarget && focusedTabId !== null && focusedTabId !== tab.id && !isTabReferenced(focusedTabId)) {
+      const previousFocusedSession = getSession(focusedTabId, { create: false })
+      await detachSession(previousFocusedSession)
+      sessionsByTabId.delete(focusedTabId)
+    }
+    const session = getSession(tab.id)
+    if (!session.attached) {
       try {
         await chrome.debugger.attach({ tabId: tab.id }, "1.3")
         setBadgeState("on")
       } catch (e) {
-        attachedTabId = null
+        if (attachedTabId === tab.id) attachedTabId = null
         if (state.connected) {
           setBadgeState("on")
         } else {
@@ -323,40 +553,57 @@ async function ensureAttached() {
         }
         throw e
       }
-      attachedTabId = tab.id
-      scriptMap = new Map()
-      scriptSourceCache = new Map()
-      networkRequests = []
-      requestMap = new Map()
-      await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Runtime.enable")
-      await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Log.enable")
-      await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Console.enable").catch(() => {})
-      await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Debugger.enable")
-      await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Profiler.enable")
-      await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Network.enable").catch(() => {})
+      session.attached = true
+      resetDebuggerState(session)
+      await chrome.debugger.sendCommand({ tabId: session.tabId }, "Runtime.enable")
+      await chrome.debugger.sendCommand({ tabId: session.tabId }, "Log.enable")
+      await chrome.debugger.sendCommand({ tabId: session.tabId }, "Console.enable").catch(() => {})
+      await chrome.debugger.sendCommand({ tabId: session.tabId }, "Debugger.enable")
+      await chrome.debugger.sendCommand({ tabId: session.tabId }, "Profiler.enable")
+      await chrome.debugger.sendCommand({ tabId: session.tabId }, "Network.enable").catch(() => {})
 
       // Enable auto-attach to sub-targets (iframes, workers) for comprehensive capture
-      await chrome.debugger.sendCommand({ tabId: attachedTabId }, "Target.setAutoAttach", {
+      await chrome.debugger.sendCommand({ tabId: session.tabId }, "Target.setAutoAttach", {
         autoAttach: true,
         waitForDebuggerOnStart: false,
         flatten: true,
       }).catch(() => {})
     }
-    return { tabId: attachedTabId }
+    attachedTabId = session.tabId
+    if (isFocusedDefaultTarget) focusedTabId = session.tabId
+    return { target: { tabId: session.tabId }, session, tab }
   } finally {
     _release()
   }
 }
 
+async function ensureAttached(params = {}) {
+  const attached = await ensureAttachedSession(params)
+  return attached.target
+}
+
+async function detachSession(session) {
+  if (!session) return
+  try {
+    if (session.attached) await chrome.debugger.detach({ tabId: session.tabId })
+  } catch (e) {
+    log(`detach 失败：${e.message}`)
+  } finally {
+    session.attached = false
+    if (attachedTabId === session.tabId) attachedTabId = null
+    resetDebuggerState(session)
+  }
+}
+
 async function maybeDetach(force = false) {
-  if ((CONFIG.autoDetach || force) && attachedTabId) {
-    try {
-      await chrome.debugger.detach({ tabId: attachedTabId })
-    } catch (e) {
-      log(`detach 失败：${e.message}`)
-    } finally {
-      attachedTabId = null
+  if (force) {
+    for (const session of sessionsByTabId.values()) {
+      await detachSession(session)
     }
+    return
+  }
+  if (CONFIG.autoDetach && attachedTabId !== null) {
+    await detachSession(getSession(attachedTabId, { create: false }))
   }
 }
 
@@ -382,15 +629,185 @@ async function detachAllTargets() {
     }
   } catch {}
   attachedTabId = null
+  focusedTabId = null
+  sessionsByTabId.clear()
 }
 
 // ========== 命令处理 ==========
 
+async function buildTargetInfo(clientId) {
+  const client = getClientSession(clientId)
+  const viewingTab = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+    .then(([tab]) => tab || null)
+    .catch(() => null)
+
+  let targetTab = null
+  let targetError = ''
+  const targetTabId = client.targetMode === 'pinned' ? client.pinnedTabId : (viewingTab?.id ?? attachedTabId)
+
+  if (targetTabId !== null && targetTabId !== undefined) {
+    try {
+      targetTab = await chrome.tabs.get(targetTabId)
+    } catch (e) {
+      targetError = e.message
+    }
+  } else if (client.targetMode === 'focused') {
+    targetTab = viewingTab
+  }
+
+  return {
+    clientId: clientId || DEFAULT_CLIENT_ID,
+    targetMode: client.targetMode,
+    pinnedTabId: client.pinnedTabId,
+    focusedTabId,
+    attachedTabId,
+    attachedTabIds: [...sessionsByTabId.values()].filter((session) => session.attached).map((session) => session.tabId),
+    targetTab: summarizeTab(targetTab),
+    viewingTab: summarizeTab(viewingTab),
+    targets: await summarizeNamedTargets(),
+    targetError,
+  }
+}
+
+function describeCommandTarget(params, session) {
+  if (params?.target) return String(params.target)
+  const names = getNamesForTab(session.tabId)
+  if (names.length) return names[0]
+  const client = getClientSession(params?.clientId)
+  if (client.targetMode === 'pinned' && client.pinnedTabId === session.tabId) return 'pinned'
+  return 'focused'
+}
+
+async function summarizeNamedTargets() {
+  const results = []
+  for (const [ownerId, client] of clientSessions.entries()) {
+    for (const [name, tabId] of client.namedTargets.entries()) {
+      const session = getSession(tabId, { create: false })
+      try {
+        const tab = await chrome.tabs.get(tabId)
+        results.push({
+          owner: ownerId,
+          name,
+          tabId,
+          tab: summarizeTab(tab),
+          attached: !!session?.attached,
+          errorCount: session?.lastErrors.filter((e) => e.severity === 'error').length || 0,
+          networkCount: (session?.networkRequests.length || 0) + (session?.requestMap.size || 0),
+        })
+      } catch (e) {
+        results.push({ owner: ownerId, name, tabId, attached: false, error: e.message })
+      }
+    }
+  }
+  return results
+}
+
+async function handleListTabs(params = {}) {
+  const tabs = await chrome.tabs.query({})
+  const targetInfo = await buildTargetInfo(params.clientId)
+  return {
+    ...targetInfo,
+    tabs: tabs
+      .filter((tab) => tab.id !== undefined)
+      .sort((a, b) => (a.windowId - b.windowId) || (a.index - b.index))
+      .map(summarizeTab),
+  }
+}
+
+async function handleListTargets(params = {}) {
+  return buildTargetInfo(params.clientId)
+}
+
+async function bindTarget(name, tab, clientId) {
+  const client = getClientSession(clientId)
+  const previousTabId = client.namedTargets.get(name)
+  client.namedTargets.set(name, tab.id)
+  try {
+    await ensureAttachedSession({ target: name, clientId })
+  } catch (e) {
+    if (previousTabId !== undefined) client.namedTargets.set(name, previousTabId)
+    else client.namedTargets.delete(name)
+    throw e
+  }
+  if (previousTabId !== undefined && previousTabId !== tab.id && !isTabReferenced(previousTabId)) {
+    const previousSession = getSession(previousTabId, { create: false })
+    await detachSession(previousSession)
+    sessionsByTabId.delete(previousTabId)
+  }
+  broadcastStatus()
+  return {
+    bound: { name, tabId: tab.id, tab: summarizeTab(tab) },
+    ...(await buildTargetInfo(clientId)),
+  }
+}
+
+async function handleBindTab(params = {}) {
+  const name = normalizeTargetName(params.name, 'name')
+  const tab = await findTabByParams(params)
+  return bindTarget(name, tab, params.clientId)
+}
+
+async function handleUnbindTab(params = {}) {
+  const client = getClientSession(params.clientId)
+  const name = normalizeTargetName(params.name || params.target, 'name')
+  const tabId = client.namedTargets.get(name)
+  if (tabId === undefined) throw new Error(`未绑定 target "${name}"`)
+  client.namedTargets.delete(name)
+
+  const session = getSession(tabId, { create: false })
+  if (session && !isTabReferenced(tabId)) {
+    await detachSession(session)
+    sessionsByTabId.delete(tabId)
+  }
+
+  broadcastStatus()
+  return {
+    unbound: { name, tabId },
+    ...(await buildTargetInfo(params.clientId)),
+  }
+}
+
+async function pinTab(tab, clientId) {
+  const client = getClientSession(clientId)
+  const previousMode = client.targetMode
+  const previousPinnedTabId = client.pinnedTabId
+  client.targetMode = 'pinned'
+  client.pinnedTabId = tab.id
+  try {
+    await ensureAttachedSession({ tabId: tab.id, clientId })
+  } catch (e) {
+    client.targetMode = previousMode
+    client.pinnedTabId = previousPinnedTabId
+    throw e
+  }
+  broadcastStatus()
+  return buildTargetInfo(clientId)
+}
+
+async function handlePinCurrentTab(params = {}) {
+  return pinTab(await getFocusedTabOrThrow(), params.clientId)
+}
+
+async function handlePinTab(params = {}) {
+  return pinTab(await findTabByParams(params), params.clientId)
+}
+
+async function handleUnpinTab(params = {}) {
+  const client = getClientSession(params.clientId)
+  client.targetMode = 'focused'
+  client.pinnedTabId = null
+  if (state.enabled && state.connected) {
+    await ensureAttached({ clientId: params.clientId })
+  }
+  broadcastStatus()
+  return buildTargetInfo(params.clientId)
+}
+
 async function handleGetLastError(params = {}) {
-  await ensureAttached()
+  const { session } = await ensureAttachedSession(params)
   const severity = params.severity || "error"
   const limit = Math.max(1, Math.min(params.limit || 20, CONFIG.maxErrors))
-  const allEvents = lastErrors.slice(0, CONFIG.maxErrors)
+  const allEvents = session.lastErrors.slice(0, CONFIG.maxErrors)
   const filteredEvents = severity === "all"
     ? allEvents
     : allEvents.filter((event) => (event.severity || "info") === severity)
@@ -404,7 +821,7 @@ async function handleGetLastError(params = {}) {
   )
   const events = filteredEvents.slice(0, limit)
   return {
-    lastErrorLocation,
+    lastErrorLocation: session.lastErrorLocation,
     summary: {
       count: events.length,
       cachedCount: allEvents.length,
@@ -418,17 +835,17 @@ async function handleGetLastError(params = {}) {
   }
 }
 
-async function pickScriptId(preferUrlContains) {
+async function pickScriptId(session, preferUrlContains) {
   if (preferUrlContains) {
-    for (const [id, meta] of scriptMap.entries()) {
+    for (const [id, meta] of session.scriptMap.entries()) {
       if (meta.url && meta.url.includes(preferUrlContains)) return { id, url: meta.url }
     }
   }
-  if (lastErrorLocation?.scriptId && scriptMap.has(lastErrorLocation.scriptId)) {
-    const meta = scriptMap.get(lastErrorLocation.scriptId)
-    return { id: lastErrorLocation.scriptId, url: meta.url }
+  if (session.lastErrorLocation?.scriptId && session.scriptMap.has(session.lastErrorLocation.scriptId)) {
+    const meta = session.scriptMap.get(session.lastErrorLocation.scriptId)
+    return { id: session.lastErrorLocation.scriptId, url: meta.url }
   }
-  const first = scriptMap.entries().next().value
+  const first = session.scriptMap.entries().next().value
   if (first) {
     return { id: first[0], url: first[1].url }
   }
@@ -436,15 +853,15 @@ async function pickScriptId(preferUrlContains) {
 }
 
 async function handleGetScriptSource(params = {}) {
-  const target = await ensureAttached()
-  const chosen = await pickScriptId(params.scriptUrlContains)
+  const { target, session } = await ensureAttachedSession(params)
+  const chosen = await pickScriptId(session, params.scriptUrlContains)
   const { scriptSource } = await chrome.debugger.sendCommand(target, "Debugger.getScriptSource", {
     scriptId: chosen.id,
   })
-  scriptSourceCache.set(chosen.id, scriptSource)
+  session.scriptSourceCache.set(chosen.id, scriptSource)
   const location = {
-    line: params.line ?? lastErrorLocation?.line ?? null,
-    column: params.column ?? lastErrorLocation?.column ?? null,
+    line: params.line ?? session.lastErrorLocation?.line ?? null,
+    column: params.column ?? session.lastErrorLocation?.column ?? null,
   }
   return {
     url: chosen.url,
@@ -456,7 +873,7 @@ async function handleGetScriptSource(params = {}) {
 }
 
 async function handleCoverageSnapshot(params = {}) {
-  const target = await ensureAttached()
+  const target = await ensureAttached(params)
   const durationMs = params.durationMs || 1500
   await chrome.debugger.sendCommand(target, "Profiler.startPreciseCoverage", {
     callCount: true,
@@ -492,20 +909,20 @@ function findContexts(source, query, maxMatches) {
 }
 
 async function handleFindByString(params = {}) {
-  const target = await ensureAttached()
+  const { target, session } = await ensureAttachedSession(params)
   const query = params.query
   const maxMatches = params.maxMatches || 5
   const preferred = params.scriptUrlContains
 
   const results = []
-  const entries = [...scriptMap.entries()]
+  const entries = [...session.scriptMap.entries()]
   for (const [id, meta] of entries) {
     if (preferred && (!meta.url || !meta.url.includes(preferred))) continue
-    if (!scriptSourceCache.has(id)) {
+    if (!session.scriptSourceCache.has(id)) {
       const { scriptSource } = await chrome.debugger.sendCommand(target, "Debugger.getScriptSource", { scriptId: id })
-      scriptSourceCache.set(id, scriptSource)
+      session.scriptSourceCache.set(id, scriptSource)
     }
-    const source = scriptSourceCache.get(id)
+    const source = session.scriptSourceCache.get(id)
     const matches = findContexts(source, query, maxMatches - results.length)
     if (matches.length) {
       results.push({ url: meta.url, scriptId: id, matches })
@@ -516,8 +933,8 @@ async function handleFindByString(params = {}) {
   return { query, results }
 }
 
-async function handleSymbolicHints() {
-  const target = await ensureAttached()
+async function handleSymbolicHints(params = {}) {
+  const target = await ensureAttached(params)
   const expression = `(function(){
     try {
       const resources = performance.getEntriesByType('resource').slice(-20).map(e => ({
@@ -540,7 +957,7 @@ async function handleSymbolicHints() {
 }
 
 async function handleEval(params = {}) {
-  const target = await ensureAttached()
+  const target = await ensureAttached(params)
   const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
     expression: params.code,
     returnByValue: true,
@@ -549,11 +966,11 @@ async function handleEval(params = {}) {
 }
 
 async function handleListNetworkRequests(params = {}) {
-  await ensureAttached()
+  const { session } = await ensureAttachedSession(params)
   const { filter, method, status, resourceType, limit = 50, priorityMode = 'debug' } = params
 
-  let results = [...networkRequests]
-  const pending = [...requestMap.values()].map(r => ({ ...r, status: "pending" }))
+  let results = [...session.networkRequests]
+  const pending = [...session.requestMap.values()].map(r => ({ ...r, status: "pending" }))
   results = [...pending, ...results]
 
   if (filter) {
@@ -571,7 +988,7 @@ async function handleListNetworkRequests(params = {}) {
   results = results.slice(0, limit)
 
   return {
-    total: networkRequests.length + requestMap.size,
+    total: session.networkRequests.length + session.requestMap.size,
     filtered: results.length,
     priorityMode,
     requests: results.map((entry) => GhostBridgeNetwork.buildNetworkRequestSummary(entry)),
@@ -579,12 +996,12 @@ async function handleListNetworkRequests(params = {}) {
 }
 
 async function handleGetNetworkDetail(params = {}) {
-  const target = await ensureAttached()
+  const { target, session } = await ensureAttachedSession(params)
   const { requestId, includeBody = false } = params
   if (!requestId) throw new Error("需要提供 requestId")
 
-  let entry = requestMap.get(requestId)
-  if (!entry) entry = networkRequests.find(r => r.requestId === requestId)
+  let entry = session.requestMap.get(requestId)
+  if (!entry) entry = session.networkRequests.find(r => r.requestId === requestId)
   if (!entry) throw new Error(`未找到请求: ${requestId}`)
 
   const urlMeta = GhostBridgeNetwork.summarizeNetworkUrl(entry.url)
@@ -627,15 +1044,15 @@ async function handleGetNetworkDetail(params = {}) {
   return result
 }
 
-async function handleClearNetworkRequests() {
-  await ensureAttached()
-  const count = networkRequests.length
-  networkRequests = []
+async function handleClearNetworkRequests(params = {}) {
+  const { session } = await ensureAttachedSession(params)
+  const count = session.networkRequests.length
+  session.networkRequests = []
   return { cleared: count }
 }
 
 async function handlePerfMetrics(params = {}) {
-  const target = await ensureAttached()
+  const target = await ensureAttached(params)
   const { includeResources = true, includeTimings = true } = params
 
   // 1. CDP Performance.getMetrics — 底层引擎指标
@@ -786,7 +1203,7 @@ function roundMs(seconds) {
 }
 
 async function handleCaptureScreenshot(params = {}) {
-  const target = await ensureAttached()
+  const target = await ensureAttached(params)
   const { format: requestedFormat, quality: requestedQuality, fullPage = false, clip } = params
   const format = requestedFormat || 'jpeg'
   const quality = format === 'jpeg'
@@ -866,7 +1283,7 @@ async function handleCaptureScreenshot(params = {}) {
 }
 
 async function handleInspectPageSnapshot(params = {}) {
-  const target = await ensureAttached()
+  const { target, session } = await ensureAttachedSession(params)
   const { selector, includeInteractive = true, maxElements = 30 } = params
   const expression = GhostBridgeDom.buildInspectPageExpression({ selector, includeInteractive, maxElements })
 
@@ -876,11 +1293,16 @@ async function handleInspectPageSnapshot(params = {}) {
   })
 
   if (result?.value?.error) throw new Error(result.value.error)
-  return result?.value
+  const value = result?.value
+  if (value) {
+    value.target = describeCommandTarget(params, session)
+    value.tabId = session.tabId
+  }
+  return value
 }
 
 async function handleGetPageContent(params = {}) {
-  const target = await ensureAttached()
+  const target = await ensureAttached(params)
   const { mode = "text", selector, maxLength = 50000, includeMetadata = true } = params
   const expression = GhostBridgeDom.buildPageContentExpression({ mode, selector, maxLength, includeMetadata })
 
@@ -896,7 +1318,7 @@ async function handleGetPageContent(params = {}) {
 // ========== DOM 交互：可交互元素快照 ==========
 
 async function handleGetInteractiveSnapshot(params = {}) {
-  const target = await ensureAttached()
+  const { target, session } = await ensureAttachedSession(params)
   const { selector, includeText = true, maxElements = 100 } = params
   const expression = GhostBridgeDom.buildInteractiveSnapshotExpression({ selector, includeText, maxElements })
 
@@ -906,13 +1328,22 @@ async function handleGetInteractiveSnapshot(params = {}) {
   })
 
   if (result?.value?.error) throw new Error(result.value.error)
-  return result?.value
+  const value = result?.value
+  if (value) {
+    value.target = describeCommandTarget(params, session)
+    value.tabId = session.tabId
+  }
+  return value
 }
 
 // ========== DOM 交互：动作分发器 ==========
 
 async function handleDispatchAction(params = {}) {
-  const target = await ensureAttached()
+  const anyNamedTargets = [...clientSessions.values()].some((client) => client.namedTargets.size > 0)
+  if (anyNamedTargets && !params.target && params.tabId === undefined) {
+    throw new Error("已绑定命名 target 时，dispatch_action 必须提供 target，避免跨页面误用 ref")
+  }
+  const target = await ensureAttached(params)
   const { ref, action, value, key, deltaX, deltaY, waitMs = 500 } = params
 
   if (!ref) throw new Error("需要提供 ref（元素标识，如 'e1'）")
@@ -1080,8 +1511,15 @@ async function handleDispatchAction(params = {}) {
 
 // 处理来自服务器的命令
 async function handleCommand(message) {
-  const { id, command, params, token } = message
+  const { id, command, token } = message
   if (!id || !command) return
+
+  // 内部命令：服务器通知某个 MCP 会话断开，清理其 target 命名空间（不要求扩展已启用）
+  if (command === "_clientDisconnected") {
+    cleanupClientSession(message.params?.clientId)
+    sendToServer({ id, result: { cleaned: true } })
+    return
+  }
   if (!state.enabled) {
     sendToServer({ id, error: "扩展已暂停，点击图标重新开启" })
     return
@@ -1090,17 +1528,28 @@ async function handleCommand(message) {
     sendToServer({ id, error: "token 校验失败" })
     return
   }
+  // 命令所属的 MCP 会话：pin/bind 的命名空间按它隔离
+  const clientId = message.clientId
+  const params = { ...(message.params || {}), clientId }
   try {
     let result
-    if (command === "getLastError") result = await handleGetLastError(params)
+    if (command === "listTabs") result = await handleListTabs(params)
+    else if (command === "getTargetTab") result = await buildTargetInfo(clientId)
+    else if (command === "listTargets") result = await handleListTargets(params)
+    else if (command === "bindTab") result = await handleBindTab(params)
+    else if (command === "unbindTab") result = await handleUnbindTab(params)
+    else if (command === "pinCurrentTab") result = await handlePinCurrentTab(params)
+    else if (command === "pinTab") result = await handlePinTab(params)
+    else if (command === "unpinTab") result = await handleUnpinTab(params)
+    else if (command === "getLastError") result = await handleGetLastError(params)
     else if (command === "getScriptSource") result = await handleGetScriptSource(params)
     else if (command === "coverageSnapshot") result = await handleCoverageSnapshot(params)
     else if (command === "findByString") result = await handleFindByString(params)
-    else if (command === "symbolicHints") result = await handleSymbolicHints()
+    else if (command === "symbolicHints") result = await handleSymbolicHints(params)
     else if (command === "eval") result = await handleEval(params)
     else if (command === "listNetworkRequests") result = await handleListNetworkRequests(params)
     else if (command === "getNetworkDetail") result = await handleGetNetworkDetail(params)
-    else if (command === "clearNetworkRequests") result = await handleClearNetworkRequests()
+    else if (command === "clearNetworkRequests") result = await handleClearNetworkRequests(params)
     else if (command === "perfMetrics") result = await handlePerfMetrics(params)
     else if (command === "captureScreenshot") result = await handleCaptureScreenshot(params)
     else if (command === "inspectPageSnapshot") result = await handleInspectPageSnapshot(params)
@@ -1124,8 +1573,7 @@ function sendToServer(data) {
 
 // ========== 状态广播 ==========
 
-// 主动推送状态给 popup
-function broadcastStatus() {
+function getConnectionStatus() {
   let status
   if (!state.enabled) {
     status = 'disconnected'
@@ -1134,43 +1582,53 @@ function broadcastStatus() {
   } else {
     status = state.connectionStatus || 'connecting'
   }
+  return status
+}
 
-  let tabUrl = ''
-  let tabTitle = ''
-  
-  if (attachedTabId) {
-    chrome.tabs.get(attachedTabId).then(t => {
-      tabUrl = t.url
-      tabTitle = t.title
-      doBroadcast()
-    }).catch(() => doBroadcast())
-  } else {
-    doBroadcast()
+async function buildPopupState() {
+  const status = getConnectionStatus()
+  const targetInfo = await buildTargetInfo()
+  const targetTab = targetInfo.targetTab
+  const viewingTab = targetInfo.viewingTab
+  return {
+    status,
+    enabled: state.enabled,
+    port: state.port,
+    currentPort: state.currentPort,
+    basePort: CONFIG.basePort,
+    connectionError: state.connectionError,
+    serverInfo: state.serverInfo,
+    targetMode: targetInfo.targetMode,
+    pinnedTabId: targetInfo.pinnedTabId,
+    focusedTabId: targetInfo.focusedTabId,
+    attachedTabId: targetInfo.attachedTabId,
+    attachedTabIds: targetInfo.attachedTabIds,
+    targets: targetInfo.targets,
+    targetTab,
+    viewingTab,
+    targetError: targetInfo.targetError,
+    tabTitle: targetTab?.title || '',
+    tabUrl: targetTab?.url || '',
+    viewingTitle: viewingTab?.title || '',
+    viewingUrl: viewingTab?.url || '',
   }
+}
 
-  function doBroadcast() {
-    const actualErrors = lastErrors.filter(e => e.severity === 'error')
+// 主动推送状态给 popup
+async function broadcastStatus() {
+  try {
     chrome.runtime.sendMessage({
       type: 'statusUpdate',
-      state: {
-        status,
-        enabled: state.enabled,
-        port: state.port,
-        currentPort: state.currentPort,
-        basePort: CONFIG.basePort,
-        connectionError: state.connectionError,
-        errorCount: actualErrors.length,
-        recentErrors: actualErrors.slice(0, 5),
-        tabTitle,
-        tabUrl,
-      }
+      state: await buildPopupState()
     }).catch(() => {}) // popup 可能未打开，忽略错误
+  } catch (e) {
+    log(`状态广播失败：${e.message}`)
   }
 }
 
 // 监听被调试页面的导航变化，实时推送到 popup
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (tabId === attachedTabId && (changeInfo.title || changeInfo.url)) {
+  if ((sessionsByTabId.has(tabId) || tab.active) && (changeInfo.title || changeInfo.url)) {
     if (state.connected) broadcastStatus()
   }
 })
@@ -1179,13 +1637,37 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
   if (state.enabled && state.connected) {
     try {
-      // 这里的 ensureAttached() 会自动处理从旧 Tab detach 并 attach 到新 Tab
-      await ensureAttached()
+      // focused 模式保持旧行为：切换 Tab 时自动跟随（focused 是共享语义，任一会话处于 focused 即跟随）
+      const anyFocused = clientSessions.size === 0
+        || [...clientSessions.values()].some((client) => client.targetMode === 'focused')
+      if (anyFocused) {
+        await ensureAttached()
+      }
       broadcastStatus()
     } catch (e) {
       log(`自动跟随切换 Tab 失败：${e.message}`)
     }
   }
+})
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  for (const client of clientSessions.values()) {
+    if (client.pinnedTabId === tabId) {
+      client.targetMode = 'focused'
+      client.pinnedTabId = null
+    }
+    for (const [name, boundTabId] of client.namedTargets.entries()) {
+      if (boundTabId === tabId) client.namedTargets.delete(name)
+    }
+  }
+  if (tabId === attachedTabId) {
+    attachedTabId = null
+  }
+  if (tabId === focusedTabId) {
+    focusedTabId = null
+  }
+  sessionsByTabId.delete(tabId)
+  if (state.connected) broadcastStatus()
 })
 
 
@@ -1210,29 +1692,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       state.currentPort = message.port
       state.connectionStatus = 'connected'
       state.connectionError = ''
+      state.serverInfo = message.serverInfo || null
       setBadgeState('on')
+      // 服务器可能已重启，clientId 分配从零开始，旧会话桶全部作废
+      clientSessions.clear()
       log(`✅ 已连接到 ghost-bridge 服务 (端口 ${message.port})`)
-      ensureAttached().catch((e) => log(`attach 失败：${e.message}`))
+      ensureAttached()
+        .then(() => broadcastStatus())
+        .catch((e) => log(`attach 失败：${e.message}`))
     } else if (message.status === 'disconnected') {
       state.connected = false
       state.port = null
       state.connectionStatus = 'connecting'
       state.connectionError = ''
+      state.serverInfo = null
       if (state.enabled) setBadgeState('connecting')
     } else if (message.status === 'connecting') {
       state.currentPort = message.currentPort
       state.connectionStatus = 'connecting'
       state.connectionError = ''
+      state.serverInfo = null
       setBadgeState('connecting')
     } else if (message.status === 'error') {
       state.currentPort = message.currentPort
       state.connectionStatus = 'error'
       state.connectionError = message.errorMessage || ''
+      state.serverInfo = null
       setBadgeState('err')
     } else if (message.status === 'not_found') {
       state.currentPort = message.currentPort
       state.connectionStatus = 'not_found'
-      state.connectionError = ''
+      state.connectionError = message.errorMessage || ''
+      state.serverInfo = null
       setBadgeState('connecting')
     }
     broadcastStatus() // 状态变化时主动推送
@@ -1258,44 +1749,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // 来自 popup 的状态查询
   if (message.type === 'getStatus') {
-    let status
-    if (!state.enabled) {
-      status = 'disconnected'
-    } else if (state.connected) {
-      status = 'connected'
-    } else {
-      status = state.connectionStatus || 'connecting'
-    }
+    buildPopupState().then(sendResponse).catch((e) => sendResponse({ status: 'error', connectionError: e.message }))
+    return true
+  }
 
-    let tabUrl = ''
-    let tabTitle = ''
-    if (attachedTabId) {
-      chrome.tabs.get(attachedTabId).then(t => {
-        tabUrl = t.url
-        tabTitle = t.title
-        sendStatusResponse()
-      }).catch(() => {
-        sendStatusResponse()
-      })
-    } else {
-      sendStatusResponse()
+  if (message.type === 'pinCurrentTab') {
+    if (!state.enabled || !state.connected) {
+      sendResponse({ ok: false, error: "Ghost Bridge 尚未连接" })
+      return true
     }
+    handlePinCurrentTab().then((result) => sendResponse({ ok: true, result })).catch((e) => sendResponse({ ok: false, error: e.message }))
+    return true
+  }
 
-    function sendStatusResponse() {
-      const actualErrors = lastErrors.filter(e => e.severity === 'error')
-      sendResponse({
-        status,
-        enabled: state.enabled,
-        port: state.port,
-        currentPort: state.currentPort,
-        basePort: CONFIG.basePort,
-        connectionError: state.connectionError,
-        errorCount: actualErrors.length,
-        recentErrors: actualErrors.slice(0, 5),
-        tabTitle,
-        tabUrl,
-      })
+  if (message.type === 'unpinTab') {
+    if (!state.enabled || !state.connected) {
+      sendResponse({ ok: false, error: "Ghost Bridge 尚未连接" })
+      return true
     }
+    handleUnpinTab().then((result) => sendResponse({ ok: true, result })).catch((e) => sendResponse({ ok: false, error: e.message }))
     return true
   }
 
@@ -1303,60 +1775,56 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'connect') {
     if (message.port) {
       CONFIG.basePort = message.port
-      chrome.storage.local.set({ basePort: message.port })
     }
-    state.enabled = true
-    state.connected = false
-    state.port = null
-    state.currentPort = CONFIG.basePort
-    state.connectionStatus = 'connecting'
-    state.connectionError = ''
-    setBadgeState('connecting')
 
-    // 启动 offscreen 并开始连接
-    setupOffscreenDocument().then(() => {
-      chrome.runtime.sendMessage({
-        type: 'connect',
-        basePort: CONFIG.basePort,
-        token: CONFIG.token,
-      }).catch(() => {})
-    })
-
-    sendResponse({ ok: true })
+    startBridgeConnection({ persist: true })
+      .then(() => sendResponse({ ok: true }))
+      .catch((e) => sendResponse({ ok: false, error: e.message }))
     return true
   }
 
   // 来自 popup 的断开请求
   if (message.type === 'disconnect') {
-    state.enabled = false
-    state.connected = false
-    state.port = null
-    state.currentPort = null
-    state.connectionStatus = 'disconnected'
-    state.connectionError = ''
-    setBadgeState('off')
-    detachAllTargets().catch(() => {})
-
-    // 通知 offscreen 断开 (WebSocket 清除)
-    chrome.runtime.sendMessage({ type: 'disconnect' }).catch(() => {})
-    
-    // 关键修复：显式销毁 offscreen document 防止内存泄漏
-    closeOffscreenDocument().catch(() => {})
-
-    sendResponse({ ok: true })
+    stopBridgeConnection({ persist: true })
+      .then(() => sendResponse({ ok: true }))
+      .catch((e) => sendResponse({ ok: false, error: e.message }))
     return true
   }
 
   return false
 })
 
-// 启动时从 storage 加载端口配置
-chrome.storage.local.get(['basePort'], (result) => {
-  if (result.basePort) {
-    CONFIG.basePort = result.basePort
+// ========== 唤醒探活钩子 ==========
+// 系统锁屏/睡眠唤醒后，WebSocket 可能处于半开状态（onclose 不触发、徽章仍显示已连接），
+// 通知 offscreen 立即发一次心跳：无响应则关闭死链并马上重连，不等 15 秒周期心跳超时
+chrome.idle.onStateChanged.addListener(async (idleState) => {
+  if (idleState !== 'active') return
+  if (!state.enabled) return
+  log('系统唤醒，触发连接探活...')
+  try {
+    await setupOffscreenDocument()
+    const alive = await chrome.runtime.sendMessage({ type: 'healthCheck' }).catch(() => null)
+    // alive === false 说明 offscreen 已自行触发重连，无需干预；
+    // 仅当 offscreen 完全无响应（可能被回收）时才走完整连接流程兜底
+    if (alive !== true && alive !== false) {
+      const status = await chrome.runtime.sendMessage({ type: 'getOffscreenStatus' }).catch(() => null)
+      if (!status || !status.connected) {
+        log('唤醒探活无响应，重新建立连接...')
+        await startBridgeConnection()
+      }
+    }
+  } catch (e) {
+    log(`唤醒探活失败：${e.message}`)
   }
 })
 
-// 默认暂停
-setBadgeState("off")
+chrome.runtime.onStartup.addListener(() => {
+  restoreBridgeConnection()
+})
+
+chrome.runtime.onInstalled.addListener(() => {
+  restoreBridgeConnection()
+})
+
+restoreBridgeConnection()
 log("Ghost Bridge background 已加载")

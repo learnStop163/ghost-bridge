@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Ghost Bridge",
-  "version": "0.7.1",
+  "version": "0.9.0",
   "description": "Zero-restart Chrome debugger bridge for Claude MCP, optimized for no-sourcemap production debugging.",
   "permissions": [
     "debugger",
@@ -9,7 +9,8 @@
     "scripting",
     "storage",
     "tabs",
-    "offscreen"
+    "offscreen",
+    "idle"
   ],
   "host_permissions": [
     "ws://localhost/*",
