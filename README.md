@@ -147,18 +147,26 @@ Read the next case from target cases, operate target app, then mark the case pas
 ```mermaid
 flowchart LR
     A["AI Client<br/>Claude / Codex / Cursor"]
-    B["Ghost Bridge MCP Server<br/>server.js"]
+    S["Session Process<br/>dist/server.js (stdio)"]
+    B["Ghost Bridge Daemon<br/>resident WebSocket service"]
     C["Chrome Extension<br/>background.js"]
     D["Browser Tabs<br/>Target Sessions"]
 
-    A <-->|"stdio"| B
-    B <-->|"WebSocket"| C
+    A <-->|"stdio"| S
+    S <-->|"WebSocket (mcp-client)"| B
+    C <-->|"WebSocket"| B
     C <-->|"CDP"| D
 ```
 
+The WebSocket service runs as a detached daemon, independent of any MCP session:
+
+- The first session process spawns the daemon automatically; it keeps running after that session exits
+- If the daemon crashes, any live session detects it and respawns it automatically
+- Stop it manually with `ghost-bridge stop` (close live MCP sessions first, otherwise they will bring it back on their next reconnect)
+
 ## Troubleshooting
 
-If the popup shows `No Bridge` / `Not Found`, it means the Chrome extension could not find a Ghost Bridge WebSocket service on the configured port. It does not necessarily mean your AI client is closed.
+If the popup shows `No Bridge` / `Not Found`, it means the Chrome extension could not find a Ghost Bridge WebSocket service on the configured port. With the resident daemon this normally only happens before the first MCP session of the day starts, or after `ghost-bridge stop`. Starting any MCP session (or reconnecting the extension) brings the service back within seconds.
 
 Run `ghost-bridge status` and check:
 

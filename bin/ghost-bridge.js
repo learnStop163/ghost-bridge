@@ -3,6 +3,7 @@ import { Command } from 'commander';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import chalk from 'chalk';
 
 // ESM fix for __dirname
@@ -84,12 +85,82 @@ program
   .command('status')
   .description('Check Ghost Bridge configuration status')
   .action(async () => {
-      try {
-        const { status } = await import('../lib/status.js');
-        await status();
-      } catch (error) {
-        console.error(chalk.red('Error checking status:'), error);
+    try {
+      const { status } = await import('../lib/status.js');
+      await status();
+    } catch (error) {
+      console.error(chalk.red('Error checking status:'), error);
+    }
+  });
+
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+}
+
+function readPortInfoFile() {
+  const portInfoFile =
+    process.env.GHOST_BRIDGE_PORT_INFO || path.join(os.tmpdir(), 'ghost-bridge-port.json');
+  if (!fs.existsSync(portInfoFile)) return null;
+  try {
+    const info = JSON.parse(fs.readFileSync(portInfoFile, 'utf-8'));
+    return info && info.pid ? { file: portInfoFile, ...info } : null;
+  } catch {
+    return null;
+  }
+}
+
+function removePortInfoFile(entry) {
+  try {
+    const current = JSON.parse(fs.readFileSync(entry.file, 'utf-8'));
+    if (current.pid === entry.pid) fs.unlinkSync(entry.file);
+  } catch {}
+}
+
+program
+  .command('stop')
+  .description('Stop the resident ghost-bridge daemon')
+  .action(async () => {
+    try {
+      const entry = readPortInfoFile();
+      if (!entry) {
+        console.log(chalk.yellow('未发现运行中的 ghost-bridge 常驻服务'));
+        return;
       }
+
+      if (!isProcessAlive(entry.pid)) {
+        removePortInfoFile(entry);
+        console.log(chalk.yellow(`端口信息已过期（PID ${entry.pid} 不存在），已清理`));
+        return;
+      }
+
+      console.log(chalk.blue(`正在停止 ghost-bridge 常驻服务 (PID: ${entry.pid})...`));
+      process.kill(entry.pid, 'SIGTERM');
+
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline && isProcessAlive(entry.pid)) {
+        await sleepMs(200);
+      }
+      if (isProcessAlive(entry.pid)) {
+        console.error(chalk.red('服务未能在预期时间内退出，请手动检查该进程'));
+        process.exit(1);
+      }
+
+      removePortInfoFile(entry);
+      console.log(chalk.green('✅ ghost-bridge 常驻服务已停止'));
+      console.log(
+        chalk.dim('注意：若仍有活跃的 MCP 会话，会话会在下次重连时自动重新拉起服务；如需彻底停止，请先关闭使用中的会话。')
+      );
+    } catch (error) {
+      console.error(chalk.red('Error stopping ghost-bridge:'), error);
+      process.exit(1);
+    }
   });
 
 program.parse();

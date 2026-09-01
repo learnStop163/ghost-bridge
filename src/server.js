@@ -8,6 +8,7 @@ import net from "net"
 import fs from "fs"
 import os from "os"
 import path from "path"
+import { spawn } from "child_process"
 import { fileURLToPath } from "url"
 import { GHOST_BRIDGE_VERSION } from "../lib/version.js"
 
@@ -15,18 +16,21 @@ const BASE_PORT = Number(process.env.GHOST_BRIDGE_PORT || 33333)
 const DEFAULT_WS_TOKEN = "ghost-bridge-local"
 const WS_TOKEN = process.env.GHOST_BRIDGE_TOKEN || DEFAULT_WS_TOKEN
 const RESPONSE_TIMEOUT = 8000
-const PORT_INFO_FILE = path.join(os.tmpdir(), "ghost-bridge-port.json")
+const PORT_INFO_FILE = process.env.GHOST_BRIDGE_PORT_INFO || path.join(os.tmpdir(), "ghost-bridge-port.json")
 const SERVER_STARTED_AT = new Date().toISOString()
 const SERVER_ENTRY_PATH = fileURLToPath(import.meta.url)
+// daemon 模式：常驻 WebSocket 服务进程（detached 启动，生命周期独立于任何 MCP 会话，
+// 只有 ghost-bridge stop 或系统重启才会让它退出）
+const IS_DAEMON = process.env.GHOST_BRIDGE_DAEMON === "1"
 
-let chromeConnection = null   // Chrome 扩展的连接
-let activeConnection = null   // 当前用于发送请求的连接（主实例用 chromeConnection，非主实例用到主实例的连接）
+let chromeConnection = null   // Chrome 扩展的连接（daemon 持有）
+let activeConnection = null   // 当前用于发送请求的连接（daemon 用 chromeConnection，会话进程用到 daemon 的连接）
 let actualPort = BASE_PORT
-let isMainInstance = false    // 是否是主实例（启动了 WebSocket 服务器）
+let isMainInstance = false    // 是否持有 WebSocket 服务器（仅 daemon 为 true）
 const pendingRequests = new Map()
-const mcpClients = new Set()  // 连接到主实例的其他 MCP 客户端
+const mcpClients = new Set()  // 连接到 daemon 的其他 MCP 会话进程
 let mcpClientSeq = 0          // MCP 客户端 clientId 序号（c1、c2…），进程生命周期内不复用
-const LOCAL_CLIENT_ID = "local" // 主实例本地（stdio）会话的 clientId
+const LOCAL_CLIENT_ID = "local" // daemon 本地请求的 clientId
 
 function log(msg) {
   console.error(`[ghost-bridge] ${msg}`)
@@ -207,25 +211,34 @@ function isPortAvailable(port) {
 }
 
 /**
- * 寻找可用端口并启动 WebSocket 服务器
+ * 启动 WebSocket 服务器（race-safe：监听成功 resolve，EADDRINUSE 等错误 reject）
+ * 并发拉起的多个 daemon 竞争同一端口时，输掉的一方通过 reject 走"已有服务"分支退出
  */
-async function startWebSocketServer() {
-  const available = await isPortAvailable(BASE_PORT)
-  if (!available) {
-    throw new Error(`固定端口 ${BASE_PORT} 不可用，请释放该端口或通过 GHOST_BRIDGE_PORT 指定其他端口`)
-  }
-
-  actualPort = BASE_PORT
-  const wss = new WebSocketServer({ port: BASE_PORT })
-  log(`🚀 WebSocket 服务已启动，端口 ${BASE_PORT}${WS_TOKEN ? "（启用 token 校验）" : ""}`)
-  return wss
+function startWebSocketServer(port) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const wss = new WebSocketServer({ port }, () => {
+      if (settled) return
+      settled = true
+      wss.removeListener("error", onError)
+      resolve(wss)
+    })
+    const onError = (err) => {
+      if (settled) return
+      settled = true
+      reject(err)
+    }
+    wss.on("error", onError)
+  })
 }
 
 /**
- * 初始化 WebSocket 服务（单例模式）
+ * daemon：获取固定端口（必要时接管旧服务）
+ * 返回 { wss } 表示绑定成功；返回 { alreadyRunning: true } 表示已有等价服务在跑（本进程应退出）；
+ * 端口被外部进程占用且无法接管时抛错
  */
-async function initWebSocketService() {
-  // 检查是否已有服务在运行
+async function acquirePortForDaemon() {
+  // 检查端口信息文件指向的服务
   const existing = getExistingService()
   if (existing) {
     log(`检测到现有服务 (PID: ${existing.pid}, 端口: ${existing.port})，验证中...`)
@@ -235,17 +248,15 @@ async function initWebSocketService() {
         const mismatch = getServiceMismatch(probe)
         if (!mismatch) {
           actualPort = existing.port
-          isMainInstance = false
-          log(`✅ 复用现有服务，端口 ${actualPort}`)
-          return null // 不启动新的 WebSocket 服务器
+          log(`✅ 已有常驻服务在运行，无需重复启动`)
+          return { alreadyRunning: true }
         }
         await stopExistingService(Number(probe.pid) || existing.pid, existing.port, mismatch)
       } else {
-        const oldPid = Number(probe.pid) || existing.pid
-        await stopExistingService(oldPid, existing.port, "token 不一致")
+        await stopExistingService(Number(probe.pid) || existing.pid, existing.port, "token 不一致")
       }
     } else {
-      log(`❌ 现有服务验证失败，启动新服务...`)
+      log(`❌ 现有服务验证失败，准备接管...`)
       try { fs.unlinkSync(PORT_INFO_FILE) } catch {}
     }
   }
@@ -257,9 +268,8 @@ async function initWebSocketService() {
         const mismatch = getServiceMismatch(probe)
         if (!mismatch) {
           actualPort = BASE_PORT
-          isMainInstance = false
-          log(`✅ 复用固定端口上的现有服务，端口 ${actualPort}`)
-          return null
+          log(`✅ 固定端口上已有常驻服务在运行，无需重复启动`)
+          return { alreadyRunning: true }
         }
         await stopExistingService(Number(probe.pid), BASE_PORT, mismatch)
       } else {
@@ -272,9 +282,41 @@ async function initWebSocketService() {
     }
   }
 
-  // 启动新的 WebSocket 服务器
-  const wss = await startWebSocketServer()
+  let wss
+  try {
+    wss = await startWebSocketServer(BASE_PORT)
+  } catch (err) {
+    // 绑定失败的典型原因是并发启动的 daemon 抢先绑定了端口：确认是等价服务就直接让位
+    const probe = await probeExistingService(BASE_PORT)
+    if (probe?.service === "ghost-bridge" && probe.token === WS_TOKEN && !getServiceMismatch(probe)) {
+      actualPort = BASE_PORT
+      log(`✅ 另一个常驻服务已抢先启动，本进程退出`)
+      return { alreadyRunning: true }
+    }
+    throw err
+  }
+
+  log(`🚀 WebSocket 服务已启动，端口 ${BASE_PORT}${WS_TOKEN ? "（启用 token 校验）" : ""}`)
+  actualPort = BASE_PORT
   isMainInstance = true
+  return { wss }
+}
+
+/**
+ * daemon 入口：获取端口并写入端口信息文件，返回 WebSocket 服务器实例；
+ * 已有等价服务或无法绑定时直接退出
+ */
+async function runDaemon() {
+  let acquired
+  try {
+    acquired = await acquirePortForDaemon()
+  } catch (e) {
+    log(`❌ daemon 启动失败：${e.message}`)
+    process.exit(1)
+  }
+  if (acquired.alreadyRunning) {
+    process.exit(0)
+  }
 
   // 写入端口信息
   fs.writeFileSync(
@@ -289,17 +331,67 @@ async function initWebSocketService() {
     }, null, 2)
   )
   log(`📝 端口信息已写入: ${PORT_INFO_FILE}`)
-
-  return wss
+  return acquired.wss
 }
 
-const wss = await initWebSocketService()
+/**
+ * 会话进程：确保常驻 daemon 在运行（没有就 detached 拉起一个），成功返回 true
+ * 探测失败/不匹配时也走拉起流程，由 daemon 内部完成对旧服务的接管
+ */
+async function ensureDaemonRunning() {
+  const existing = getExistingService()
+  if (existing) {
+    const probe = await probeExistingService(existing.port)
+    if (probe?.service === "ghost-bridge" && probe.token === WS_TOKEN && !getServiceMismatch(probe)) {
+      actualPort = Number(probe.port) || existing.port
+      return true
+    }
+  } else {
+    // 端口信息文件丢失但服务可能还在，直接探测固定端口
+    const probe = await probeExistingService(BASE_PORT)
+    if (probe?.service === "ghost-bridge" && probe.token === WS_TOKEN && !getServiceMismatch(probe)) {
+      actualPort = BASE_PORT
+      return true
+    }
+  }
+  return spawnDaemonAndWait()
+}
+
+/**
+ * 会话进程：detached 拉起 daemon 并等待其就绪
+ * daemon 与当前会话进程无父子依赖（unref + stdio ignore），
+ * 会话退出后 daemon 继续存活，避免 WebSocket 服务跟着会话陪葬
+ */
+async function spawnDaemonAndWait(timeoutMs = 15000) {
+  log("🛠 常驻服务未运行，正在启动 daemon...")
+  const child = spawn(process.execPath, [SERVER_ENTRY_PATH], {
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env, GHOST_BRIDGE_DAEMON: "1" },
+  })
+  child.unref()
+
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const probe = await probeExistingService(BASE_PORT)
+    if (probe?.service === "ghost-bridge" && probe.token === WS_TOKEN && !getServiceMismatch(probe)) {
+      actualPort = Number(probe.port) || BASE_PORT
+      log(`✅ daemon 已就绪 (PID: ${probe.pid}, 端口: ${actualPort})`)
+      return true
+    }
+    await sleep(250)
+  }
+  log(`❌ daemon 未能在 ${timeoutMs}ms 内就绪，稍后将重试`)
+  return false
+}
+
+const wss = IS_DAEMON ? await runDaemon() : null
 
 // 协议层心跳定时器：主动 ping 所有连接，超时未响应的视为死连接并踢除
 let wsPingInterval = null
 const WS_PING_INTERVAL_MS = 30000
 
-// 如果是主实例，设置 WebSocket 服务器的连接处理
+// daemon：设置 WebSocket 服务器的连接处理
 if (wss) {
   wss.on("connection", (ws, req) => {
     // 标记连接活性，配合下方 ping 定时器检测半开死连接（系统休眠唤醒后常见）
@@ -463,18 +555,22 @@ if (wss) {
     }
   }, WS_PING_INTERVAL_MS)
 } else {
-  // 非主实例：作为客户端连接到主实例
-  log(`📡 作为客户端连接到主实例 (端口 ${actualPort})...`)
+  // 会话进程：确保常驻 daemon 在运行（必要时拉起），然后作为客户端连接
+  const ready = await ensureDaemonRunning()
+  if (!ready) log("⚠️ 常驻服务暂时不可用，将保持后台重试并自动拉起")
+  log(`📡 作为客户端连接到常驻服务 (端口: ${actualPort})...`)
   connectToMainInstance()
 }
 
-const MAX_RECONNECT_ATTEMPTS = 10  // 最大重连次数
-const RECONNECT_INTERVAL = 3000    // 重连间隔 (ms)
-let reconnectAttempts = 0
-let wasEverConnected = false  // 是否曾经成功连接过
+const RECONNECT_INTERVAL = 3000   // 与常驻服务的重连间隔 (ms)
+const DAEMON_CHECK_EVERY = 5      // 连续失败每 N 次检查并尝试重新拉起 daemon
+let consecutiveFailures = 0
 
 /**
- * 连接到主实例的 WebSocket 服务器
+ * 会话进程：作为 MCP 客户端连接到常驻 daemon
+ * 连不上时不退出——保持重连，并周期性尝试重新拉起 daemon。
+ * 这样 daemon 意外挂掉后，任何一个存活会话都能让服务自动恢复
+ * （扩展端本来就在无限重试，会随即连上）
  */
 function connectToMainInstance() {
   const url = new URL(`ws://localhost:${actualPort}`)
@@ -484,9 +580,8 @@ function connectToMainInstance() {
   const ws = new WebSocket(url.toString())
 
   ws.on("open", () => {
-    log(`✅ 已连接到主实例 (端口 ${actualPort})`)
-    reconnectAttempts = 0  // 重置重连计数
-    wasEverConnected = true
+    log(`✅ 已连接到常驻服务 (端口: ${actualPort})`)
+    consecutiveFailures = 0
   })
 
   ws.on("message", (data) => {
@@ -504,35 +599,28 @@ function connectToMainInstance() {
   })
 
   ws.on("close", () => {
-    log("⚠️ 与主实例的连接已断开")
+    log("⚠️ 与常驻服务的连接已断开")
     activeConnection = null
-    failAllPending("与主实例的连接已断开")
+    failAllPending("与常驻服务的连接已断开")
 
-    // 尝试重连，但限制次数
-    reconnectAttempts++
-    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-      log(`❌ 重连失败次数过多 (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})，客户端进程退出`)
-      process.exit(0)
-    }
+    consecutiveFailures++
+    const attempt = consecutiveFailures
+    const needDaemonCheck = attempt % DAEMON_CHECK_EVERY === 0
 
-    setTimeout(() => {
-      if (!activeConnection) {
-        log(`🔄 尝试重新连接到主实例... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`)
-        connectToMainInstance()
+    setTimeout(async () => {
+      if (activeConnection) return
+      if (needDaemonCheck) {
+        log(`🔄 连续 ${attempt} 次未连上常驻服务，检查并尝试拉起...`)
+        await ensureDaemonRunning()
       }
+      if (activeConnection) return
+      log(`🔄 尝试重新连接到常驻服务 (第 ${attempt} 次)...`)
+      connectToMainInstance()
     }, RECONNECT_INTERVAL)
   })
 
   ws.on("error", (err) => {
-    log(`❌ 连接主实例失败: ${err.message}`)
-    // 如果从未成功连接过，增加重连计数
-    if (!wasEverConnected) {
-      reconnectAttempts++
-      if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-        log(`❌ 无法连接到主实例，客户端进程退出`)
-        process.exit(0)
-      }
-    }
+    log(`❌ 连接常驻服务失败: ${err.message}`)
   })
 }
 
@@ -574,7 +662,7 @@ function handleIncoming(data) {
  * 向主实例发送内部命令（仅非主实例使用）
  */
 async function askMainInstance(command, params = {}) {
-  if (!activeConnection) throw new Error("未连接到主实例")
+  if (!activeConnection) throw new Error("未连接到常驻服务")
   const id = crypto.randomUUID()
   const payload = { id, command, params }
 
@@ -597,7 +685,13 @@ async function askMainInstance(command, params = {}) {
 }
 
 async function askChrome(command, params = {}, options = {}) {
-  if (!activeConnection) throw new Error("Chrome 未连接，请确认浏览器开启且扩展已启用")
+  if (!activeConnection) {
+    throw new Error(
+      IS_DAEMON
+        ? "Chrome 未连接，请确认浏览器开启且扩展已启用"
+        : "ghost-bridge 常驻服务未连接，请稍后重试（可用 ghost-bridge status 检查）"
+    )
+  }
   const id = crypto.randomUUID()
   const payload = { id, command, params, clientId: LOCAL_CLIENT_ID }
   if (WS_TOKEN) payload.token = WS_TOKEN
@@ -1113,7 +1207,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             text: jsonText({
               service: "ghost-bridge",
               version: GHOST_BRIDGE_VERSION,
-              role: isMainInstance ? "主实例 (WebSocket Server)" : "客户端 (连接到主实例)",
+              role: isMainInstance ? "daemon (常驻 WebSocket 服务)" : "会话客户端 (连接常驻服务)",
               wsPort: actualPort,
               wsUrl: `ws://localhost:${actualPort}`,
               pid: process.pid,
@@ -1336,55 +1430,61 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 })
 
-const transport = new StdioServerTransport()
-await server.connect(transport)
+// stdio MCP 服务与孤儿检测只属于会话进程；
+// daemon 以 detached + stdio:'ignore' 运行，stdin 是 /dev/null（立即 EOF）、父进程随即退出，
+// 挂上这些检测会让 daemon 启动即自杀
+if (!IS_DAEMON) {
+  const transport = new StdioServerTransport()
+  await server.connect(transport)
 
-// 启动完成日志
-const roleText = isMainInstance ? "主实例" : "客户端"
-log(`✅ MCP server 已启动 | 角色: ${roleText} | 端口: ${actualPort} | PID: ${process.pid} | PPID: ${process.ppid}`)
-log(`📄 端口信息文件: ${PORT_INFO_FILE}`)
-log(`💡 使用 get_server_info 工具查看详细状态`)
+  log(`✅ MCP server 已启动 | 角色: 会话客户端 | 常驻服务端口: ${actualPort} | PID: ${process.pid} | PPID: ${process.ppid}`)
+  log(`💡 使用 get_server_info 工具查看详细状态`)
 
-// ========== 孤儿进程检测与自动退出 ==========
-const PARENT_CHECK_INTERVAL = 5000  // 每 5 秒检查一次父进程
-const parentPid = process.ppid
+  // ========== 会话进程孤儿检测与自动退出 ==========
+  const PARENT_CHECK_INTERVAL = 5000  // 每 5 秒检查一次父进程
+  const parentPid = process.ppid
 
-// 方法 1: 监听 stdin 关闭（父进程退出时 stdin 会关闭）
-process.stdin.on("end", () => {
-  log("⚠️ stdin 已关闭，父进程可能已退出，正在退出...")
-  cleanup()
-  process.exit(0)
-})
-
-process.stdin.on("close", () => {
-  log("⚠️ stdin 已关闭，正在退出...")
-  cleanup()
-  process.exit(0)
-})
-
-// 方法 2: 定期检查父进程是否还存活
-const parentCheckTimer = setInterval(() => {
-  try {
-    // process.kill(pid, 0) 不会杀死进程，只检查进程是否存在
-    process.kill(parentPid, 0)
-  } catch (e) {
-    // 父进程不存在了
-    log(`⚠️ 父进程 (PID: ${parentPid}) 已不存在，正在退出...`)
-    clearInterval(parentCheckTimer)
+  // 方法 1: 监听 stdin 关闭（父进程退出时 stdin 会关闭）
+  process.stdin.on("end", () => {
+    log("⚠️ stdin 已关闭，父进程可能已退出，正在退出...")
     cleanup()
     process.exit(0)
-  }
-}, PARENT_CHECK_INTERVAL)
+  })
 
-// 确保定时器不阻止进程退出
-parentCheckTimer.unref()
+  process.stdin.on("close", () => {
+    log("⚠️ stdin 已关闭，正在退出...")
+    cleanup()
+    process.exit(0)
+  })
+
+  // 方法 2: 定期检查父进程是否还存活
+  const parentCheckTimer = setInterval(() => {
+    try {
+      // process.kill(pid, 0) 不会杀死进程，只检查进程是否存在
+      process.kill(parentPid, 0)
+    } catch (e) {
+      // 父进程不存在了
+      log(`⚠️ 父进程 (PID: ${parentPid}) 已不存在，正在退出...`)
+      clearInterval(parentCheckTimer)
+      cleanup()
+      process.exit(0)
+    }
+  }, PARENT_CHECK_INTERVAL)
+
+  // 确保定时器不阻止进程退出
+  parentCheckTimer.unref()
+} else {
+  log(`✅ ghost-bridge daemon 已启动 | 端口: ${actualPort} | PID: ${process.pid}`)
+  log(`📄 端口信息文件: ${PORT_INFO_FILE}`)
+  log(`💡 停止服务: ghost-bridge stop`)
+}
 
 // ========== 进程退出清理 ==========
 function cleanup() {
   log("🧹 正在清理...")
 
-  // 主实例退出时删除端口信息文件
-  if (isMainInstance) {
+  // daemon 退出时删除端口信息文件
+  if (IS_DAEMON) {
     try {
       // 只有当文件中的 PID 是当前进程时才删除
       if (fs.existsSync(PORT_INFO_FILE)) {
@@ -1431,7 +1531,7 @@ process.on("SIGTERM", () => {
 
 process.on("exit", () => {
   // exit 事件中只能执行同步操作
-  if (isMainInstance) {
+  if (IS_DAEMON) {
     try {
       if (fs.existsSync(PORT_INFO_FILE)) {
         const info = JSON.parse(fs.readFileSync(PORT_INFO_FILE, "utf-8"))
