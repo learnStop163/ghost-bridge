@@ -32,8 +32,28 @@ const mcpClients = new Set()  // 连接到 daemon 的其他 MCP 会话进程
 let mcpClientSeq = 0          // MCP 客户端 clientId 序号（c1、c2…），进程生命周期内不复用
 const LOCAL_CLIENT_ID = "local" // daemon 本地请求的 clientId
 
+const DAEMON_LOG_FILE = path.join(os.homedir(), ".ghost-bridge", "daemon.log")
+
+function appendDaemonLog(line) {
+  try {
+    fs.mkdirSync(path.dirname(DAEMON_LOG_FILE), { recursive: true })
+    try {
+      const st = fs.statSync(DAEMON_LOG_FILE)
+      // 简单轮转：超 2MB 保留后半，避免无限增长
+      if (st.size > 2 * 1024 * 1024) {
+        const tail = fs.readFileSync(DAEMON_LOG_FILE).slice(-512 * 1024)
+        fs.writeFileSync(DAEMON_LOG_FILE, tail)
+      }
+    } catch {}
+    fs.appendFileSync(DAEMON_LOG_FILE, `${new Date().toISOString()} ${line}\n`)
+  } catch {}
+}
+
 function log(msg) {
-  console.error(`[ghost-bridge] ${msg}`)
+  const line = `[ghost-bridge] ${msg}`
+  console.error(line)
+  // daemon 以 detached + stdio ignore 运行，stderr 无人接收；日志落盘便于事后排查（如 daemon 静默退出）
+  if (IS_DAEMON) appendDaemonLog(line)
 }
 
 function buildIdentityPayload() {
@@ -719,9 +739,67 @@ function jsonText(data) {
   return typeof data === "string" ? data : JSON.stringify(data)
 }
 
+// 递归剔除 null / 空串 / 空数组 / 空对象字段——这类噪声在工具输出里占比不小且无信息量
+function compact(value) {
+  if (Array.isArray(value)) {
+    const cleaned = value.map(compact).filter((v) => v !== undefined)
+    return cleaned.length ? cleaned : undefined
+  }
+  if (value && typeof value === "object") {
+    const cleaned = {}
+    for (const [k, v] of Object.entries(value)) {
+      const c = compact(v)
+      if (c !== undefined) cleaned[k] = c
+    }
+    return Object.keys(cleaned).length ? cleaned : undefined
+  }
+  if (value === null || value === "") return undefined
+  return value
+}
+
+// 所有工具输出的统一出口：compact 后再序列化
+function out(data) {
+  return jsonText(compact(data))
+}
+
+// list_tabs 输出瘦身：URL 截断、去掉与 tabs[] 重复的 targetTab/viewingTab 对象、丢弃 windowId
+function shrinkListTabs(res, { fullUrl } = {}) {
+  if (!res || !Array.isArray(res.tabs)) return res
+  const trimTab = (t) => {
+    if (!t) return t
+    const item = { id: t.id, index: t.index, active: t.active, title: t.title, url: t.url }
+    if (!fullUrl && typeof item.url === "string" && item.url.length > 200) {
+      item.url = item.url.slice(0, 200) + "…"
+      item.urlTruncated = true
+    }
+    return item
+  }
+  const result = {
+    clientId: res.clientId,
+    targetMode: res.targetMode,
+    focusedTabId: res.focusedTabId,
+    pinnedTabId: res.pinnedTabId,
+    attachedTabIds: res.attachedTabIds,
+    targetTabId: res.targetTab?.id,
+    viewingTabId: res.viewingTab?.id,
+    targetError: res.targetError,
+    targets: (res.targets || []).map((tg) => ({
+      owner: tg.owner,
+      name: tg.name,
+      tabId: tg.tabId,
+      attached: tg.attached,
+      errorCount: tg.errorCount,
+      networkCount: tg.networkCount,
+    })),
+    tabs: res.tabs.map(trimTab),
+  }
+  if (!fullUrl) result.note = "URL 超 200 字符已截断，需要完整链接传 fullUrl:true；bind_tab 匹配仍基于真实 URL"
+  return result
+}
+
 const TARGET_ARG = {
   type: "string",
-  description: "命名浏览器目标，如 cases/app。先用 bind_tab 绑定；不指定则使用默认 focused/pinned 目标。绑定与 pin 均按会话隔离",
+  description: "命名目标（bind_tab 绑定；缺省用聚焦/锁定页，按会话隔离）",
 }
 
 function buildSnippet(source, line, column, { beautifyEnabled = true, contextLines = 20 } = {}) {
@@ -774,53 +852,65 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "inspect_page",
       description:
-        "页面分析入口。返回页面元数据、结构化摘要和可交互元素概览，适合先快速了解当前页面。",
+        "页面分析入口：返回元数据、结构计数与可交互元素数量（紧凑模式）。需要完整 page/interactive 数据传 detail:true。",
       inputSchema: {
         type: "object",
         properties: {
           target: TARGET_ARG,
           selector: {
             type: "string",
-            description: "CSS 选择器，限定分析范围。不指定则分析整个页面",
+            description: "CSS 选择器，限定分析范围",
           },
           includeInteractive: {
             type: "boolean",
-            description: "是否包含交互元素概览，默认 true",
+            description: "是否统计可交互元素，默认 true",
           },
           maxElements: {
             type: "number",
-            description: "交互元素概览的最大数量，默认 30",
+            description: "detail 模式下可交互元素上限，默认 30",
+          },
+          detail: {
+            type: "boolean",
+            description: "默认 false 只返回紧凑 summary；true 返回全量 page 与 interactive",
           },
         },
       },
     },
     {
       name: "get_server_info",
-      description: "获取 ghost-bridge 服务器状态，包括当前 WebSocket 端口、连接状态等",
+      description: "服务器状态：WebSocket 端口、Chrome 连接与会话数。",
       inputSchema: { type: "object", properties: {} },
     },
     {
       name: "list_tabs",
-      description: "列出当前 Chrome 标签页，并返回 Ghost Bridge 当前目标模式与目标标签页。",
-      inputSchema: { type: "object", properties: {} },
-    },
-    {
-      name: "bind_tab",
-      description: "按 tabId、URL 片段或标题片段把 Chrome 标签页绑定为命名 target，例如 cases 或 app。target 命名空间按 MCP 会话隔离：多个 Agent / 同一 Agent 的多个会话各自绑定的 target（含同名）互不干扰。",
+      description: "列出标签页与当前目标模式。URL 超长自动截断，fullUrl:true 输出完整。",
       inputSchema: {
         type: "object",
         properties: {
-          name: { type: "string", description: "target 名称，如 cases/app。只能包含字母、数字、下划线和连字符" },
-          tabId: { type: "number", description: "Chrome 标签页 ID，优先使用" },
-          urlContains: { type: "string", description: "URL 片段。未提供 tabId 时按它匹配" },
-          titleContains: { type: "string", description: "标题片段。可与 urlContains 同时使用" },
+          fullUrl: {
+            type: "boolean",
+            description: "默认 false（超 200 字符截断）；true 输出完整 URL",
+          },
+        },
+      },
+    },
+    {
+      name: "bind_tab",
+      description: "按 tabId/URL 片段/标题片段把标签页绑定为命名 target（如 cases、app）。命名空间按会话隔离。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "target 名称，如 cases/app（字母数字下划线连字符）" },
+          tabId: { type: "number", description: "标签页 ID，优先使用" },
+          urlContains: { type: "string", description: "URL 片段匹配" },
+          titleContains: { type: "string", description: "标题片段匹配" },
         },
         required: ["name"],
       },
     },
     {
       name: "unbind_tab",
-      description: "解绑一个命名 target。若该 tab 没有其他 target 引用，会释放对应 debugger session。",
+      description: "解绑命名 target；无其他引用时释放对应调试会话。",
       inputSchema: {
         type: "object",
         properties: {
@@ -831,40 +921,39 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "list_targets",
-      description: "查看当前已绑定的命名 targets，以及默认 focused/pinned 目标状态。",
+      description: "查看已绑定 targets 与默认目标状态。",
       inputSchema: { type: "object", properties: {} },
     },
     {
       name: "get_target_tab",
-      description: "查看 Ghost Bridge 当前操作目标。目标模式为 focused 时跟随当前聚焦标签页；pinned 时锁定指定标签页。",
+      description: "查看当前操作目标（focused 跟随聚焦页 / pinned 锁定）。",
       inputSchema: { type: "object", properties: {} },
     },
     {
       name: "pin_current_tab",
-      description: "锁定当前聚焦的 Chrome 标签页。锁定后用户切换到其他页面也不会改变 Ghost Bridge 的操作目标。",
+      description: "锁定当前聚焦标签页为操作目标，切换标签不影响。",
       inputSchema: { type: "object", properties: {} },
     },
     {
       name: "pin_tab",
-      description: "按 tabId、URL 片段或标题片段锁定 Chrome 标签页。pin 状态按 MCP 会话隔离：多个 Agent / 多个会话各自 pin 的页面互不覆盖。",
+      description: "按 tabId/URL/标题锁定标签页。pin 状态按会话隔离。",
       inputSchema: {
         type: "object",
         properties: {
-          tabId: { type: "number", description: "Chrome 标签页 ID，优先使用" },
-          urlContains: { type: "string", description: "URL 片段。未提供 tabId 时按它匹配" },
-          titleContains: { type: "string", description: "标题片段。可与 urlContains 同时使用" },
+          tabId: { type: "number", description: "标签页 ID，优先使用" },
+          urlContains: { type: "string", description: "URL 片段匹配" },
+          titleContains: { type: "string", description: "标题片段匹配" },
         },
       },
     },
     {
       name: "unpin_tab",
-      description: "解除锁定，恢复跟随当前聚焦标签页。",
+      description: "解除锁定，恢复跟随聚焦页。",
       inputSchema: { type: "object", properties: {} },
     },
     {
       name: "get_last_error",
-      description:
-        "获取目标标签页最近的控制台、异常和网络错误事件。默认只返回 error；如需查看 console.log / console.warn，请传 severity=info / warn / all。",
+      description: "最近控制台/异常/网络错误。severity 默认 error，可传 info/warn/all。",
       inputSchema: {
         type: "object",
         properties: {
@@ -876,15 +965,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           limit: {
             type: "number",
-            description: "返回条数限制，默认 20，最大 100",
+            description: "返回条数，默认 20，最大 100",
           },
         },
       },
     },
     {
       name: "get_script_source",
-      description:
-        "抓取目标标签页的脚本源码片段，支持按 URL 片段筛选和可选 beautify。",
+      description: "抓取脚本源码片段，支持 URL 筛选与 beautify。",
       inputSchema: {
         type: "object",
         properties: {
@@ -899,7 +987,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "coverage_snapshot",
-      description: "启动并采集一次执行覆盖率，返回最活跃的脚本/函数列表",
+      description: "采集一次执行覆盖率，列出最活跃的脚本/函数。",
       inputSchema: {
         type: "object",
         properties: {
@@ -910,8 +998,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "find_by_string",
-      description:
-        "在目标标签页脚本内按字符串搜索，返回匹配上下文。",
+      description: "在页面脚本内按字符串搜索，返回匹配上下文。",
       inputSchema: {
         type: "object",
         properties: {
@@ -925,13 +1012,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "symbolic_hints",
-      description:
-        "收集页面的资源、全局符号与 UA/URL 线索，帮助推断版本与模块归属",
+      description: "收集页面资源、全局符号与 UA/URL 线索，推断版本与模块归属。",
       inputSchema: { type: "object", properties: { target: TARGET_ARG } },
     },
     {
       name: "eval_script",
-      description: "在目标标签页执行只读 JS 表达式（谨慎使用）",
+      description: "在目标页执行只读 JS 表达式（谨慎使用）。",
       inputSchema: {
         type: "object",
         properties: { target: TARGET_ARG, code: { type: "string" } },
@@ -940,67 +1026,57 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "list_network_requests",
-      description:
-        "列出目标标签页捕获的网络请求，支持按 URL、方法、状态和类型过滤。默认按排障优先级排序；data URL 和超长 URL 会自动摘要化。",
+      description: "列出捕获的网络请求，支持 URL/方法/状态/类型过滤；超长 URL 自动摘要。",
       inputSchema: {
         type: "object",
         properties: {
           target: TARGET_ARG,
           filter: { type: "string", description: "URL 关键词过滤" },
-          method: { type: "string", description: "请求方法：GET/POST/PUT/DELETE 等" },
-          status: { type: "string", description: "状态：success/error/failed/pending" },
-          resourceType: { type: "string", description: "资源类型：XHR/Fetch/Script/Image 等" },
-          limit: { type: "number", description: "返回数量限制，默认 50" },
+          method: { type: "string" },
+          status: { type: "string", description: "success/error/failed/pending" },
+          resourceType: { type: "string" },
+          limit: { type: "number" },
           priorityMode: {
             type: "string",
             enum: ["debug", "api", "recent"],
-            description: "排序模式：debug=排障优先（默认），api=接口优先，recent=按时间倒序",
+            description: "排序：debug 排障优先（默认）/api 接口优先/recent 时间倒序",
           },
         },
       },
     },
     {
       name: "get_network_detail",
-      description:
-        "获取单个网络请求详情，包括请求头、响应头和可选响应体；超长 URL 会自动摘要化。",
+      description: "单个请求详情：请求/响应头与可选响应体；超长 URL 自动摘要。",
       inputSchema: {
         type: "object",
         properties: {
           target: TARGET_ARG,
-          requestId: { type: "string", description: "请求 ID（从 list_network_requests 获取）" },
-          includeBody: { type: "boolean", description: "是否包含响应体，默认 false" },
+          requestId: { type: "string", description: "来自 list_network_requests" },
+          includeBody: { type: "boolean", description: "默认 false" },
         },
         required: ["requestId"],
       },
     },
     {
       name: "clear_network_requests",
-      description: "清空已捕获的网络请求记录",
+      description: "清空网络请求捕获记录。",
       inputSchema: { type: "object", properties: { target: TARGET_ARG } },
     },
     {
       name: "perf_metrics",
-      description:
-        "获取页面性能指标，包括引擎级指标、Web Vitals 和资源加载摘要。",
+      description: "性能指标：引擎指标、Web Vitals、资源加载摘要。",
       inputSchema: {
         type: "object",
         properties: {
           target: TARGET_ARG,
-          includeTimings: {
-            type: "boolean",
-            description: "是否包含 Navigation Timing 和 Web Vitals，默认 true",
-          },
-          includeResources: {
-            type: "boolean",
-            description: "是否包含资源加载摘要（按类型统计、最慢资源），默认 true",
-          },
+          includeTimings: { type: "boolean", description: "默认 true" },
+          includeResources: { type: "boolean", description: "默认 true" },
         },
       },
     },
     {
       name: "capture_screenshot",
-      description:
-        "截取目标标签页截图，适合看页面实际视觉效果、UI 样式和布局。默认优先使用 JPEG；需要文字、细线或透明背景细节时改用 PNG。",
+      description: "截取目标标签页截图。默认 JPEG(80)；文字/细线/透明背景细节用 png；整页用 fullPage。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1008,33 +1084,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           format: {
             type: "string",
             enum: ["png", "jpeg"],
-            description: "图片格式。默认使用 jpeg；需要高保真文字、细线、透明背景时用 png"
+            description: "默认 jpeg；高保真文字用 png"
           },
           quality: {
             type: "number",
-            description: "JPEG 质量 (0-100)，仅当 format 为 jpeg 时有效。默认普通截图 80，完整长截图 70"
+            description: "JPEG 质量 0-100，默认 80（长截图 70）"
           },
           fullPage: {
             type: "boolean",
-            description: "是否截取完整页面长截图（包括滚动区域），默认 false 只截取可见区域。用于查看整个页面内容时设为 true"
+            description: "整页长截图（含滚动区域），默认 false"
           },
           clip: {
             type: "object",
-            description: "指定截取区域（像素）",
-            properties: {
-              x: { type: "number", description: "左上角 X 坐标" },
-              y: { type: "number", description: "左上角 Y 坐标" },
-              width: { type: "number", description: "宽度" },
-              height: { type: "number", description: "高度" },
-            },
+            description: "截取区域 {x,y,width,height}（像素）",
           },
         },
       },
     },
     {
       name: "get_page_content",
-      description:
-        "提取目标标签页的文本、HTML 或结构化数据。比截图更轻量，适合先看文字、DOM 结构和页面元数据；不反映 CSS，也不含 iframe 内容。",
+      description: "提取页面文本/HTML/结构化数据，比截图轻量。默认上限 8000 字符；不够时调大 maxLength 或用 offset 翻页、selector 收窄。不反映 CSS，不含 iframe。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1042,84 +1111,83 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           mode: {
             type: "string",
             enum: ["text", "html", "structured"],
-            description:
-              "提取模式：text=纯文本（默认，最快）; html=HTML片段; structured=结构化数据（标题/链接/按钮/表单/图片）",
+            description: "text 纯文本（默认）/html 片段/structured 结构化数据",
           },
           selector: {
             type: "string",
-            description:
-              "CSS 选择器，限定提取范围。如 'main'、'#content'、'.article'。不指定则提取整个 body",
+            description: "CSS 选择器限定范围，如 'main'、'#content'",
           },
           maxLength: {
             type: "number",
-            description: "最大返回长度（字符数），默认 50000。仅对 text/html 模式有效",
+            description: "本次返回上限（字符），默认 8000；text/html 有效",
+          },
+          offset: {
+            type: "number",
+            description: "从第 N 字符开始取（text/html 分页翻页用）",
           },
           includeMetadata: {
             type: "boolean",
-            description: "是否包含页面元数据（title/url/description），默认 true",
+            description: "附带 title/url/description，默认 true",
           },
         },
       },
     },
     {
       name: "get_interactive_snapshot",
-      description:
-        "扫描当前页面可见的可交互元素，返回带 ref 的精简列表，供后续 dispatch_action 使用。支持 Shadow DOM；仅用于交互定位。",
+      description: "扫描可见可交互元素，返回带 ref 的精简列表供 dispatch_action 使用（先快照后操作）。默认 30 个，需要更多传 maxElements 或用 selector 收窄。支持 Shadow DOM。",
       inputSchema: {
         type: "object",
         properties: {
           target: TARGET_ARG,
           selector: {
             type: "string",
-            description: "CSS 选择器，限定扫描范围。不指定则扫描整个页面",
+            description: "CSS 选择器限定扫描范围",
           },
           includeText: {
             type: "boolean",
-            description: "是否包含元素的文本/占位符等信息，默认 true",
+            description: "包含元素文本/占位符，默认 true",
           },
           maxElements: {
             type: "number",
-            description: "最大返回元素数量，默认 100",
+            description: "返回元素上限，默认 30",
           },
         },
       },
     },
     {
       name: "dispatch_action",
-      description:
-        "对 get_interactive_snapshot 返回的元素执行点击、输入、按键、滚动、选择、悬停或聚焦。⚠️ 使用前必须先调用 get_interactive_snapshot 获取 ref；操作后建议再验证页面状态。",
+      description: "对 get_interactive_snapshot 返回的 ref 执行操作：click/fill/press/scroll/select/hover/focus。⚠️ 必须先快照拿 ref；操作后建议复查页面状态。",
       inputSchema: {
         type: "object",
         properties: {
           target: TARGET_ARG,
           ref: {
             type: "string",
-            description: "目标元素的 ref 标识，如 'e1'、'e5'（从 get_interactive_snapshot 获取）",
+            description: "元素 ref，如 'e1'（来自 get_interactive_snapshot）",
           },
           action: {
             type: "string",
             enum: ["click", "fill", "press", "scroll", "select", "hover", "focus"],
-            description: "要执行的动作类型",
           },
           value: {
             type: "string",
-            description: "fill 时为要输入的文本；select 时为要选择的 option value；press 时为按键名（可选）",
+            description: "fill 的文本 / select 的 option value",
           },
           key: {
             type: "string",
-            description: "press 动作的按键名，如 'Enter'、'Escape'、'Tab'、'Backspace'。默认 'Enter'",
+            description: "press 按键，默认 'Enter'",
           },
           deltaX: {
             type: "number",
-            description: "scroll 动作的水平滚动量（像素），默认 0",
+            description: "水平滚动量，默认 0",
           },
           deltaY: {
             type: "number",
-            description: "scroll 动作的垂直滚动量（像素），默认 300（正数向下，负数向上）",
+            description: "垂直滚动量，默认 300（正数向下）",
           },
           waitMs: {
             type: "number",
-            description: "操作后等待页面响应的时间（毫秒），默认 500，最大 3000",
+            description: "操作后等待 ms，默认 500，最大 3000",
           },
         },
         required: ["ref", "action"],
@@ -1133,7 +1201,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const args = request.params.arguments || {}
   try {
     if (name === "inspect_page") {
-      const { target, selector, includeInteractive = true, maxElements = 30 } = args
+      const { target, selector, includeInteractive = true, maxElements = 30, detail = false } = args
       const snapshot = await askChrome("inspectPageSnapshot", {
         target,
         selector,
@@ -1152,25 +1220,36 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ? interactive.length
           : undefined
 
+      const summary = {
+        title: page?.metadata?.title,
+        url: page?.metadata?.url,
+        description: page?.metadata?.description,
+        links,
+        buttons,
+        forms,
+        interactiveCount,
+      }
+
+      // 默认紧凑模式只返回 summary，省 token；detail:true 才附带全量 page 与 interactive
       return {
         content: [
           {
             type: "text",
-            text: jsonText({
-              summary: {
-                title: page?.metadata?.title,
-                url: page?.metadata?.url,
-                description: page?.metadata?.description,
-                links,
-                buttons,
-                forms,
-                interactiveCount,
-              },
-              page,
-              interactive,
-              nextStepHint:
-                "如果需要看视觉效果，继续用 capture_screenshot；如果需要点击或输入，继续用 dispatch_action；如果需要排查请求或性能，继续用 list_network_requests / perf_metrics。",
-            }),
+            text: out(
+              detail
+                ? {
+                    summary,
+                    page,
+                    interactive,
+                    nextStepHint:
+                      "视觉用 capture_screenshot；点击/输入用 get_interactive_snapshot + dispatch_action；请求/性能用 list_network_requests / perf_metrics。",
+                  }
+                : {
+                    summary,
+                    nextStepHint:
+                      "传 detail:true 查看完整 page/interactive；视觉用 capture_screenshot；交互先 get_interactive_snapshot 再 dispatch_action。",
+                  }
+            ),
           },
         ],
       }
@@ -1204,7 +1283,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: jsonText({
+            text: out({
               service: "ghost-bridge",
               version: GHOST_BRIDGE_VERSION,
               role: isMainInstance ? "daemon (常驻 WebSocket 服务)" : "会话客户端 (连接常驻服务)",
@@ -1230,51 +1309,51 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (name === "list_tabs") {
       const res = await askChrome("listTabs")
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(shrinkListTabs(res, args)) }] }
     }
 
     if (name === "bind_tab") {
       const { name: targetName, tabId, urlContains, titleContains } = args
       const res = await askChrome("bindTab", { name: targetName, tabId, urlContains, titleContains }, { timeoutMs: 10000 })
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     if (name === "unbind_tab") {
       const { name: targetName } = args
       const res = await askChrome("unbindTab", { name: targetName }, { timeoutMs: 10000 })
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     if (name === "list_targets") {
       const res = await askChrome("listTargets")
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     if (name === "get_target_tab") {
       const res = await askChrome("getTargetTab")
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     if (name === "pin_current_tab") {
       const res = await askChrome("pinCurrentTab", {}, { timeoutMs: 10000 })
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     if (name === "pin_tab") {
       const { tabId, urlContains, titleContains } = args
       const res = await askChrome("pinTab", { tabId, urlContains, titleContains }, { timeoutMs: 10000 })
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     if (name === "unpin_tab") {
       const res = await askChrome("unpinTab", {}, { timeoutMs: 10000 })
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     if (name === "get_last_error") {
       const { target, severity = "error", limit = 20 } = args
       const data = await askChrome("getLastError", { target, severity, limit })
-      return { content: [{ type: "text", text: jsonText(data) }] }
+      return { content: [{ type: "text", text: out(data) }] }
     }
 
     if (name === "get_script_source") {
@@ -1300,7 +1379,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: jsonText({
+            text: out({
               url: res?.url,
               scriptId: res?.scriptId,
               location: res?.location,
@@ -1319,46 +1398,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { target } = args
       const durationMs = args.durationMs || 1500
       const res = await askChrome("coverageSnapshot", { target, durationMs }, { timeoutMs: durationMs + 4000 })
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     if (name === "find_by_string") {
       const { target, query, scriptUrlContains, maxMatches = 5 } = args
       const res = await askChrome("findByString", { target, query, scriptUrlContains, maxMatches })
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     if (name === "symbolic_hints") {
       const res = await askChrome("symbolicHints", { target: args.target })
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     if (name === "eval_script") {
       const res = await askChrome("eval", { target: args.target, code: args.code })
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     if (name === "list_network_requests") {
       const { target, filter, method, status, resourceType, limit, priorityMode = "debug" } = args
       const res = await askChrome("listNetworkRequests", { target, filter, method, status, resourceType, limit, priorityMode })
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     if (name === "get_network_detail") {
       const { target, requestId, includeBody } = args
       const res = await askChrome("getNetworkDetail", { target, requestId, includeBody })
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     if (name === "clear_network_requests") {
       const res = await askChrome("clearNetworkRequests", { target: args.target })
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     if (name === "perf_metrics") {
       const { target, includeTimings, includeResources } = args
       const res = await askChrome("perfMetrics", { target, includeTimings, includeResources })
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     if (name === "capture_screenshot") {
@@ -1389,14 +1468,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       contents.push({
         type: "text",
-        text: jsonText(metadata),
+        text: out(metadata),
       })
       
       return { content: contents }
     }
 
     if (name === "get_page_content") {
-      const { target, mode = "text", selector, maxLength = 50000, includeMetadata = true } = args
+      const { target, mode = "text", selector, maxLength = 8000, offset = 0, includeMetadata = true } = args
 
       const validModes = ["text", "html", "structured"]
       if (mode && !validModes.includes(mode)) {
@@ -1408,20 +1487,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
 
+      // offset 分页（text）：直接在页面内精确切片。
+      // 不走 getPageContent 是因为扩展端对超长文本采用"保留首尾"策略，会破坏 offset 语义
+      if (offset > 0 && mode === "text") {
+        const selectorExpr = selector
+          ? `(document.querySelector(${JSON.stringify(selector)}) || document.body)`
+          : "document.body"
+        const code = `(function(){try{var text=(${selectorExpr}).innerText||"";var start=${offset};var end=${offset + maxLength};return {content:text.slice(start,end),offset:start,totalLength:text.length,hasMore:text.length>end};}catch(e){return {error:e.message}}})()`
+        const res = await askChrome("eval", { target, code })
+        return { content: [{ type: "text", text: out(res) }] }
+      }
+
+      // offset 分页（html）：扩展端 html 截断是前缀切片，多取 offset+maxLength 后服务端再切
+      if (offset > 0 && mode === "html") {
+        const res = await askChrome("getPageContent", { target, mode, selector, maxLength: offset + maxLength, includeMetadata: false })
+        if (typeof res?.content === "string") {
+          res.content = res.content.slice(offset, offset + maxLength)
+          res.offset = offset
+          res.hasMore = (res.contentLength || 0) > offset + maxLength
+        }
+        return { content: [{ type: "text", text: out(res) }] }
+      }
+
       const res = await askChrome("getPageContent", { target, mode, selector, maxLength, includeMetadata })
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     if (name === "get_interactive_snapshot") {
       const { target, selector, includeText, maxElements } = args
-      const res = await askChrome("getInteractiveSnapshot", { target, selector, includeText, maxElements })
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      const res = await askChrome("getInteractiveSnapshot", { target, selector, includeText, maxElements: maxElements ?? 30 })
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     if (name === "dispatch_action") {
       const { target, ref, action, value, key, deltaX, deltaY, waitMs } = args
       const res = await askChrome("dispatchAction", { target, ref, action, value, key, deltaX, deltaY, waitMs }, { timeoutMs: 10000 })
-      return { content: [{ type: "text", text: jsonText(res) }] }
+      return { content: [{ type: "text", text: out(res) }] }
     }
 
     return { content: [{ type: "text", text: `未知工具：${name}` }] }
