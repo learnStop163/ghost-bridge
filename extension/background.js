@@ -524,6 +524,23 @@ async function resolveTargetTab(params = {}) {
 // attach 互斥锁：防止并发调用 ensureAttached 导致重复 attach / 状态竞态
 let _attachLock = Promise.resolve()
 
+// Chrome 对冻结/丢弃/无响应标签页的 debugger 调用可能永不回调。
+// 锁内的每次 debugger 操作都必须带超时，否则一次挂起会让锁永不释放，
+// 所有会话的调试功能整体死锁（list_tabs 等非 debugger 命令不受影响）
+const DBG_ATTACH_TIMEOUT_MS = 10000
+const DBG_ENABLE_TIMEOUT_MS = 8000
+const DBG_DETACH_TIMEOUT_MS = 5000
+
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} 超时(${ms}ms)，标签页可能已被 Chrome 冻结或无响应`)), ms)
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v) },
+      (e) => { clearTimeout(timer); reject(e) }
+    )
+  })
+}
+
 async function ensureAttachedSession(params = {}) {
   let _release
   const _prev = _attachLock
@@ -542,32 +559,44 @@ async function ensureAttachedSession(params = {}) {
     const session = getSession(tab.id)
     if (!session.attached) {
       try {
-        await chrome.debugger.attach({ tabId: tab.id }, "1.3")
+        await withTimeout(chrome.debugger.attach({ tabId: tab.id }, "1.3"), DBG_ATTACH_TIMEOUT_MS, `attach 标签页 ${tab.id}`)
         setBadgeState("on")
       } catch (e) {
-        if (attachedTabId === tab.id) attachedTabId = null
-        if (state.connected) {
-          setBadgeState("on")
-        } else {
-          setBadgeState("att")
+        // 本扩展重复 attach 视为成功（幂等）：也覆盖超时放弃后迟到的 attach 成功等竞态；
+        // 其余错误（如 DevTools 正在调试该标签页）照常抛出
+        if (!/^already attached/i.test(String(e && e.message))) {
+          if (attachedTabId === tab.id) attachedTabId = null
+          if (state.connected) {
+            setBadgeState("on")
+          } else {
+            setBadgeState("att")
+          }
+          throw e
         }
-        throw e
       }
       session.attached = true
       resetDebuggerState(session)
-      await chrome.debugger.sendCommand({ tabId: session.tabId }, "Runtime.enable")
-      await chrome.debugger.sendCommand({ tabId: session.tabId }, "Log.enable")
-      await chrome.debugger.sendCommand({ tabId: session.tabId }, "Console.enable").catch(() => {})
-      await chrome.debugger.sendCommand({ tabId: session.tabId }, "Debugger.enable")
-      await chrome.debugger.sendCommand({ tabId: session.tabId }, "Profiler.enable")
-      await chrome.debugger.sendCommand({ tabId: session.tabId }, "Network.enable").catch(() => {})
+      try {
+        await withTimeout((async () => {
+          await chrome.debugger.sendCommand({ tabId: session.tabId }, "Runtime.enable")
+          await chrome.debugger.sendCommand({ tabId: session.tabId }, "Log.enable")
+          await chrome.debugger.sendCommand({ tabId: session.tabId }, "Console.enable").catch(() => {})
+          await chrome.debugger.sendCommand({ tabId: session.tabId }, "Debugger.enable")
+          await chrome.debugger.sendCommand({ tabId: session.tabId }, "Profiler.enable")
+          await chrome.debugger.sendCommand({ tabId: session.tabId }, "Network.enable").catch(() => {})
 
-      // Enable auto-attach to sub-targets (iframes, workers) for comprehensive capture
-      await chrome.debugger.sendCommand({ tabId: session.tabId }, "Target.setAutoAttach", {
-        autoAttach: true,
-        waitForDebuggerOnStart: false,
-        flatten: true,
-      }).catch(() => {})
+          // Enable auto-attach to sub-targets (iframes, workers) for comprehensive capture
+          await chrome.debugger.sendCommand({ tabId: session.tabId }, "Target.setAutoAttach", {
+            autoAttach: true,
+            waitForDebuggerOnStart: false,
+            flatten: true,
+          }).catch(() => {})
+        })(), DBG_ENABLE_TIMEOUT_MS, `初始化调试器会话 ${session.tabId}`)
+      } catch (e) {
+        // 初始化阶段挂起/失败：放弃该会话，避免后续命令打到半初始化的调试器上
+        await detachSession(session)
+        throw e
+      }
     }
     attachedTabId = session.tabId
     if (isFocusedDefaultTarget) focusedTabId = session.tabId
@@ -585,7 +614,9 @@ async function ensureAttached(params = {}) {
 async function detachSession(session) {
   if (!session) return
   try {
-    if (session.attached) await chrome.debugger.detach({ tabId: session.tabId })
+    if (session.attached) {
+      await withTimeout(chrome.debugger.detach({ tabId: session.tabId }), DBG_DETACH_TIMEOUT_MS, `detach 标签页 ${session.tabId}`)
+    }
   } catch (e) {
     log(`detach 失败：${e.message}`)
   } finally {
