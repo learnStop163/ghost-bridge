@@ -4,6 +4,8 @@ import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import net from 'net';
+import { spawn } from 'child_process';
 import chalk from 'chalk';
 
 // ESM fix for __dirname
@@ -50,33 +52,62 @@ program
     }
   });
 
+function waitForTcp(port, timeoutMs = 15000) {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + timeoutMs;
+    const tryOnce = () => {
+      const sock = net.connect(port, '127.0.0.1');
+      sock.once('connect', () => {
+        sock.destroy();
+        resolve(true);
+      });
+      sock.once('error', () => {
+        sock.destroy();
+        if (Date.now() > deadline) resolve(false);
+        else setTimeout(tryOnce, 300);
+      });
+    };
+    tryOnce();
+  });
+}
+
 program
   .command('start')
-  .description('Start the Ghost Bridge MCP server directly')
+  .description('Start the resident ghost-bridge daemon (idempotent)')
   .action(async () => {
     try {
-      // Import the server module (which should start automatically or export a starter)
-      // Since existing server.js starts on high level, we might need to adjust it or just import it.
-      // For now, let's assume importing it runs it, as per current server.js implementation.
-      console.log(chalk.blue('Starting Ghost Bridge Server...'));
-      
-      // Determine path to server.js (src/server.js after refactor, currently might be in root or src)
-      // We will handle the move to src/server.js in a later step, so for now we point to where it will be.
-      // Or we can dynamically find it.
-      const serverPath = path.join(__dirname, '../src/server.js');
-      if (fs.existsSync(serverPath)) {
-          await import(serverPath);
-      } else {
-           // Fallback for before refactor complete (if testing mid-way), though we plan to move it soon.
-           const rootServerPath = path.join(__dirname, '../server.js');
-           if (fs.existsSync(rootServerPath)) {
-               await import(rootServerPath);
-           } else {
-               throw new Error('Could not find server.js');
-           }
+      const { getServerPath } = await import('../lib/utils.js');
+      const serverPath = getServerPath();
+      if (!fs.existsSync(serverPath)) {
+        throw new Error(`未找到 server: ${serverPath}`);
       }
+
+      const entry = readPortInfoFile();
+      if (entry && isProcessAlive(entry.pid)) {
+        console.log(chalk.green(`常驻服务已在运行 (PID: ${entry.pid}, 端口: ${entry.port})`));
+        return;
+      }
+
+      console.log(chalk.blue(`正在启动常驻服务 (${serverPath})...`));
+      const child = spawn(process.execPath, [serverPath], {
+        detached: true,
+        stdio: 'ignore',
+        env: { ...process.env, GHOST_BRIDGE_DAEMON: '1' },
+      });
+      child.unref();
+
+      const port = Number(process.env.GHOST_BRIDGE_PORT || 33333);
+      const ok = await waitForTcp(port);
+      if (!ok) {
+        console.error(chalk.red(`服务未能在预期时间内在端口 ${port} 就绪，可查看 ~/.ghost-bridge/daemon.log`));
+        process.exit(1);
+      }
+
+      const fresh = readPortInfoFile();
+      console.log(chalk.green(`✅ ghost-bridge 常驻服务已启动 (PID: ${fresh?.pid ?? '-'}, 端口: ${port})`));
+      console.log(chalk.dim('日志: ~/.ghost-bridge/daemon.log | 停止: ghost-bridge stop'));
     } catch (error) {
-      console.error(chalk.red('Error starting server:'), error);
+      console.error(chalk.red('Error starting daemon:'), error);
       process.exit(1);
     }
   });
