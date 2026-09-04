@@ -1,4 +1,4 @@
-importScripts('bg-network.js', 'bg-dom.js')
+importScripts('bg-network.js', 'bg-dom.js', 'bg-control.js', 'bg-runtime.js')
 
 const DEFAULT_TOKEN = 'ghost-bridge-local'
 
@@ -66,6 +66,7 @@ function createSession(tabId) {
     lastErrorLocation: null,
     requestMap: new Map(),
     networkRequests: [],
+    lastNetworkActivityAt: Date.now(),
   }
 }
 
@@ -87,6 +88,7 @@ function resetDebuggerState(session) {
   session.scriptSourceCache = new Map()
   session.networkRequests = []
   session.requestMap = new Map()
+  session.lastNetworkActivityAt = Date.now()
 }
 
 function setBadgeState(status) {
@@ -277,6 +279,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
   // 网络事件处理
   if (method === "Network.requestWillBeSent") {
+    session.lastNetworkActivityAt = Date.now()
     const req = params.request || {}
     const entry = {
       tabId: source.tabId,
@@ -326,6 +329,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   }
 
   if (method === "Network.loadingFinished") {
+    session.lastNetworkActivityAt = Date.now()
     const entry = session.requestMap.get(params.requestId)
     if (entry) {
       entry.endTime = params.timestamp
@@ -340,6 +344,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   }
 
   if (method === "Network.loadingFailed") {
+    session.lastNetworkActivityAt = Date.now()
     const entry = session.requestMap.get(params.requestId)
     if (entry) {
       entry.status = "failed"
@@ -990,19 +995,16 @@ async function handleSymbolicHints(params = {}) {
 async function handleEval(params = {}) {
   const target = await ensureAttached(params)
   const timeoutMs = Math.min(30000, Math.max(100, Number(params.timeoutMs) || 10000))
-  const { result, exceptionDetails } = await withTimeout(
-    chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-      expression: params.code,
-      returnByValue: true,
-      awaitPromise: params.awaitPromise !== false,
-    }),
+  // Runtime.evaluate.timeout is enforced inside V8. The outer transport timeout is only
+  // a safety margin for an unresponsive tab and no longer leaves normal timed-out code running.
+  return GhostBridgeRuntime.evaluateScript({
+    sendCommand: chrome.debugger.sendCommand.bind(chrome.debugger),
+    target,
+    code: params.code,
+    awaitPromise: params.awaitPromise !== false,
     timeoutMs,
-    "eval_script"
-  )
-  if (exceptionDetails) {
-    throw new Error(exceptionDetails.exception?.description || exceptionDetails.text || "脚本执行失败")
-  }
-  return result?.value
+    withTimeout,
+  })
 }
 
 async function handlePageRequest(params = {}) {
@@ -1066,6 +1068,7 @@ async function handlePageRequest(params = {}) {
       expression,
       returnByValue: true,
       awaitPromise: true,
+      timeout: timeoutMs + 250,
     }),
     timeoutMs + 500,
     "page_request"
@@ -1414,8 +1417,16 @@ async function handleInspectPageSnapshot(params = {}) {
 
 async function handleGetPageContent(params = {}) {
   const target = await ensureAttached(params)
-  const { mode = "text", selector, maxLength = 50000, includeMetadata = true } = params
-  const expression = GhostBridgeDom.buildPageContentExpression({ mode, selector, maxLength, includeMetadata })
+  const { mode = "text", selector, maxLength = 50000, offset = 0, includeMetadata = true } = params
+  const safeMaxLength = Math.min(50000, Math.max(1, Number(maxLength) || 8000))
+  const safeOffset = Math.min(100000000, Math.max(0, Math.floor(Number(offset) || 0)))
+  const expression = GhostBridgeDom.buildPageContentExpression({
+    mode,
+    selector,
+    maxLength: safeMaxLength,
+    offset: safeOffset,
+    includeMetadata,
+  })
 
   const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
     expression,
@@ -1458,198 +1469,348 @@ async function handleDispatchAction(params = {}) {
   if (anyNamedTargets && !params.target && params.tabId === undefined) {
     throw new Error("已绑定命名 target 时，dispatch_action 必须提供 target，避免跨页面误用 ref")
   }
-  const target = await ensureAttached(params)
+  const { target, session } = await ensureAttachedSession(params)
   const isBatch = Array.isArray(params.actions)
   const actions = isBatch ? params.actions : [params]
   if (!actions.length || actions.length > 20) throw new Error("actions 数量必须在 1-20 之间")
+  actions.forEach(validateDispatchStep)
+  const timeoutMs = Math.min(60000, Math.max(1000, Number(params.timeoutMs) || 30000))
+  const deadline = Date.now() + timeoutMs
 
-  const results = []
-  for (let index = 0; index < actions.length; index++) {
-    try {
-      results.push(await executeDispatchAction(target, actions[index]))
-    } catch (e) {
-      if (!isBatch) throw e
-      results.push({ index, success: false, error: e.message })
-      if (params.stopOnError !== false) break
+  const batch = await GhostBridgeControl.runActionBatch(
+    actions,
+    async (step, index) => {
+      ensureBeforeDeadline(deadline)
+      return executeDispatchAction(target, session, step, index, deadline)
+    },
+    {
+      stopOnError: params.stopOnError !== false,
+      mapError: (error, index) => error.actionResult || { index, success: false, error: error.message },
     }
-  }
+  )
+  const results = batch.results
 
-  const pageAfter = await readPageState(target)
+  let pageAfter
+  try {
+    pageAfter = await readPageState(target)
+  } catch (error) {
+    pageAfter = { error: error.message }
+  }
   const response = isBatch
     ? {
         success: results.length === actions.length && results.every((item) => item.success),
         completed: results.filter((item) => item.success).length,
         total: actions.length,
+        stopped: batch.stopped,
+        timeoutMs,
         results,
         pageAfter,
       }
     : { ...results[0], pageAfter }
 
   if (params.snapshotAfter) {
-    response.snapshotAfter = await evaluateInteractiveSnapshot(target, {
-      selector: params.snapshotSelector,
-      includeText: true,
-      maxElements: Math.min(100, Math.max(1, Number(params.snapshotMaxElements) || 20)),
-    })
+    if (Date.now() < deadline) {
+      try {
+        response.snapshotAfter = await evaluateInteractiveSnapshot(target, {
+          selector: params.snapshotSelector,
+          includeText: true,
+          maxElements: Math.min(100, Math.max(1, Number(params.snapshotMaxElements) || 20)),
+        })
+      } catch (error) {
+        response.snapshotError = error.message
+      }
+    } else {
+      response.snapshotSkipped = "批处理已到整体截止时间"
+    }
   }
 
   return response
 }
 
-async function executeDispatchAction(target, step = {}) {
-  const { ref, selector, action, value, key, deltaX, deltaY, waitMs = 500 } = step
+function batchTimeoutError(message = "批处理已到整体截止时间") {
+  const error = new Error(message)
+  error.batchTimeout = true
+  return error
+}
 
-  if (!ref && !selector) throw new Error("需要提供 ref 或 selector")
+function ensureBeforeDeadline(deadline) {
+  if (Date.now() >= deadline) throw batchTimeoutError()
+}
+
+async function sleepBeforeDeadline(ms, deadline) {
+  if (ms <= 0) return
+  const remaining = deadline - Date.now()
+  if (remaining <= 0) throw batchTimeoutError()
+  await sleep(Math.min(ms, remaining))
+  if (ms >= remaining || Date.now() >= deadline) throw batchTimeoutError()
+}
+
+async function evaluateDomValue(target, expression, options = {}) {
+  const { result, exceptionDetails } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+    expression,
+    returnByValue: true,
+    ...options,
+  })
+  if (exceptionDetails) {
+    throw new Error(exceptionDetails.exception?.description || exceptionDetails.text || "页面脚本执行失败")
+  }
+  if (result?.value?.error) {
+    const error = new Error(result.value.error)
+    error.diagnostics = result.value
+    throw error
+  }
+  return result?.value
+}
+
+async function ensureLocatorRuntime(target) {
+  let lastError
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const installed = await evaluateDomValue(target, "window.__ghostLocatorRuntime?.version === 1")
+      if (!installed) {
+        await evaluateDomValue(target, GhostBridgeDom.buildInstallLocatorRuntimeExpression())
+      }
+      return
+    } catch (error) {
+      lastError = error
+      if (!isTransientPageError(error) || attempt === 1) throw error
+      await sleep(50)
+    }
+  }
+  throw lastError
+}
+
+function isTransientPageError(error) {
+  return /context|navigat|frame|target closed|cannot find/i.test(String(error?.message || error))
+}
+
+function validateLocator(locator) {
+  if (!locator || typeof locator !== 'object' || Array.isArray(locator)) throw new Error("locator 必须是对象")
+  const fields = ['css', 'testId', 'role', 'name', 'label', 'placeholder', 'text']
+  if (!fields.some((field) => locator[field] !== undefined && locator[field] !== '')) {
+    throw new Error("locator 至少需要 css/testId/role/name/label/placeholder/text 之一")
+  }
+  if (locator.match && !['exact', 'contains'].includes(locator.match)) {
+    throw new Error("locator.match 仅支持 exact 或 contains")
+  }
+  if (locator.nth !== undefined && (!Number.isInteger(locator.nth) || locator.nth < 0)) {
+    throw new Error("locator.nth 必须是从 0 开始的整数")
+  }
+}
+
+function validateWaitFor(waitFor, fallbackLocator) {
+  if (!waitFor || typeof waitFor !== 'object') throw new Error("waitFor 必须是对象")
+  const type = waitFor.type
+  if (!['element', 'url', 'networkIdle', 'expression'].includes(type)) {
+    throw new Error("waitFor.type 仅支持 element/url/networkIdle/expression")
+  }
+  if (type === 'element') {
+    const state = waitFor.state || 'visible'
+    if (!['visible', 'hidden', 'attached', 'detached', 'enabled'].includes(state)) {
+      throw new Error("element waitFor.state 仅支持 visible/hidden/attached/detached/enabled")
+    }
+    if (!waitFor.locator && !fallbackLocator) {
+      throw new Error("element waitFor 需要 locator，或复用当前动作的 locator")
+    }
+    validateLocator(waitFor.locator || fallbackLocator)
+  } else if (type === 'url' && waitFor.equals === undefined && waitFor.contains === undefined) {
+    throw new Error("url waitFor 需要 equals 或 contains")
+  } else if (type === 'expression' && (!waitFor.expression || typeof waitFor.expression !== 'string')) {
+    throw new Error("expression waitFor 需要 expression 字符串")
+  }
+}
+
+async function waitForCondition(target, session, waitFor, fallbackLocator, deadline) {
+  validateWaitFor(waitFor, fallbackLocator)
+  const type = waitFor.type
+
+  const timeoutMs = Math.min(30000, Math.max(100, Number(waitFor.timeoutMs) || 10000))
+  const probe = async () => {
+    try {
+      if (type === 'element') {
+        const state = waitFor.state || 'visible'
+        const locator = waitFor.locator || fallbackLocator
+        await ensureLocatorRuntime(target)
+        const expression = GhostBridgeDom.buildLocatorProbeExpression({ locator, state })
+        return evaluateDomValue(target, expression)
+      } else if (type === 'url') {
+        const page = await readPageState(target)
+        const expected = waitFor.equals ?? waitFor.contains
+        const satisfied = waitFor.equals !== undefined
+          ? page?.url === String(expected)
+          : String(page?.url || '').includes(String(expected))
+        return { satisfied, url: page?.url, match: waitFor.equals !== undefined ? 'equals' : 'contains' }
+      } else if (type === 'networkIdle') {
+        const idleMs = Math.min(10000, Math.max(100, Number(waitFor.idleMs) || 500))
+        const pendingRequests = session.requestMap.size
+        const idleForMs = Date.now() - session.lastNetworkActivityAt
+        return { satisfied: pendingRequests === 0 && idleForMs >= idleMs, pendingRequests, idleForMs, idleMs }
+      } else {
+        const probeTimeout = Math.max(50, Math.min(1000, deadline - Date.now()))
+        const expression = `(async function(){return Boolean(await (${waitFor.expression}));})()`
+        const value = await evaluateDomValue(target, expression, { awaitPromise: true, timeout: probeTimeout })
+        return { satisfied: Boolean(value) }
+      }
+    } catch (error) {
+      if (isTransientPageError(error)) return { satisfied: false, transientError: error.message }
+      throw error
+    }
+  }
+
+  const status = await GhostBridgeControl.pollUntil({
+    probe,
+    timeoutMs,
+    overallDeadline: deadline,
+    intervalMs: 200,
+    sleep,
+  })
+  if (status.satisfied) {
+    return {
+      ...status,
+      type,
+      ...(type === 'element' ? { state: waitFor.state || 'visible' } : {}),
+    }
+  }
+
+  const error = status.reason === 'batchTimeout'
+    ? batchTimeoutError(`整体批处理在等待 ${type} 时超过截止时间`)
+    : new Error(`等待条件 ${type} 超时(${timeoutMs}ms)`)
+  error.waitStatus = { ...status, type }
+  throw error
+}
+
+function validateDispatchStep(step = {}) {
+  const { ref, selector, locator, action, value, key, deltaX, deltaY, waitMs = 0, waitFor } = step
+  if (!ref && !selector && !locator) throw new Error("需要提供 ref、selector 或 locator")
   if (ref && !/^e\d+$/.test(String(ref))) throw new Error(`无效的 ref: ${ref}`)
   if (!action) throw new Error("需要提供 action（动作类型：click/fill/press/scroll/select/hover/focus）")
-
-  const locator = ref ? `[data-ghost-ref="${ref}"]` : String(selector)
-  const locatorExpression = JSON.stringify(locator)
-  const locatorLabel = ref || selector
-
-  // Step 1: 实时获取目标元素的最新坐标和状态
-  const locateExpression = `(function() {
-    try {
-      const el = document.querySelector(${locatorExpression});
-      if (!el) return { error: '元素未找到：' + ${JSON.stringify(locatorLabel)} };
-      // 关键修复：确保元素在视口内，否则超出屏幕的坐标无法被 CDP 模拟点击
-      el.scrollIntoView({ block: 'center', inline: 'center' });
-      const rect = el.getBoundingClientRect();
-      if (rect.width === 0 && rect.height === 0) return { error: '元素不可见（宽高为 0）' };
-      return {
-        found: true,
-        tag: el.tagName.toLowerCase(),
-        type: el.type || '',
-        cx: Math.round(rect.left + rect.width / 2),
-        cy: Math.round(rect.top + rect.height / 2),
-        disabled: el.disabled || false,
-        value: (el.value || '').slice(0, 100),
-      };
-    } catch (e) { return { error: e.message }; }
-  })()`
-
-  const { result: locResult } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-    expression: locateExpression,
-    returnByValue: true,
-  })
-
-  const loc = locResult?.value
-  if (!loc || loc.error) throw new Error(loc?.error || "无法定位元素")
-  if (loc.disabled) throw new Error(`元素 ${locatorLabel} 已被禁用 (disabled)`)
-
-  const cx = loc.cx
-  const cy = loc.cy
-
-  let actionResult = { ...(ref ? { ref } : { selector }), action, success: true }
-
-  // Step 2: 根据动作类型执行 CDP 命令
-  if (action === "click") {
-    // 物理级 CDP 鼠标点击
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
-      type: "mousePressed", x: cx, y: cy, button: "left", clickCount: 1,
-    })
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
-      type: "mouseReleased", x: cx, y: cy, button: "left", clickCount: 1,
-    })
-    actionResult.detail = `已点击 ${locatorLabel} (${loc.tag}) 坐标 (${cx}, ${cy})`
-
-  } else if (action === "fill") {
-    if (value === undefined || value === null) throw new Error("fill 动作需要提供 value 参数")
-    // 先点击聚焦
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
-      type: "mousePressed", x: cx, y: cy, button: "left", clickCount: 1,
-    })
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
-      type: "mouseReleased", x: cx, y: cy, button: "left", clickCount: 1,
-    })
-    // 全选并清空已有内容
-    await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-      expression: `(function() {
-        const el = document.querySelector(${locatorExpression});
-        if (el) { el.focus(); el.select && el.select(); }
-      })()`,
-    })
-    // 用 CDP 模拟键盘输入
-    await chrome.debugger.sendCommand(target, "Input.insertText", {
-      text: String(value),
-    })
-    // 强制触发 input/change 事件（兼容 React/Vue）
-    await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-      expression: `(function() {
-        const el = document.querySelector(${locatorExpression});
-        if (el) {
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      })()`,
-    })
-    actionResult.detail = `已在 ${locatorLabel} (${loc.tag}) 中填入 "${String(value).slice(0, 50)}"`
-
-  } else if (action === "press") {
-    // 模拟键盘按键
-    const keyName = key || value || "Enter"
-    // 先确保元素聚焦
-    await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-      expression: `(function() {
-        const el = document.querySelector(${locatorExpression});
-        if (el) el.focus();
-      })()`,
-    })
-    await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
-      type: "keyDown", key: keyName,
-    })
-    await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
-      type: "keyUp", key: keyName,
-    })
-    actionResult.detail = `已在 ${locatorLabel} 上按下 ${keyName}`
-
-  } else if (action === "scroll") {
-    const dx = deltaX || 0
-    const dy = deltaY || 300
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
-      type: "mouseWheel", x: cx, y: cy, deltaX: dx, deltaY: dy,
-    })
-    actionResult.detail = `已在 ${locatorLabel} 位置滚动 (${dx}, ${dy})`
-
-  } else if (action === "select") {
-    // 下拉框选择
-    if (value === undefined) throw new Error("select 动作需要提供 value 参数")
-    await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-      expression: `(function() {
-        const el = document.querySelector(${locatorExpression});
-        if (el && el.tagName === 'SELECT') {
-          el.value = ${JSON.stringify(String(value))};
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      })()`,
-    })
-    actionResult.detail = `已在 ${locatorLabel} 选择值 "${value}"`
-
-  } else if (action === "hover") {
-    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
-      type: "mouseMoved", x: cx, y: cy,
-    })
-    actionResult.detail = `已将鼠标悬停到 ${locatorLabel} (${cx}, ${cy})`
-
-  } else if (action === "focus") {
-    await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-      expression: `(function() {
-        const el = document.querySelector(${locatorExpression});
-        if (el) el.focus();
-      })()`,
-    })
-    actionResult.detail = `已聚焦到 ${locatorLabel}`
-
-  } else {
+  if (!["click", "fill", "press", "scroll", "select", "hover", "focus"].includes(action)) {
     throw new Error(`不支持的动作类型: ${action}，可选: click/fill/press/scroll/select/hover/focus`)
   }
+  if (action === "fill" && (value === undefined || value === null)) throw new Error("fill 动作需要提供 value 参数")
+  if (action === "select" && value === undefined) throw new Error("select 动作需要提供 value 参数")
 
-  // Step 3: 等待页面响应
-  if (waitMs > 0) {
-    await sleep(Math.min(waitMs, 3000))
+  const semanticLocator = locator || { css: ref ? `[data-ghost-ref="${ref}"]` : String(selector) }
+  validateLocator(semanticLocator)
+  if (waitFor) validateWaitFor(waitFor, semanticLocator)
+  return semanticLocator
+}
+
+async function executeDispatchAction(target, session, step = {}, index, deadline) {
+  const { ref, selector, locator, action, value, key, deltaX, deltaY, waitMs = 0, waitFor } = step
+  const semanticLocator = validateDispatchStep(step)
+  const locatorLabel = ref || selector || JSON.stringify(locator)
+  const actionId = `a${Date.now()}_${index}_${Math.random().toString(36).slice(2, 8)}`
+  let actionResult = { index, ...(ref ? { ref } : selector ? { selector } : { locator }), action, success: false }
+  let actionCompleted = false
+
+  try {
+    ensureBeforeDeadline(deadline)
+    await ensureLocatorRuntime(target)
+    const locateExpression = GhostBridgeDom.buildLocateElementExpression({ locator, ref, selector, actionId })
+    const loc = await evaluateDomValue(target, locateExpression)
+    if (!loc?.found) throw new Error("无法定位元素")
+    if (loc.disabled) throw new Error(`元素 ${locatorLabel} 已被禁用 (disabled)`)
+
+    const cx = loc.cx
+    const cy = loc.cy
+    actionResult.matched = {
+      tag: loc.tag,
+      role: loc.role,
+      name: loc.name,
+      text: loc.text,
+      matchCount: loc.matchCount,
+    }
+
+    // Step 2: 根据动作类型执行 CDP 命令
+    if (action === "click") {
+      // 物理级 CDP 鼠标点击
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mousePressed", x: cx, y: cy, button: "left", clickCount: 1,
+      })
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mouseReleased", x: cx, y: cy, button: "left", clickCount: 1,
+      })
+      actionResult.detail = `已点击 ${locatorLabel} (${loc.tag}) 坐标 (${cx}, ${cy})`
+
+    } else if (action === "fill") {
+      // 先点击聚焦
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mousePressed", x: cx, y: cy, button: "left", clickCount: 1,
+      })
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mouseReleased", x: cx, y: cy, button: "left", clickCount: 1,
+      })
+      // 全选并清空已有内容
+      await evaluateDomValue(target, GhostBridgeDom.buildElementCommandExpression({ actionId, command: 'prepareFill' }))
+      // 用 CDP 模拟键盘输入
+      await chrome.debugger.sendCommand(target, "Input.insertText", {
+        text: String(value),
+      })
+      // 强制触发 input/change 事件（兼容 React/Vue）
+      await evaluateDomValue(target, GhostBridgeDom.buildElementCommandExpression({ actionId, command: 'dispatchInput' }))
+      actionResult.detail = `已在 ${locatorLabel} (${loc.tag}) 中填入 "${String(value).slice(0, 50)}"`
+
+    } else if (action === "press") {
+      // 模拟键盘按键
+      const keyName = key || value || "Enter"
+      // 先确保元素聚焦
+      await evaluateDomValue(target, GhostBridgeDom.buildElementCommandExpression({ actionId, command: 'focus' }))
+      await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
+        type: "keyDown", key: keyName,
+      })
+      await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
+        type: "keyUp", key: keyName,
+      })
+      actionResult.detail = `已在 ${locatorLabel} 上按下 ${keyName}`
+
+    } else if (action === "scroll") {
+      const dx = deltaX ?? 0
+      const dy = deltaY ?? 300
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mouseWheel", x: cx, y: cy, deltaX: dx, deltaY: dy,
+      })
+      actionResult.detail = `已在 ${locatorLabel} 位置滚动 (${dx}, ${dy})`
+
+    } else if (action === "select") {
+      // 下拉框选择
+      await evaluateDomValue(target, GhostBridgeDom.buildElementCommandExpression({ actionId, command: 'select', payload: { value: String(value) } }))
+      actionResult.detail = `已在 ${locatorLabel} 选择值 "${value}"`
+
+    } else if (action === "hover") {
+      await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+        type: "mouseMoved", x: cx, y: cy,
+      })
+      actionResult.detail = `已将鼠标悬停到 ${locatorLabel} (${cx}, ${cy})`
+
+    } else if (action === "focus") {
+      await evaluateDomValue(target, GhostBridgeDom.buildElementCommandExpression({ actionId, command: 'focus' }))
+      actionResult.detail = `已聚焦到 ${locatorLabel}`
+
+    }
+
+    actionCompleted = true
+    actionResult.success = true
+
+    // Legacy fixed delay remains available, but defaults to zero. A state-based waitFor
+    // is faster when the page responds quickly and safer when it responds slowly.
+    if (waitMs > 0) await sleepBeforeDeadline(Math.min(Number(waitMs) || 0, 3000), deadline)
+    if (waitFor) actionResult.waitFor = await waitForCondition(target, session, waitFor, semanticLocator, deadline)
+
+    return actionResult
+  } catch (error) {
+    actionResult.success = false
+    actionResult.actionCompleted = actionCompleted || undefined
+    actionResult.error = error.message
+    actionResult.diagnostics = error.diagnostics
+    actionResult.waitFor = error.waitStatus
+    error.actionResult = actionResult
+    throw error
+  } finally {
+    try {
+      await evaluateDomValue(target, GhostBridgeDom.buildCleanupElementExpression(actionId))
+    } catch (_) {}
   }
-
-  return actionResult
 }
 
 async function readPageState(target) {

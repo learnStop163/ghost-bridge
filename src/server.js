@@ -11,6 +11,13 @@ import path from "path"
 import { spawn } from "child_process"
 import { fileURLToPath } from "url"
 import { GHOST_BRIDGE_VERSION } from "../lib/version.js"
+import {
+  boundedOut,
+  calculateDispatchBudget,
+  clampNumber,
+  out,
+} from "./bridge-utils.js"
+import { DISPATCH_ACTION_TOOL } from "./tool-schemas.js"
 
 const BASE_PORT = Number(process.env.GHOST_BRIDGE_PORT || 33333)
 const DEFAULT_WS_TOKEN = "ghost-bridge-local"
@@ -737,58 +744,6 @@ async function askChrome(command, params = {}, options = {}) {
   })
 }
 
-function jsonText(data) {
-  return typeof data === "string" ? data : JSON.stringify(data)
-}
-
-// 递归剔除 null / 空串 / 空数组 / 空对象字段——这类噪声在工具输出里占比不小且无信息量
-function compact(value) {
-  if (Array.isArray(value)) {
-    const cleaned = value.map(compact).filter((v) => v !== undefined)
-    return cleaned.length ? cleaned : undefined
-  }
-  if (value && typeof value === "object") {
-    const cleaned = {}
-    for (const [k, v] of Object.entries(value)) {
-      const c = compact(v)
-      if (c !== undefined) cleaned[k] = c
-    }
-    return Object.keys(cleaned).length ? cleaned : undefined
-  }
-  if (value === null || value === "") return undefined
-  return value
-}
-
-// 所有工具输出的统一出口：compact 后再序列化
-function out(data) {
-  return jsonText(compact(data))
-}
-
-function clampNumber(value, fallback, min, max) {
-  const number = Number(value)
-  if (!Number.isFinite(number)) return fallback
-  return Math.min(max, Math.max(min, Math.round(number)))
-}
-
-// eval_script 可以返回任意页面对象。统一限制序列化后的文本长度，避免一次意外的
-// DOM / bundle 返回污染后续所有模型请求；保留首尾便于判断内容类型与结束状态。
-function boundedOut(data, maxLength = DEFAULT_EVAL_OUTPUT_LENGTH) {
-  const text = out(data) ?? "undefined"
-  const limit = clampNumber(maxLength, DEFAULT_EVAL_OUTPUT_LENGTH, 200, MAX_EVAL_OUTPUT_LENGTH)
-  if (text.length <= limit) return text
-
-  const markerBudget = 100
-  const headLength = Math.max(100, Math.floor((limit - markerBudget) * 0.8))
-  const tailLength = Math.max(50, limit - markerBudget - headLength)
-  const omitted = Math.max(0, text.length - headLength - tailLength)
-  return out({
-    truncated: true,
-    originalLength: text.length,
-    content: `${text.slice(0, headLength)}\n... [已省略 ${omitted} 个字符] ...\n${text.slice(-tailLength)}`,
-    hint: "需要更多结果时请收窄返回字段；不要通过连续轮询分片获取大对象",
-  })
-}
-
 // 元数据里的 URL 常带超长 query（跟踪参数、回调地址等），输出前统一截断
 function truncateUrl(url, maxLen = 200) {
   if (typeof url !== "string" || url.length <= maxLen) return url
@@ -1195,7 +1150,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_interactive_snapshot",
-      description: "扫描可见可交互元素，返回带 ref 的精简列表供 dispatch_action 使用（先快照后操作）。默认 30 个，需要更多传 maxElements 或用 selector 收窄。支持 Shadow DOM。",
+      description: "当无法直接写出语义 locator 时，扫描可见可交互元素并返回 ref。默认 30 个，需要更多传 maxElements 或用 selector 收窄。支持 Shadow DOM。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1215,83 +1170,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
-    {
-      name: "dispatch_action",
-      description: "执行单个或一批交互动作。可用快照 ref 或 CSS selector 定位；优先用 actions 批量完成连续填写/点击，snapshotAfter:true 可在同一次调用返回操作后元素，减少模型往返。",
-      inputSchema: {
-        type: "object",
-        properties: {
-          target: TARGET_ARG,
-          ref: {
-            type: "string",
-            description: "元素 ref，如 'e1'（来自 get_interactive_snapshot）",
-          },
-          selector: {
-            type: "string",
-            description: "CSS 选择器；已知选择器时可替代 ref，省去前置快照",
-          },
-          action: {
-            type: "string",
-            enum: ["click", "fill", "press", "scroll", "select", "hover", "focus"],
-          },
-          value: {
-            type: "string",
-            description: "fill 的文本 / select 的 option value",
-          },
-          key: {
-            type: "string",
-            description: "press 按键，默认 'Enter'",
-          },
-          deltaX: {
-            type: "number",
-            description: "水平滚动量，默认 0",
-          },
-          deltaY: {
-            type: "number",
-            description: "垂直滚动量，默认 300（正数向下）",
-          },
-          waitMs: {
-            type: "number",
-            description: "操作后等待 ms，默认 500，最大 3000",
-          },
-          actions: {
-            type: "array",
-            maxItems: 20,
-            description: "顺序执行的动作，最多 20 个；每项支持 ref/selector、action、value/key、deltaX/deltaY、waitMs",
-            items: {
-              type: "object",
-              properties: {
-                ref: { type: "string" },
-                selector: { type: "string" },
-                action: { type: "string", enum: ["click", "fill", "press", "scroll", "select", "hover", "focus"] },
-                value: { type: "string" },
-                key: { type: "string" },
-                deltaX: { type: "number" },
-                deltaY: { type: "number" },
-                waitMs: { type: "number" },
-              },
-              required: ["action"],
-            },
-          },
-          stopOnError: {
-            type: "boolean",
-            description: "批量动作失败时立即停止，默认 true",
-          },
-          snapshotAfter: {
-            type: "boolean",
-            description: "在最后一个动作后返回新的交互快照，默认 false",
-          },
-          snapshotSelector: {
-            type: "string",
-            description: "限制操作后快照范围",
-          },
-          snapshotMaxElements: {
-            type: "number",
-            description: "操作后快照元素上限，默认 20",
-          },
-        },
-      },
-    },
+    DISPATCH_ACTION_TOOL,
   ],
 }))
 
@@ -1345,7 +1224,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     page,
                     interactive,
                     nextStepHint:
-                      "视觉用 capture_screenshot；点击/输入用 get_interactive_snapshot + dispatch_action；请求/性能用 list_network_requests / perf_metrics。",
+                      "视觉用 capture_screenshot；点击/输入优先用 dispatch_action 语义 locator，当前 refs 也可直接使用；请求/性能用 list_network_requests / perf_metrics。",
                   }
                 : {
                     summary,
@@ -1604,6 +1483,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (name === "get_page_content") {
       const { target, mode = "text", selector, maxLength = 8000, offset = 0, includeMetadata = true } = args
+      const safeMaxLength = clampNumber(maxLength, 8000, 1, 50000)
+      const safeOffset = clampNumber(offset, 0, 0, 100000000)
 
       const validModes = ["text", "html", "structured"]
       if (mode && !validModes.includes(mode)) {
@@ -1615,29 +1496,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
 
-      // offset 分页（text）：直接在页面内精确切片。
-      // 不走 getPageContent 是因为扩展端对超长文本采用"保留首尾"策略，会破坏 offset 语义
-      if (offset > 0 && mode === "text") {
-        const selectorExpr = selector
-          ? `(document.querySelector(${JSON.stringify(selector)}) || document.body)`
-          : "document.body"
-        const code = `(function(){try{function ct(el){var t=el.innerText||el.textContent||"";try{var fs=el.querySelectorAll("iframe");for(var i=0;i<fs.length;i++){try{var d=fs[i].contentDocument;if(d&&d.body)t+="\\n\\n"+ct(d.body);}catch(e){}}}catch(e){}return t;}var text=ct(${selectorExpr});var start=${offset};var end=${offset + maxLength};return {content:text.slice(start,end),offset:start,totalLength:text.length,hasMore:text.length>end};}catch(e){return {error:e.message}}})()`
-        const res = await askChrome("eval", { target, code })
-        return { content: [{ type: "text", text: out(res) }] }
-      }
-
-      // offset 分页（html）：扩展端 html 截断是前缀切片，多取 offset+maxLength 后服务端再切
-      if (offset > 0 && mode === "html") {
-        const res = await askChrome("getPageContent", { target, mode, selector, maxLength: offset + maxLength, includeMetadata: false })
-        if (typeof res?.content === "string") {
-          res.content = res.content.slice(offset, offset + maxLength)
-          res.offset = offset
-          res.hasMore = (res.contentLength || 0) > offset + maxLength
-        }
-        return { content: [{ type: "text", text: out(res) }] }
-      }
-
-      const res = await askChrome("getPageContent", { target, mode, selector, maxLength, includeMetadata })
+      const res = await askChrome("getPageContent", {
+        target,
+        mode,
+        selector,
+        maxLength: safeMaxLength,
+        offset: safeOffset,
+        includeMetadata,
+      })
       if (typeof res?.metadata?.url === "string" && res.metadata.url.length > 200) {
         res.metadata.url = truncateUrl(res.metadata.url)
         res.metadata.urlTruncated = true
@@ -1652,11 +1518,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (name === "dispatch_action") {
-      const steps = Array.isArray(args.actions) ? args.actions : [args]
-      if (!steps.length || steps.length > 20) throw new Error("actions 数量必须在 1-20 之间")
-      const totalWaitMs = steps.reduce((sum, step) => sum + clampNumber(step.waitMs, 500, 0, 3000), 0)
-      const timeoutMs = Math.min(45000, 10000 + totalWaitMs)
-      const res = await askChrome("dispatchAction", args, { timeoutMs })
+      const budget = calculateDispatchBudget(args)
+      const res = await askChrome(
+        "dispatchAction",
+        { ...args, timeoutMs: budget.executionTimeoutMs },
+        { timeoutMs: budget.serverTimeoutMs }
+      )
       return { content: [{ type: "text", text: out(res) }] }
     }
 

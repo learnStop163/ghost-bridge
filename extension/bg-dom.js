@@ -159,7 +159,15 @@
             }
           }
 
-          document.querySelectorAll('[data-ghost-ref]').forEach(el => el.removeAttribute('data-ghost-ref'));
+          function clearRefs(scanTarget) {
+            const all = scanTarget.querySelectorAll('*');
+            for (const el of all) {
+              if (el.hasAttribute('data-ghost-ref')) el.removeAttribute('data-ghost-ref');
+              if (el.shadowRoot) clearRefs(el.shadowRoot);
+            }
+          }
+
+          clearRefs(document);
           scanRoot(root);
 
           return {
@@ -203,7 +211,7 @@
     })()`
   }
 
-  function buildPageContentExpression({ mode, selector, maxLength, includeMetadata }) {
+  function buildPageContentExpression({ mode, selector, maxLength, offset = 0, includeMetadata }) {
     const selectorStr = selector ? JSON.stringify(selector) : 'null'
     const modeStr = JSON.stringify(mode)
 
@@ -217,6 +225,7 @@
         const selector = ${selectorStr};
         const mode = ${modeStr};
         const maxLength = ${maxLength};
+        const offset = ${offset};
         const includeMetadata = ${includeMetadata};
 
         function getMetadata() {
@@ -269,28 +278,6 @@
           return structured;
         }
 
-        function smartTruncateText(text, limit) {
-          if (text.length <= limit) {
-            return { content: text, truncated: false };
-          }
-
-          if (limit < 400) {
-            return { content: text.slice(0, limit), truncated: true, note: '内容过长，已截断' };
-          }
-
-          const headLength = Math.max(200, Math.floor(limit * 0.8));
-          const tailLength = Math.max(120, limit - headLength - 80);
-          const head = text.slice(0, headLength).trimEnd();
-          const tail = text.slice(-tailLength).trimStart();
-          const omittedChars = Math.max(0, text.length - head.length - tail.length);
-
-          return {
-            content: head + '\\n\\n... [已省略 ' + omittedChars + ' 个字符] ...\\n\\n' + tail,
-            truncated: true,
-            note: '内容过长，已保留开头与结尾片段'
-          };
-        }
-
         const targetElement = resolveTargetElement();
         if (targetElement?.error) return targetElement;
 
@@ -301,39 +288,57 @@
         if (mode === 'text') {
           // 递归收集同源 iframe 内的文本：跨域 iframe 访问 contentDocument 会抛错，跳过即可。
           // 大量文档类页面（钉钉文档、italent 等）正文都在 iframe 里，不递归会拿到空文本，
-            // 迫使模型退化为整页截图读文档——那是长会话里最昂贵的 token 开销
+          // 迫使模型退化为整页截图读文档——那是长会话里最昂贵的 token 开销
           function collectText(el) {
-            let text = el.innerText || el.textContent || '';
+            const collected = {
+              text: el.innerText || el.textContent || '',
+              iframeCount: 0,
+              readableIframeCount: 0,
+              crossOriginSkipped: 0
+            };
             try {
               var frames = el.querySelectorAll('iframe');
               for (var i = 0; i < frames.length; i++) {
+                collected.iframeCount++;
                 try {
                   var doc = frames[i].contentDocument;
-                  if (doc && doc.body) text += '\\n\\n' + collectText(doc.body);
-                } catch (e) {}
+                  if (doc && doc.body) {
+                    const nested = collectText(doc.body);
+                    collected.readableIframeCount++;
+                    collected.text += '\\n\\n' + nested.text;
+                    collected.iframeCount += nested.iframeCount;
+                    collected.readableIframeCount += nested.readableIframeCount;
+                    collected.crossOriginSkipped += nested.crossOriginSkipped;
+                  } else {
+                    collected.crossOriginSkipped++;
+                  }
+                } catch (e) {
+                  collected.crossOriginSkipped++;
+                }
               }
             } catch (e) {}
-            return text;
+            return collected;
           }
-          let text = collectText(targetElement);
+          const collected = collectText(targetElement);
+          let text = collected.text;
           text = text.replace(/\\n{3,}/g, '\\n\\n').trim();
           result.contentLength = text.length;
-          result.includesIframes = true;
-          const truncated = smartTruncateText(text, maxLength);
-          result.content = truncated.content;
-          result.truncated = truncated.truncated;
-          if (truncated.note) result.note = truncated.note;
+          result.iframeCount = collected.iframeCount;
+          result.readableIframeCount = collected.readableIframeCount;
+          result.crossOriginSkipped = collected.crossOriginSkipped;
+          result.includesIframes = collected.readableIframeCount > 0;
+          result.offset = offset;
+          result.content = text.slice(offset, offset + maxLength);
+          result.truncated = offset > 0 || text.length > offset + maxLength;
+          result.hasMore = text.length > offset + maxLength;
         } else if (mode === 'html') {
           let html = targetElement.outerHTML || '';
           result.contentLength = html.length;
-          if (html.length > maxLength) {
-            result.content = html.slice(0, maxLength);
-            result.truncated = true;
-            result.note = 'HTML 已截断，可能不完整';
-          } else {
-            result.content = html;
-            result.truncated = false;
-          }
+          result.offset = offset;
+          result.content = html.slice(offset, offset + maxLength);
+          result.truncated = offset > 0 || html.length > offset + maxLength;
+          result.hasMore = html.length > offset + maxLength;
+          if (result.truncated) result.note = 'HTML 分页片段可能不是完整标签';
         } else if (mode === 'structured') {
           const structured = buildStructuredContent(targetElement);
           result.structured = structured;
@@ -421,7 +426,15 @@
           }
         }
 
-        document.querySelectorAll('[data-ghost-ref]').forEach(el => el.removeAttribute('data-ghost-ref'));
+        function clearRefs(scanTarget) {
+          const all = scanTarget.querySelectorAll('*');
+          for (const el of all) {
+            if (el.hasAttribute('data-ghost-ref')) el.removeAttribute('data-ghost-ref');
+            if (el.shadowRoot) clearRefs(el.shadowRoot);
+          }
+        }
+
+        clearRefs(document);
 
         let rootEl = document.body;
         const sel = ${selectorStr};
@@ -450,9 +463,363 @@
     })()`
   }
 
+  // This runtime is serialized into Runtime.evaluate expressions. Keep it self-contained:
+  // it intentionally depends only on the supplied page window and standard DOM APIs.
+  function createLocatorRuntime(rootWindow) {
+    const STORE_KEY = '__ghostActionElements'
+
+    function normalize(value) {
+      return String(value == null ? '' : value).replace(/\s+/g, ' ').trim()
+    }
+
+    function matches(actual, expected, mode) {
+      const left = normalize(actual)
+      const right = normalize(expected)
+      if (!right) return false
+      return mode === 'contains' ? left.includes(right) : left === right
+    }
+
+    function elementWindow(element) {
+      return element?.ownerDocument?.defaultView || rootWindow
+    }
+
+    function styleOf(element) {
+      try {
+        return elementWindow(element).getComputedStyle(element)
+      } catch (_) {
+        return null
+      }
+    }
+
+    function isVisible(element) {
+      if (!element || element.isConnected === false || element.hidden) return false
+      if (element.getAttribute?.('aria-hidden') === 'true') return false
+      const style = styleOf(element)
+      if (style && (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0)) return false
+      const rect = element.getBoundingClientRect?.()
+      return Boolean(rect && (rect.width > 0 || rect.height > 0))
+    }
+
+    function isDisabled(element) {
+      if (!element) return true
+      if (element.disabled || element.getAttribute?.('aria-disabled') === 'true') return true
+      try {
+        return Boolean(element.closest?.('fieldset[disabled]'))
+      } catch (_) {
+        return false
+      }
+    }
+
+    function elementText(element) {
+      return normalize(element?.innerText || element?.textContent || '')
+    }
+
+    function rootById(element, id) {
+      const root = element?.getRootNode?.()
+      if (root?.getElementById) return root.getElementById(id)
+      if (root?.querySelector) {
+        try {
+          return root.querySelector(`[id="${String(id).replace(/["\\]/g, '\\$&')}"]`)
+        } catch (_) {}
+      }
+      return element?.ownerDocument?.getElementById?.(id) || null
+    }
+
+    function labelText(element) {
+      const parts = []
+      try {
+        if (element.labels) {
+          for (const label of element.labels) parts.push(elementText(label))
+        }
+      } catch (_) {}
+      if (!parts.length) {
+        const wrapped = element.closest?.('label')
+        if (wrapped) parts.push(elementText(wrapped))
+      }
+      if (!parts.length && element.id && element.ownerDocument?.querySelectorAll) {
+        try {
+          for (const label of element.ownerDocument.querySelectorAll('label')) {
+            if (label.htmlFor === element.id || label.getAttribute?.('for') === element.id) parts.push(elementText(label))
+          }
+        } catch (_) {}
+      }
+      return normalize(parts.filter(Boolean).join(' '))
+    }
+
+    function accessibleName(element) {
+      const ariaLabel = normalize(element.getAttribute?.('aria-label'))
+      if (ariaLabel) return ariaLabel
+
+      const labelledBy = normalize(element.getAttribute?.('aria-labelledby'))
+      if (labelledBy) {
+        const text = labelledBy.split(' ').map((id) => elementText(rootById(element, id))).filter(Boolean).join(' ')
+        if (text) return normalize(text)
+      }
+
+      const label = labelText(element)
+      if (label) return label
+      const alt = normalize(element.getAttribute?.('alt'))
+      if (alt) return alt
+      const tag = String(element.tagName || '').toLowerCase()
+      const type = String(element.type || '').toLowerCase()
+      if (tag === 'input' && ['button', 'submit', 'reset'].includes(type)) {
+        const value = normalize(element.value)
+        if (value) return value
+      }
+      return elementText(element)
+    }
+
+    function implicitRole(element) {
+      const explicit = normalize(element.getAttribute?.('role')).toLowerCase()
+      if (explicit) return explicit.split(' ')[0]
+      const tag = String(element.tagName || '').toLowerCase()
+      const type = String(element.type || '').toLowerCase()
+      if (tag === 'button') return 'button'
+      if (tag === 'a' && element.getAttribute?.('href')) return 'link'
+      if (tag === 'textarea') return 'textbox'
+      if (tag === 'select') return element.multiple ? 'listbox' : 'combobox'
+      if (tag === 'img') return 'img'
+      if (/^h[1-6]$/.test(tag)) return 'heading'
+      if (tag === 'input') {
+        if (['button', 'submit', 'reset', 'image'].includes(type)) return 'button'
+        if (type === 'checkbox') return 'checkbox'
+        if (type === 'radio') return 'radio'
+        if (type === 'range') return 'slider'
+        if (type === 'number') return 'spinbutton'
+        if (!['hidden', 'color', 'file'].includes(type)) return type === 'search' ? 'searchbox' : 'textbox'
+      }
+      return ''
+    }
+
+    function collectContexts() {
+      const contexts = []
+      const seenRoots = new Set()
+
+      function visit(root, frames) {
+        if (!root || seenRoots.has(root)) return
+        seenRoots.add(root)
+        contexts.push({ root, frames })
+        let elements = []
+        try { elements = Array.from(root.querySelectorAll('*')) } catch (_) {}
+        for (const element of elements) {
+          if (element.shadowRoot) visit(element.shadowRoot, frames)
+          if (String(element.tagName || '').toLowerCase() === 'iframe') {
+            try {
+              const frameDocument = element.contentDocument
+              if (frameDocument?.documentElement) visit(frameDocument, frames.concat(element))
+            } catch (_) {}
+          }
+        }
+      }
+
+      visit(rootWindow.document, [])
+      return contexts
+    }
+
+    function semanticMatch(element, locator, mode) {
+      if (locator.testId !== undefined && !matches(element.getAttribute?.('data-testid'), locator.testId, mode)) return false
+      if (locator.role !== undefined && normalize(implicitRole(element)).toLowerCase() !== normalize(locator.role).toLowerCase()) return false
+      if (locator.name !== undefined && !matches(accessibleName(element), locator.name, mode)) return false
+      if (locator.label !== undefined) {
+        const tag = String(element.tagName || '').toLowerCase()
+        if (!['button', 'input', 'meter', 'output', 'progress', 'select', 'textarea'].includes(tag)) return false
+        if (!matches(labelText(element) || accessibleName(element), locator.label, mode)) return false
+      }
+      if (locator.placeholder !== undefined && !matches(element.getAttribute?.('placeholder') || element.placeholder, locator.placeholder, mode)) return false
+      if (locator.text !== undefined) {
+        if (!matches(elementText(element), locator.text, mode)) return false
+        try {
+          const childMatches = Array.from(element.querySelectorAll('*')).some((child) => matches(elementText(child), locator.text, mode))
+          if (childMatches) return false
+        } catch (_) {}
+      }
+      return true
+    }
+
+    function find(locator = {}, { visibleOnly = false } = {}) {
+      if (!locator || typeof locator !== 'object') return { error: 'locator 必须是对象' }
+      const keys = ['css', 'testId', 'role', 'name', 'label', 'placeholder', 'text']
+      if (!keys.some((key) => locator[key] !== undefined && locator[key] !== '')) {
+        return { error: 'locator 至少需要 css/testId/role/name/label/placeholder/text 之一' }
+      }
+      if (locator.match && !['exact', 'contains'].includes(locator.match)) return { error: 'locator.match 仅支持 exact 或 contains' }
+      if (locator.nth !== undefined && (!Number.isInteger(locator.nth) || locator.nth < 0)) return { error: 'locator.nth 必须是从 0 开始的整数' }
+
+      const mode = locator.match || 'exact'
+      const found = []
+      const seen = new Set()
+      for (const context of collectContexts()) {
+        let elements = []
+        try {
+          elements = Array.from(context.root.querySelectorAll(locator.css || '*'))
+        } catch (error) {
+          return { error: `无效的 CSS 选择器: ${error.message}` }
+        }
+        for (const element of elements) {
+          if (seen.has(element)) continue
+          seen.add(element)
+          if (!semanticMatch(element, locator, mode)) continue
+          if (visibleOnly && !isVisible(element)) continue
+          found.push({ element, frames: context.frames })
+        }
+      }
+      return { found }
+    }
+
+    function summary(item, index) {
+      const element = item.element
+      const result = {
+        nth: index,
+        tag: String(element.tagName || '').toLowerCase(),
+        role: implicitRole(element) || undefined,
+        name: accessibleName(element).slice(0, 100) || undefined,
+        text: elementText(element).slice(0, 100) || undefined,
+        placeholder: normalize(element.getAttribute?.('placeholder') || element.placeholder).slice(0, 80) || undefined,
+        testId: normalize(element.getAttribute?.('data-testid')).slice(0, 80) || undefined,
+        disabled: isDisabled(element) || undefined,
+      }
+      return Object.fromEntries(Object.entries(result).filter(([, value]) => value !== undefined && value !== ''))
+    }
+
+    function selectOne(locator, options) {
+      const result = find(locator, options)
+      if (result.error) return result
+      const matches = result.found
+      if (!matches.length) return { error: 'locator 未匹配到元素', locator }
+      if (locator.nth !== undefined) {
+        if (!matches[locator.nth]) return { error: `locator.nth=${locator.nth} 超出匹配范围（共 ${matches.length} 个）`, locator }
+        return { selected: matches[locator.nth], count: matches.length }
+      }
+      if (matches.length > 1) {
+        return {
+          error: `locator 匹配到 ${matches.length} 个元素，请增加条件或指定 nth`,
+          ambiguous: true,
+          matchCount: matches.length,
+          candidates: matches.slice(0, 5).map(summary),
+        }
+      }
+      return { selected: matches[0], count: 1 }
+    }
+
+    function scrollAndMeasure(item) {
+      for (const frame of item.frames) frame.scrollIntoView?.({ block: 'center', inline: 'center' })
+      item.element.scrollIntoView?.({ block: 'center', inline: 'center' })
+      const rect = item.element.getBoundingClientRect()
+      let left = rect.left
+      let top = rect.top
+      for (const frame of item.frames) {
+        const frameRect = frame.getBoundingClientRect()
+        left += frameRect.left + (frame.clientLeft || 0)
+        top += frameRect.top + (frame.clientTop || 0)
+      }
+      return {
+        cx: Math.round(left + rect.width / 2),
+        cy: Math.round(top + rect.height / 2),
+      }
+    }
+
+    function locate(locator, actionId) {
+      const result = selectOne(locator, { visibleOnly: true })
+      if (result.error) return result
+      const item = result.selected
+      const position = scrollAndMeasure(item)
+      if (!isVisible(item.element)) return { error: '元素滚动后仍不可见', locator }
+      if (!rootWindow[STORE_KEY]) rootWindow[STORE_KEY] = Object.create(null)
+      rootWindow[STORE_KEY][actionId] = item
+      return {
+        found: true,
+        ...summary(item, locator.nth || 0),
+        ...position,
+        matchCount: result.count,
+      }
+    }
+
+    function probe(locator, state) {
+      const result = find(locator, { visibleOnly: false })
+      if (result.error) return result
+      const all = result.found
+      const selected = locator.nth === undefined ? all : (all[locator.nth] ? [all[locator.nth]] : [])
+      const visible = selected.filter((item) => isVisible(item.element))
+      const enabled = visible.filter((item) => !isDisabled(item.element))
+      let satisfied = false
+      if (state === 'attached') satisfied = selected.length > 0
+      else if (state === 'detached') satisfied = selected.length === 0
+      else if (state === 'hidden') satisfied = visible.length === 0
+      else if (state === 'enabled') satisfied = enabled.length > 0
+      else satisfied = visible.length > 0
+      return {
+        satisfied,
+        state,
+        matchCount: all.length,
+        visibleCount: visible.length,
+        enabledCount: enabled.length,
+        candidates: satisfied ? undefined : all.slice(0, 3).map(summary),
+      }
+    }
+
+    function use(actionId, command, payload = {}) {
+      const store = rootWindow[STORE_KEY]
+      const item = store?.[actionId]
+      const element = item?.element
+      if (!element || element.isConnected === false) return { error: '动作执行前元素已从页面移除' }
+      if (command === 'focus') element.focus?.()
+      else if (command === 'prepareFill') {
+        element.focus?.()
+        element.select?.()
+      } else if (command === 'dispatchInput') {
+        element.dispatchEvent(new (elementWindow(element).Event)('input', { bubbles: true }))
+        element.dispatchEvent(new (elementWindow(element).Event)('change', { bubbles: true }))
+      } else if (command === 'select') {
+        if (String(element.tagName || '').toLowerCase() !== 'select') return { error: 'select 动作只能用于 <select> 元素' }
+        const values = Array.from(element.options || []).map((option) => String(option.value))
+        if (!values.includes(String(payload.value))) return { error: `下拉框不存在值 "${String(payload.value)}"` }
+        element.value = String(payload.value)
+        element.dispatchEvent(new (elementWindow(element).Event)('input', { bubbles: true }))
+        element.dispatchEvent(new (elementWindow(element).Event)('change', { bubbles: true }))
+      }
+      return { success: true }
+    }
+
+    function cleanup(actionId) {
+      if (rootWindow[STORE_KEY]) delete rootWindow[STORE_KEY][actionId]
+      return true
+    }
+
+    return { version: 1, locate, probe, use, cleanup }
+  }
+
+  const locatorRuntimeSource = () => `(${createLocatorRuntime.toString()})(window)`
+
+  function buildInstallLocatorRuntimeExpression() {
+    return `(function(){window.__ghostLocatorRuntime=${locatorRuntimeSource()};return true;})()`
+  }
+
+  function buildLocateElementExpression({ locator, ref, selector, actionId }) {
+    const semanticLocator = locator || { css: ref ? `[data-ghost-ref="${String(ref).replace(/["\\]/g, '\\$&')}"]` : String(selector || '') }
+    return `(function(){try{return window.__ghostLocatorRuntime.locate(${JSON.stringify(semanticLocator)},${JSON.stringify(actionId)});}catch(e){return {error:e.message};}})()`
+  }
+
+  function buildElementCommandExpression({ actionId, command, payload }) {
+    return `(function(){try{return window.__ghostLocatorRuntime.use(${JSON.stringify(actionId)},${JSON.stringify(command)},${JSON.stringify(payload || {})});}catch(e){return {error:e.message};}})()`
+  }
+
+  function buildCleanupElementExpression(actionId) {
+    return `(function(){return window.__ghostLocatorRuntime ? window.__ghostLocatorRuntime.cleanup(${JSON.stringify(actionId)}) : true;})()`
+  }
+
+  function buildLocatorProbeExpression({ locator, state }) {
+    return `(function(){try{return window.__ghostLocatorRuntime.probe(${JSON.stringify(locator)},${JSON.stringify(state)});}catch(e){return {error:e.message};}})()`
+  }
+
   global.GhostBridgeDom = {
     buildInspectPageExpression,
     buildPageContentExpression,
     buildInteractiveSnapshotExpression,
+    buildInstallLocatorRuntimeExpression,
+    buildLocateElementExpression,
+    buildElementCommandExpression,
+    buildCleanupElementExpression,
+    buildLocatorProbeExpression,
+    createLocatorRuntime,
   }
 })(self)

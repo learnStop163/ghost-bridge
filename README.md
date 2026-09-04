@@ -16,6 +16,8 @@ Most browser-capable AI tools start a separate browser. Ghost Bridge connects AI
 - Inspect page structure, text, screenshots, errors, and network traffic
 - Search and extract script sources, even in production bundles
 - Click, type, scroll, and submit forms on the current page
+- Locate elements by role/name, label, placeholder, text, test ID, or CSS across open Shadow DOM and same-origin iframes
+- Run `locate → act → wait → snapshot` as one browser call instead of model-driven polling
 - Bind multiple Chrome tabs as named targets and operate them independently
 - Share one Chrome transport across multiple MCP clients
 
@@ -94,7 +96,7 @@ Typical prompts:
 | `capture_screenshot` | Visual inspection and UI debugging |
 | `get_page_content` | Text, HTML, and structured DOM extraction |
 | `get_interactive_snapshot` | Find clickable and editable elements |
-| `dispatch_action` | Click, fill, press, scroll, hover, or select; supports selector-based and batched actions |
+| `dispatch_action` | Locate, act, wait, and verify in one call; supports semantic locators and batches |
 | `eval_script` | Execute JavaScript, wait for returned promises, and cap arbitrary output |
 | `page_request` | Send an authenticated page-context request and wait for the response in one call |
 | `bind_tab` | Bind a Chrome tab as a named target such as `cases` or `app` |
@@ -115,12 +117,12 @@ Typical prompts:
 
 Recommended flow:
 
-1. Start with `inspect_page`; its compact response includes a small set of actionable refs
-2. Use `capture_screenshot` for visual issues
+1. When the target is describable, call `dispatch_action` directly with a semantic `locator`
+2. Use `inspect_page` when the page is unfamiliar or a locator is ambiguous; its compact response includes actionable refs
+3. Use `capture_screenshot` for visual issues
    Default is optimized for transfer with JPEG; switch to `png` for pixel-level checks
-3. Use `get_page_content` for DOM or text extraction
-4. Use `get_interactive_snapshot` only when the refs returned by `inspect_page` are insufficient
-5. Put consecutive fills/clicks into one `dispatch_action.actions` call and request `snapshotAfter` when the next page state is needed
+4. Use `get_page_content` for DOM or text extraction
+5. Put consecutive fills/clicks into one `dispatch_action.actions` call; add `waitFor` to the action that changes state and `snapshotAfter` when the resulting UI is needed
 
 Round-trip-efficient examples:
 
@@ -128,13 +130,41 @@ Round-trip-efficient examples:
 {
   "target": "app",
   "actions": [
-    { "selector": "input[name=email]", "action": "fill", "value": "user@example.com" },
-    { "selector": "input[name=password]", "action": "fill", "value": "secret" },
-    { "selector": "button[type=submit]", "action": "click", "waitMs": 1200 }
+    {
+      "locator": { "role": "textbox", "label": "Email" },
+      "action": "fill",
+      "value": "user@example.com"
+    },
+    {
+      "locator": { "role": "textbox", "label": "Password" },
+      "action": "fill",
+      "value": "secret"
+    },
+    {
+      "locator": { "role": "button", "name": "Sign in" },
+      "action": "click",
+      "waitFor": {
+        "type": "element",
+        "locator": { "text": "Signed in" },
+        "state": "visible",
+        "timeoutMs": 10000
+      }
+    }
   ],
   "snapshotAfter": true
 }
 ```
+
+Locator fields are `css`, `testId`, `role` + `name`, `label`, `placeholder`, `text`, `match`, and zero-based `nth`. Matching is exact by default. Ghost Bridge refuses ambiguous action targets and returns compact candidates instead of silently choosing the first element.
+
+`waitFor` supports:
+
+- `element`: `visible`, `hidden`, `attached`, `detached`, or `enabled`
+- `url`: `contains` or `equals`
+- `networkIdle`: optional `idleMs`
+- `expression`: a truthy JavaScript expression, including a returned Promise
+
+Polling happens inside the extension at a short interval, so it does not create repeated model/tool turns. Each condition defaults to 10 seconds and is capped at 30 seconds. The whole batch has a hard deadline of at most 60 seconds; once reached, remaining actions are not executed. Fixed `waitMs` remains for compatibility but defaults to zero.
 
 For API calls that need the page's login state, prefer `page_request`. If custom asynchronous JavaScript is still needed, return the promise from `eval_script` instead of storing a result on `window` and polling it in another tool call:
 
@@ -150,6 +180,8 @@ Notes:
 
 - Use `bind_tab` when a workflow spans multiple pages. For example, bind a checklist page as `cases` and a business page as `app`, then call tools with `target: "cases"` or `target: "app"`.
 - All browser tools accept an optional `target` parameter. When named targets are bound, `dispatch_action` requires `target` so refs from one page are not accidentally used on another page.
+- Semantic locators traverse open Shadow DOM and readable same-origin iframes. Cross-origin iframe DOM is not accessible and is skipped explicitly.
+- `get_page_content` reports iframe counters and uses contiguous `offset`/`maxLength` slices, so pagination does not duplicate or skip the hidden middle of a head/tail truncation.
 - Use `pin_current_tab` when you are debugging a page and need to switch to other tabs without changing the AI target. Use `unpin_tab` to restore the original follow-focused-tab behavior.
 - `list_network_requests` and `get_network_detail` automatically summarize `data:` URLs and very long URLs so inline images or oversized query strings do not overwhelm model context
 
