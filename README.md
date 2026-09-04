@@ -94,7 +94,9 @@ Typical prompts:
 | `capture_screenshot` | Visual inspection and UI debugging |
 | `get_page_content` | Text, HTML, and structured DOM extraction |
 | `get_interactive_snapshot` | Find clickable and editable elements |
-| `dispatch_action` | Click, fill, press, scroll, hover, select |
+| `dispatch_action` | Click, fill, press, scroll, hover, or select; supports selector-based and batched actions |
+| `eval_script` | Execute JavaScript, wait for returned promises, and cap arbitrary output |
+| `page_request` | Send an authenticated page-context request and wait for the response in one call |
 | `bind_tab` | Bind a Chrome tab as a named target such as `cases` or `app` |
 | `unbind_tab` | Remove a named target binding |
 | `list_targets` | Show named targets and their per-tab session status |
@@ -113,11 +115,36 @@ Typical prompts:
 
 Recommended flow:
 
-1. Start with `inspect_page`
+1. Start with `inspect_page`; its compact response includes a small set of actionable refs
 2. Use `capture_screenshot` for visual issues
    Default is optimized for transfer with JPEG; switch to `png` for pixel-level checks
 3. Use `get_page_content` for DOM or text extraction
-4. Use `get_interactive_snapshot` before `dispatch_action`
+4. Use `get_interactive_snapshot` only when the refs returned by `inspect_page` are insufficient
+5. Put consecutive fills/clicks into one `dispatch_action.actions` call and request `snapshotAfter` when the next page state is needed
+
+Round-trip-efficient examples:
+
+```json
+{
+  "target": "app",
+  "actions": [
+    { "selector": "input[name=email]", "action": "fill", "value": "user@example.com" },
+    { "selector": "input[name=password]", "action": "fill", "value": "secret" },
+    { "selector": "button[type=submit]", "action": "click", "waitMs": 1200 }
+  ],
+  "snapshotAfter": true
+}
+```
+
+For API calls that need the page's login state, prefer `page_request`. If custom asynchronous JavaScript is still needed, return the promise from `eval_script` instead of storing a result on `window` and polling it in another tool call:
+
+```javascript
+(async () => {
+  const response = await fetch('/api/items', { credentials: 'include' })
+  const data = await response.json()
+  return data.items.map(({ id, name }) => ({ id, name }))
+})()
+```
 
 Notes:
 

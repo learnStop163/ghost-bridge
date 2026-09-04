@@ -299,9 +299,26 @@
         }
 
         if (mode === 'text') {
-          let text = targetElement.innerText || targetElement.textContent || '';
+          // 递归收集同源 iframe 内的文本：跨域 iframe 访问 contentDocument 会抛错，跳过即可。
+          // 大量文档类页面（钉钉文档、italent 等）正文都在 iframe 里，不递归会拿到空文本，
+            // 迫使模型退化为整页截图读文档——那是长会话里最昂贵的 token 开销
+          function collectText(el) {
+            let text = el.innerText || el.textContent || '';
+            try {
+              var frames = el.querySelectorAll('iframe');
+              for (var i = 0; i < frames.length; i++) {
+                try {
+                  var doc = frames[i].contentDocument;
+                  if (doc && doc.body) text += '\\n\\n' + collectText(doc.body);
+                } catch (e) {}
+              }
+            } catch (e) {}
+            return text;
+          }
+          let text = collectText(targetElement);
           text = text.replace(/\\n{3,}/g, '\\n\\n').trim();
           result.contentLength = text.length;
+          result.includesIframes = true;
           const truncated = smartTruncateText(text, maxLength);
           result.content = truncated.content;
           result.truncated = truncated.truncated;

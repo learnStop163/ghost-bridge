@@ -989,10 +989,90 @@ async function handleSymbolicHints(params = {}) {
 
 async function handleEval(params = {}) {
   const target = await ensureAttached(params)
-  const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-    expression: params.code,
-    returnByValue: true,
-  })
+  const timeoutMs = Math.min(30000, Math.max(100, Number(params.timeoutMs) || 10000))
+  const { result, exceptionDetails } = await withTimeout(
+    chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+      expression: params.code,
+      returnByValue: true,
+      awaitPromise: params.awaitPromise !== false,
+    }),
+    timeoutMs,
+    "eval_script"
+  )
+  if (exceptionDetails) {
+    throw new Error(exceptionDetails.exception?.description || exceptionDetails.text || "脚本执行失败")
+  }
+  return result?.value
+}
+
+async function handlePageRequest(params = {}) {
+  const target = await ensureAttached(params)
+  if (!params.url || typeof params.url !== 'string') throw new Error("page_request 需要提供 url")
+  const timeoutMs = Math.min(30000, Math.max(100, Number(params.timeoutMs) || 10000))
+  const maxOutputLength = Math.min(50000, Math.max(200, Number(params.maxOutputLength) || 8000))
+  const method = String(params.method || 'GET').toUpperCase()
+  const responseType = ['auto', 'json', 'text'].includes(params.responseType) ? params.responseType : 'auto'
+  const headers = params.headers && typeof params.headers === 'object' ? { ...params.headers } : {}
+  let body = params.body
+  if (body !== undefined && body !== null && typeof body !== 'string') {
+    body = JSON.stringify(body)
+    if (!Object.keys(headers).some((name) => name.toLowerCase() === 'content-type')) {
+      headers['Content-Type'] = 'application/json'
+    }
+  }
+
+  const expression = `(async function() {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ${timeoutMs});
+    try {
+      const url = new URL(${JSON.stringify(params.url)}, window.location.href);
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+        throw new Error('仅支持 HTTP(S) URL');
+      }
+      const response = await fetch(url.href, {
+        method: ${JSON.stringify(method)},
+        headers: ${JSON.stringify(headers)},
+        body: ${body === undefined || body === null ? 'undefined' : JSON.stringify(String(body))},
+        credentials: 'include',
+        signal: controller.signal,
+      });
+      const text = await response.text();
+      const contentType = response.headers.get('content-type') || '';
+      const truncated = text.length > ${maxOutputLength};
+      const content = truncated ? text.slice(0, ${maxOutputLength}) : text;
+      let data = content;
+      if (!truncated && (${JSON.stringify(responseType)} === 'json' || (${JSON.stringify(responseType)} === 'auto' && contentType.includes('json')))) {
+        try { data = JSON.parse(content); } catch (e) {
+          if (${JSON.stringify(responseType)} === 'json') throw new Error('响应不是有效 JSON: ' + e.message);
+        }
+      }
+      return {
+        ok: response.ok,
+        status: response.status,
+        statusText: response.statusText,
+        url: response.url,
+        contentType,
+        originalLength: text.length,
+        truncated,
+        data,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  })()`
+
+  const { result, exceptionDetails } = await withTimeout(
+    chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+      expression,
+      returnByValue: true,
+      awaitPromise: true,
+    }),
+    timeoutMs + 500,
+    "page_request"
+  )
+  if (exceptionDetails) {
+    throw new Error(exceptionDetails.exception?.description || exceptionDetails.text || "页面请求失败")
+  }
   return result?.value
 }
 
@@ -1351,6 +1431,15 @@ async function handleGetPageContent(params = {}) {
 async function handleGetInteractiveSnapshot(params = {}) {
   const { target, session } = await ensureAttachedSession(params)
   const { selector, includeText = true, maxElements = 100 } = params
+  const value = await evaluateInteractiveSnapshot(target, { selector, includeText, maxElements })
+  if (value) {
+    value.target = describeCommandTarget(params, session)
+    value.tabId = session.tabId
+  }
+  return value
+}
+
+async function evaluateInteractiveSnapshot(target, { selector, includeText = true, maxElements = 100 } = {}) {
   const expression = GhostBridgeDom.buildInteractiveSnapshotExpression({ selector, includeText, maxElements })
 
   const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
@@ -1359,12 +1448,7 @@ async function handleGetInteractiveSnapshot(params = {}) {
   })
 
   if (result?.value?.error) throw new Error(result.value.error)
-  const value = result?.value
-  if (value) {
-    value.target = describeCommandTarget(params, session)
-    value.tabId = session.tabId
-  }
-  return value
+  return result?.value
 }
 
 // ========== DOM 交互：动作分发器 ==========
@@ -1375,16 +1459,59 @@ async function handleDispatchAction(params = {}) {
     throw new Error("已绑定命名 target 时，dispatch_action 必须提供 target，避免跨页面误用 ref")
   }
   const target = await ensureAttached(params)
-  const { ref, action, value, key, deltaX, deltaY, waitMs = 500 } = params
+  const isBatch = Array.isArray(params.actions)
+  const actions = isBatch ? params.actions : [params]
+  if (!actions.length || actions.length > 20) throw new Error("actions 数量必须在 1-20 之间")
 
-  if (!ref) throw new Error("需要提供 ref（元素标识，如 'e1'）")
+  const results = []
+  for (let index = 0; index < actions.length; index++) {
+    try {
+      results.push(await executeDispatchAction(target, actions[index]))
+    } catch (e) {
+      if (!isBatch) throw e
+      results.push({ index, success: false, error: e.message })
+      if (params.stopOnError !== false) break
+    }
+  }
+
+  const pageAfter = await readPageState(target)
+  const response = isBatch
+    ? {
+        success: results.length === actions.length && results.every((item) => item.success),
+        completed: results.filter((item) => item.success).length,
+        total: actions.length,
+        results,
+        pageAfter,
+      }
+    : { ...results[0], pageAfter }
+
+  if (params.snapshotAfter) {
+    response.snapshotAfter = await evaluateInteractiveSnapshot(target, {
+      selector: params.snapshotSelector,
+      includeText: true,
+      maxElements: Math.min(100, Math.max(1, Number(params.snapshotMaxElements) || 20)),
+    })
+  }
+
+  return response
+}
+
+async function executeDispatchAction(target, step = {}) {
+  const { ref, selector, action, value, key, deltaX, deltaY, waitMs = 500 } = step
+
+  if (!ref && !selector) throw new Error("需要提供 ref 或 selector")
+  if (ref && !/^e\d+$/.test(String(ref))) throw new Error(`无效的 ref: ${ref}`)
   if (!action) throw new Error("需要提供 action（动作类型：click/fill/press/scroll/select/hover/focus）")
+
+  const locator = ref ? `[data-ghost-ref="${ref}"]` : String(selector)
+  const locatorExpression = JSON.stringify(locator)
+  const locatorLabel = ref || selector
 
   // Step 1: 实时获取目标元素的最新坐标和状态
   const locateExpression = `(function() {
     try {
-      const el = document.querySelector('[data-ghost-ref="${ref}"]');
-      if (!el) return { error: '元素未找到，ref 可能已失效，请重新获取快照' };
+      const el = document.querySelector(${locatorExpression});
+      if (!el) return { error: '元素未找到：' + ${JSON.stringify(locatorLabel)} };
       // 关键修复：确保元素在视口内，否则超出屏幕的坐标无法被 CDP 模拟点击
       el.scrollIntoView({ block: 'center', inline: 'center' });
       const rect = el.getBoundingClientRect();
@@ -1408,12 +1535,12 @@ async function handleDispatchAction(params = {}) {
 
   const loc = locResult?.value
   if (!loc || loc.error) throw new Error(loc?.error || "无法定位元素")
-  if (loc.disabled) throw new Error(`元素 ${ref} 已被禁用 (disabled)`)
+  if (loc.disabled) throw new Error(`元素 ${locatorLabel} 已被禁用 (disabled)`)
 
   const cx = loc.cx
   const cy = loc.cy
 
-  let actionResult = { ref, action, success: true }
+  let actionResult = { ...(ref ? { ref } : { selector }), action, success: true }
 
   // Step 2: 根据动作类型执行 CDP 命令
   if (action === "click") {
@@ -1424,7 +1551,7 @@ async function handleDispatchAction(params = {}) {
     await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
       type: "mouseReleased", x: cx, y: cy, button: "left", clickCount: 1,
     })
-    actionResult.detail = `已点击 ${ref} (${loc.tag}) 坐标 (${cx}, ${cy})`
+    actionResult.detail = `已点击 ${locatorLabel} (${loc.tag}) 坐标 (${cx}, ${cy})`
 
   } else if (action === "fill") {
     if (value === undefined || value === null) throw new Error("fill 动作需要提供 value 参数")
@@ -1438,7 +1565,7 @@ async function handleDispatchAction(params = {}) {
     // 全选并清空已有内容
     await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
       expression: `(function() {
-        const el = document.querySelector('[data-ghost-ref="${ref}"]');
+        const el = document.querySelector(${locatorExpression});
         if (el) { el.focus(); el.select && el.select(); }
       })()`,
     })
@@ -1449,14 +1576,14 @@ async function handleDispatchAction(params = {}) {
     // 强制触发 input/change 事件（兼容 React/Vue）
     await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
       expression: `(function() {
-        const el = document.querySelector('[data-ghost-ref="${ref}"]');
+        const el = document.querySelector(${locatorExpression});
         if (el) {
           el.dispatchEvent(new Event('input', { bubbles: true }));
           el.dispatchEvent(new Event('change', { bubbles: true }));
         }
       })()`,
     })
-    actionResult.detail = `已在 ${ref} (${loc.tag}) 中填入 "${String(value).slice(0, 50)}"`
+    actionResult.detail = `已在 ${locatorLabel} (${loc.tag}) 中填入 "${String(value).slice(0, 50)}"`
 
   } else if (action === "press") {
     // 模拟键盘按键
@@ -1464,7 +1591,7 @@ async function handleDispatchAction(params = {}) {
     // 先确保元素聚焦
     await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
       expression: `(function() {
-        const el = document.querySelector('[data-ghost-ref="${ref}"]');
+        const el = document.querySelector(${locatorExpression});
         if (el) el.focus();
       })()`,
     })
@@ -1474,7 +1601,7 @@ async function handleDispatchAction(params = {}) {
     await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
       type: "keyUp", key: keyName,
     })
-    actionResult.detail = `已在 ${ref} 上按下 ${keyName}`
+    actionResult.detail = `已在 ${locatorLabel} 上按下 ${keyName}`
 
   } else if (action === "scroll") {
     const dx = deltaX || 0
@@ -1482,36 +1609,36 @@ async function handleDispatchAction(params = {}) {
     await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
       type: "mouseWheel", x: cx, y: cy, deltaX: dx, deltaY: dy,
     })
-    actionResult.detail = `已在 ${ref} 位置滚动 (${dx}, ${dy})`
+    actionResult.detail = `已在 ${locatorLabel} 位置滚动 (${dx}, ${dy})`
 
   } else if (action === "select") {
     // 下拉框选择
     if (value === undefined) throw new Error("select 动作需要提供 value 参数")
     await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
       expression: `(function() {
-        const el = document.querySelector('[data-ghost-ref="${ref}"]');
+        const el = document.querySelector(${locatorExpression});
         if (el && el.tagName === 'SELECT') {
           el.value = ${JSON.stringify(String(value))};
           el.dispatchEvent(new Event('change', { bubbles: true }));
         }
       })()`,
     })
-    actionResult.detail = `已在 ${ref} 选择值 "${value}"`
+    actionResult.detail = `已在 ${locatorLabel} 选择值 "${value}"`
 
   } else if (action === "hover") {
     await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
       type: "mouseMoved", x: cx, y: cy,
     })
-    actionResult.detail = `已将鼠标悬停到 ${ref} (${cx}, ${cy})`
+    actionResult.detail = `已将鼠标悬停到 ${locatorLabel} (${cx}, ${cy})`
 
   } else if (action === "focus") {
     await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
       expression: `(function() {
-        const el = document.querySelector('[data-ghost-ref="${ref}"]');
+        const el = document.querySelector(${locatorExpression});
         if (el) el.focus();
       })()`,
     })
-    actionResult.detail = `已聚焦到 ${ref}`
+    actionResult.detail = `已聚焦到 ${locatorLabel}`
 
   } else {
     throw new Error(`不支持的动作类型: ${action}，可选: click/fill/press/scroll/select/hover/focus`)
@@ -1522,7 +1649,10 @@ async function handleDispatchAction(params = {}) {
     await sleep(Math.min(waitMs, 3000))
   }
 
-  // Step 4: 获取操作后状态摘要
+  return actionResult
+}
+
+async function readPageState(target) {
   const { result: afterResult } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
     expression: `(function() {
       return {
@@ -1533,11 +1663,7 @@ async function handleDispatchAction(params = {}) {
     })()`,
     returnByValue: true,
   })
-  if (afterResult?.value) {
-    actionResult.pageAfter = afterResult.value
-  }
-
-  return actionResult
+  return afterResult?.value
 }
 
 // 处理来自服务器的命令
@@ -1578,6 +1704,7 @@ async function handleCommand(message) {
     else if (command === "findByString") result = await handleFindByString(params)
     else if (command === "symbolicHints") result = await handleSymbolicHints(params)
     else if (command === "eval") result = await handleEval(params)
+    else if (command === "pageRequest") result = await handlePageRequest(params)
     else if (command === "listNetworkRequests") result = await handleListNetworkRequests(params)
     else if (command === "getNetworkDetail") result = await handleGetNetworkDetail(params)
     else if (command === "clearNetworkRequests") result = await handleClearNetworkRequests(params)
@@ -1823,6 +1950,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   return false
+})
+
+// ========== 定时兜底重连 ==========
+// offscreen 的重连循环在 daemon 重启/长时间找不到服务后偶发停摆（现象：手动点 Connect 才恢复）。
+// 每分钟检查一次连接状态，未连接则重新触发完整连接流程，保证无人值守时也能自动恢复
+chrome.alarms.create('ghost-bridge-keepalive', { delayInMinutes: 1, periodInMinutes: 1 })
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== 'ghost-bridge-keepalive') return
+  if (!state.enabled) return
+  try {
+    const status = await chrome.runtime.sendMessage({ type: 'getOffscreenStatus' }).catch(() => null)
+    if (!status || !status.connected) {
+      log('定时兜底：连接未建立，重新触发连接流程')
+      await startBridgeConnection()
+    }
+  } catch (e) {
+    log(`定时兜底重连失败：${e.message}`)
+  }
 })
 
 // ========== 唤醒探活钩子 ==========

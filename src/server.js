@@ -16,6 +16,8 @@ const BASE_PORT = Number(process.env.GHOST_BRIDGE_PORT || 33333)
 const DEFAULT_WS_TOKEN = "ghost-bridge-local"
 const WS_TOKEN = process.env.GHOST_BRIDGE_TOKEN || DEFAULT_WS_TOKEN
 const RESPONSE_TIMEOUT = 8000
+const DEFAULT_EVAL_OUTPUT_LENGTH = 8000
+const MAX_EVAL_OUTPUT_LENGTH = 50000
 const PORT_INFO_FILE = process.env.GHOST_BRIDGE_PORT_INFO || path.join(os.tmpdir(), "ghost-bridge-port.json")
 const SERVER_STARTED_AT = new Date().toISOString()
 const SERVER_ENTRY_PATH = fileURLToPath(import.meta.url)
@@ -762,6 +764,37 @@ function out(data) {
   return jsonText(compact(data))
 }
 
+function clampNumber(value, fallback, min, max) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return fallback
+  return Math.min(max, Math.max(min, Math.round(number)))
+}
+
+// eval_script 可以返回任意页面对象。统一限制序列化后的文本长度，避免一次意外的
+// DOM / bundle 返回污染后续所有模型请求；保留首尾便于判断内容类型与结束状态。
+function boundedOut(data, maxLength = DEFAULT_EVAL_OUTPUT_LENGTH) {
+  const text = out(data) ?? "undefined"
+  const limit = clampNumber(maxLength, DEFAULT_EVAL_OUTPUT_LENGTH, 200, MAX_EVAL_OUTPUT_LENGTH)
+  if (text.length <= limit) return text
+
+  const markerBudget = 100
+  const headLength = Math.max(100, Math.floor((limit - markerBudget) * 0.8))
+  const tailLength = Math.max(50, limit - markerBudget - headLength)
+  const omitted = Math.max(0, text.length - headLength - tailLength)
+  return out({
+    truncated: true,
+    originalLength: text.length,
+    content: `${text.slice(0, headLength)}\n... [已省略 ${omitted} 个字符] ...\n${text.slice(-tailLength)}`,
+    hint: "需要更多结果时请收窄返回字段；不要通过连续轮询分片获取大对象",
+  })
+}
+
+// 元数据里的 URL 常带超长 query（跟踪参数、回调地址等），输出前统一截断
+function truncateUrl(url, maxLen = 200) {
+  if (typeof url !== "string" || url.length <= maxLen) return url
+  return url.slice(0, maxLen) + "…"
+}
+
 // list_tabs 输出瘦身：URL 截断、去掉与 tabs[] 重复的 targetTab/viewingTab 对象、丢弃 windowId
 function shrinkListTabs(res, { fullUrl } = {}) {
   if (!res || !Array.isArray(res.tabs)) return res
@@ -852,7 +885,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "inspect_page",
       description:
-        "页面分析入口：返回元数据、结构计数与可交互元素数量（紧凑模式）。需要完整 page/interactive 数据传 detail:true。",
+        "页面分析入口：一次返回元数据、结构计数和少量可直接操作的元素 ref，通常无需再调用 get_interactive_snapshot。detail:true 返回完整结构。",
       inputSchema: {
         type: "object",
         properties: {
@@ -867,7 +900,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           maxElements: {
             type: "number",
-            description: "detail 模式下可交互元素上限，默认 30",
+            description: "返回可交互元素上限，默认 20",
+          },
+          includeElements: {
+            type: "boolean",
+            description: "紧凑模式是否附带可操作元素，默认 true",
           },
           detail: {
             type: "boolean",
@@ -1017,11 +1054,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "eval_script",
-      description: "在目标页执行只读 JS 表达式（谨慎使用）。",
+      description: "在目标页执行 JS。高成本工具：同一目标的读取/操作应合并进一次 code；异步代码直接返回 Promise，本工具默认等待完成，禁止写 window 临时变量后再次轮询。结果默认最多 8000 字符。",
       inputSchema: {
         type: "object",
-        properties: { target: TARGET_ARG, code: { type: "string" } },
+        properties: {
+          target: TARGET_ARG,
+          code: { type: "string", description: "JS 表达式；异步示例：(async()=>await fetch(...).then(r=>r.json()))()" },
+          awaitPromise: { type: "boolean", description: "等待 Promise 完成，默认 true" },
+          timeoutMs: { type: "number", description: "Promise 等待上限，默认 10000，最大 30000" },
+          maxOutputLength: { type: "number", description: "序列化结果字符上限，默认 8000，最大 50000" },
+        },
         required: ["code"],
+      },
+    },
+    {
+      name: "page_request",
+      description: "使用当前页面登录态发起 fetch 并等待响应，一次返回结果；页面接口调用优先用它，避免 eval_script 发起请求后再轮询。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          target: TARGET_ARG,
+          url: { type: "string", description: "相对或绝对 HTTP(S) URL" },
+          method: { type: "string", description: "默认 GET" },
+          headers: { type: "object", description: "请求头" },
+          body: { description: "字符串或 JSON 对象；对象会自动 JSON.stringify" },
+          responseType: { type: "string", enum: ["auto", "json", "text"], description: "默认 auto" },
+          timeoutMs: { type: "number", description: "默认 10000，最大 30000" },
+          maxOutputLength: { type: "number", description: "响应内容字符上限，默认 8000，最大 50000" },
+        },
+        required: ["url"],
       },
     },
     {
@@ -1103,7 +1164,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_page_content",
-      description: "提取页面文本/HTML/结构化数据，比截图轻量。默认上限 8000 字符；不够时调大 maxLength 或用 offset 翻页、selector 收窄。不反映 CSS，不含 iframe。",
+      description: "提取页面文本/HTML/结构化数据，比截图轻量。text 模式递归收集同源 iframe 文本（适合文档类页面）。默认上限 8000 字符；不够时调大 maxLength 或用 offset 翻页、selector 收窄。不反映 CSS。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1156,7 +1217,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "dispatch_action",
-      description: "对 get_interactive_snapshot 返回的 ref 执行操作：click/fill/press/scroll/select/hover/focus。⚠️ 必须先快照拿 ref；操作后建议复查页面状态。",
+      description: "执行单个或一批交互动作。可用快照 ref 或 CSS selector 定位；优先用 actions 批量完成连续填写/点击，snapshotAfter:true 可在同一次调用返回操作后元素，减少模型往返。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1164,6 +1225,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           ref: {
             type: "string",
             description: "元素 ref，如 'e1'（来自 get_interactive_snapshot）",
+          },
+          selector: {
+            type: "string",
+            description: "CSS 选择器；已知选择器时可替代 ref，省去前置快照",
           },
           action: {
             type: "string",
@@ -1189,8 +1254,42 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "number",
             description: "操作后等待 ms，默认 500，最大 3000",
           },
+          actions: {
+            type: "array",
+            maxItems: 20,
+            description: "顺序执行的动作，最多 20 个；每项支持 ref/selector、action、value/key、deltaX/deltaY、waitMs",
+            items: {
+              type: "object",
+              properties: {
+                ref: { type: "string" },
+                selector: { type: "string" },
+                action: { type: "string", enum: ["click", "fill", "press", "scroll", "select", "hover", "focus"] },
+                value: { type: "string" },
+                key: { type: "string" },
+                deltaX: { type: "number" },
+                deltaY: { type: "number" },
+                waitMs: { type: "number" },
+              },
+              required: ["action"],
+            },
+          },
+          stopOnError: {
+            type: "boolean",
+            description: "批量动作失败时立即停止，默认 true",
+          },
+          snapshotAfter: {
+            type: "boolean",
+            description: "在最后一个动作后返回新的交互快照，默认 false",
+          },
+          snapshotSelector: {
+            type: "string",
+            description: "限制操作后快照范围",
+          },
+          snapshotMaxElements: {
+            type: "number",
+            description: "操作后快照元素上限，默认 20",
+          },
         },
-        required: ["ref", "action"],
       },
     },
   ],
@@ -1201,7 +1300,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const args = request.params.arguments || {}
   try {
     if (name === "inspect_page") {
-      const { target, selector, includeInteractive = true, maxElements = 30, detail = false } = args
+      const { target, selector, includeInteractive = true, maxElements = 20, includeElements = true, detail = false } = args
       const snapshot = await askChrome("inspectPageSnapshot", {
         target,
         selector,
@@ -1222,7 +1321,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       const summary = {
         title: page?.metadata?.title,
-        url: page?.metadata?.url,
+        url: truncateUrl(page?.metadata?.url),
         description: page?.metadata?.description,
         links,
         buttons,
@@ -1230,7 +1329,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         interactiveCount,
       }
 
-      // 默认紧凑模式只返回 summary，省 token；detail:true 才附带全量 page 与 interactive
+      const elements = includeElements && Array.isArray(interactive?.elements)
+        ? interactive.elements
+        : undefined
+
+      // 紧凑模式保留少量可操作 ref，避免为了点击再做一次快照；detail:true 才附带完整页面结构
       return {
         content: [
           {
@@ -1246,8 +1349,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   }
                 : {
                     summary,
+                    interactive: elements
+                      ? { viewport: interactive?.viewport, elements }
+                      : undefined,
                     nextStepHint:
-                      "传 detail:true 查看完整 page/interactive；视觉用 capture_screenshot；交互先 get_interactive_snapshot 再 dispatch_action。",
+                      "可直接用 interactive.elements 的 ref 调 dispatch_action；连续动作放进 actions，操作后需继续定位时传 snapshotAfter:true。",
                   }
             ),
           },
@@ -1413,8 +1519,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (name === "eval_script") {
-      const res = await askChrome("eval", { target: args.target, code: args.code })
-      return { content: [{ type: "text", text: out(res) }] }
+      const timeoutMs = clampNumber(args.timeoutMs, 10000, 100, 30000)
+      const res = await askChrome("eval", {
+        target: args.target,
+        code: args.code,
+        awaitPromise: args.awaitPromise !== false,
+        timeoutMs,
+      }, { timeoutMs: timeoutMs + 3000 })
+      return { content: [{ type: "text", text: boundedOut(res, args.maxOutputLength) }] }
+    }
+
+    if (name === "page_request") {
+      const timeoutMs = clampNumber(args.timeoutMs, 10000, 100, 30000)
+      const maxOutputLength = clampNumber(args.maxOutputLength, DEFAULT_EVAL_OUTPUT_LENGTH, 200, MAX_EVAL_OUTPUT_LENGTH)
+      const res = await askChrome("pageRequest", {
+        target: args.target,
+        url: args.url,
+        method: args.method,
+        headers: args.headers,
+        body: args.body,
+        responseType: args.responseType,
+        timeoutMs,
+        maxOutputLength,
+      }, { timeoutMs: timeoutMs + 3000 })
+      return { content: [{ type: "text", text: boundedOut(res, maxOutputLength) }] }
     }
 
     if (name === "list_network_requests") {
@@ -1493,7 +1621,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const selectorExpr = selector
           ? `(document.querySelector(${JSON.stringify(selector)}) || document.body)`
           : "document.body"
-        const code = `(function(){try{var text=(${selectorExpr}).innerText||"";var start=${offset};var end=${offset + maxLength};return {content:text.slice(start,end),offset:start,totalLength:text.length,hasMore:text.length>end};}catch(e){return {error:e.message}}})()`
+        const code = `(function(){try{function ct(el){var t=el.innerText||el.textContent||"";try{var fs=el.querySelectorAll("iframe");for(var i=0;i<fs.length;i++){try{var d=fs[i].contentDocument;if(d&&d.body)t+="\\n\\n"+ct(d.body);}catch(e){}}}catch(e){}return t;}var text=ct(${selectorExpr});var start=${offset};var end=${offset + maxLength};return {content:text.slice(start,end),offset:start,totalLength:text.length,hasMore:text.length>end};}catch(e){return {error:e.message}}})()`
         const res = await askChrome("eval", { target, code })
         return { content: [{ type: "text", text: out(res) }] }
       }
@@ -1510,6 +1638,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       const res = await askChrome("getPageContent", { target, mode, selector, maxLength, includeMetadata })
+      if (typeof res?.metadata?.url === "string" && res.metadata.url.length > 200) {
+        res.metadata.url = truncateUrl(res.metadata.url)
+        res.metadata.urlTruncated = true
+      }
       return { content: [{ type: "text", text: out(res) }] }
     }
 
@@ -1520,8 +1652,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (name === "dispatch_action") {
-      const { target, ref, action, value, key, deltaX, deltaY, waitMs } = args
-      const res = await askChrome("dispatchAction", { target, ref, action, value, key, deltaX, deltaY, waitMs }, { timeoutMs: 10000 })
+      const steps = Array.isArray(args.actions) ? args.actions : [args]
+      if (!steps.length || steps.length > 20) throw new Error("actions 数量必须在 1-20 之间")
+      const totalWaitMs = steps.reduce((sum, step) => sum + clampNumber(step.waitMs, 500, 0, 3000), 0)
+      const timeoutMs = Math.min(45000, 10000 + totalWaitMs)
+      const res = await askChrome("dispatchAction", args, { timeoutMs })
       return { content: [{ type: "text", text: out(res) }] }
     }
 
