@@ -88,6 +88,8 @@ function resetDebuggerState(session) {
   session.scriptSourceCache = new Map()
   session.networkRequests = []
   session.requestMap = new Map()
+  // Target.setAutoAttach 报告的子 target（跨站 iframe/OOPIF、worker），targetId -> {type,url,title}
+  session.childTargets = new Map()
   session.lastNetworkActivityAt = Date.now()
 }
 
@@ -223,6 +225,22 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   const session = getSession(source.tabId, { create: false })
   if (!session) return
   if (!state.enabled) return
+
+  // Target.setAutoAttach 的子 target 生命周期：跨站 iframe（OOPIF）是独立调试 target，
+  // 页面内 contentDocument 因同源策略读不到，但它的 targetId 可以尝试直接 attach（跨域读取实验）。
+  // 注意：事件里的 sessionId 无法用于 chrome.debugger 路由（API 不支持），只能收集 targetId
+  if (method === "Target.attachedToTarget") {
+    const info = params?.targetInfo || {}
+    if (info.targetId) {
+      session.childTargets ||= new Map()
+      session.childTargets.set(info.targetId, { type: info.type, url: info.url || "", title: info.title || "" })
+    }
+    return
+  }
+  if (method === "Target.detachedFromTarget") {
+    if (params?.targetId) session.childTargets?.delete(params.targetId)
+    return
+  }
 
   if (method === "Debugger.scriptParsed") {
     session.scriptMap.set(params.scriptId, { url: params.url || "(inline)" })
@@ -1415,8 +1433,55 @@ async function handleInspectPageSnapshot(params = {}) {
   return value
 }
 
+// 跨域 iframe 读取：对 autoAttach 报告的 iframe 子 target 直接 attach + evaluate。
+// 实测（CDP 1.3）：chrome.debugger 接受 OOPIF 子 target 的 targetId 附加，可读取
+// 同源策略下 contentDocument 不可访问的跨域 iframe 文本。失败即置
+// crossOriginUnsupported 并放弃，不影响主流程
+async function tryMergeCrossOriginFrames(session, value, maxLength) {
+  if (!value || !value.crossOriginSkipped) return
+  session.childTargets ||= new Map()
+  const frames = [...session.childTargets.entries()].filter(([, info]) => info.type === "iframe").slice(0, 5)
+  if (!frames.length) return
+
+  // 每个 iframe 的文本预算：主预算的一半、至少 1000 字符，避免追加内容让总量失控
+  const frameBudget = Math.max(1000, Math.floor(maxLength * 0.5))
+  const merged = []
+  let failed = 0
+  for (const [targetId] of frames) {
+    const childTarget = { targetId }
+    try {
+      await chrome.debugger.attach(childTarget, "1.3")
+    } catch (e) {
+      failed++
+      value.crossOriginUnsupported = String(e?.message || e)
+      return
+    }
+    try {
+      const { result: childResult } = await chrome.debugger.sendCommand(childTarget, "Runtime.evaluate", {
+        expression: `(function(){try{return {text:((document.body&&document.body.innerText)||"").replace(/\\n{3,}/g,"\\n\\n").trim().slice(0,${frameBudget}),url:location.href,title:document.title}}catch(e){return {error:String(e&&e.message||e)}}})()`,
+        returnByValue: true,
+      })
+      const childValue = childResult?.value
+      if (childValue && !childValue.error && childValue.text) {
+        merged.push(`[跨域 iframe ${childValue.url}]\n${childValue.text}`)
+      }
+    } catch (e) {
+      failed++
+    } finally {
+      try { await chrome.debugger.detach(childTarget) } catch (e) {}
+    }
+  }
+  if (merged.length) {
+    value.content = (value.content || "") + merged.map((t) => "\n\n" + t).join("")
+    value.crossOriginMerged = merged.length
+    value.crossOriginSkipped = Math.max(0, (value.crossOriginSkipped || 0) - merged.length)
+    value.includesIframes = true
+  }
+  if (failed) value.crossOriginFailed = failed
+}
+
 async function handleGetPageContent(params = {}) {
-  const target = await ensureAttached(params)
+  const { target, session } = await ensureAttachedSession(params)
   const { mode = "text", selector, maxLength = 50000, offset = 0, includeMetadata = true } = params
   const safeMaxLength = Math.min(50000, Math.max(1, Number(maxLength) || 8000))
   const safeOffset = Math.min(100000000, Math.max(0, Math.floor(Number(offset) || 0)))
@@ -1434,6 +1499,9 @@ async function handleGetPageContent(params = {}) {
   })
 
   if (result?.value?.error) throw new Error(result.value.error)
+  if (mode === "text") {
+    await tryMergeCrossOriginFrames(session, result?.value, safeMaxLength)
+  }
   return result?.value
 }
 
