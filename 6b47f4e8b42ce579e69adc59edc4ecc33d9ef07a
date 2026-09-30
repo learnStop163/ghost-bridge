@@ -1,0 +1,104 @@
+tests/bridge-utils.test.js
+  473fe3f5a7fe4111 50-70
+scripts/reflex-loop.js
+  d8d4a7107effb11f 1-274
+extension/background.js
+  473fe3f5a7fe4111 568,573-574,578,608-609,613-619,636,1017-1019,1026-1029,1424-1426,1438,1449-1467,1469-1470,1909-1912,1941,1943
+  c5ab3195aca124d7 611
+  d8d4a7107effb11f 610,612,942-946
+tests/runtime.test.js
+  473fe3f5a7fe4111 57-87
+  d8d4a7107effb11f 88-133,135-139,156-173
+  c5ab3195aca124d7 134,140-155
+tests/reflex.test.js
+  d8d4a7107effb11f 1-174
+extension/manifest.json
+  d5d8567f396cea29 4
+scripts/jev-cjk-probe.js
+  d8d4a7107effb11f 1-356
+tests/profiler-compat.test.js
+  d5d8567f396cea29 1-71
+extension/bg-runtime.js
+  d8d4a7107effb11f 52-57,63-87
+  473fe3f5a7fe4111 16-49
+  c5ab3195aca124d7 50-51,58-62
+extension/bg-dom.js
+  473fe3f5a7fe4111 190-200,225-233,836
+scripts/reflex-engine.js
+  d8d4a7107effb11f 1-4
+.gitignore
+  d5d8567f396cea29 10-11
+package.json
+  d5d8567f396cea29 3
+tests/page-content.test.js
+  473fe3f5a7fe4111 58-113
+scripts/benchmark-mcp.js
+  473fe3f5a7fe4111 1-49
+src/bridge-utils.js
+  473fe3f5a7fe4111 111-124
+src/server.js
+  473fe3f5a7fe4111 16,26,685-690,732,736,743,851,872-873,883,889,928,934,1136,1202-1203,1225-1227,1239,1243,1251
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "6b47f4e8b42ce579e69adc59edc4ecc33d9ef07a",
+  "prompts": {
+    "473fe3f5a7fe4111": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a083f7-1bb9-7fd2-91bb-8709e3aded49",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiuban",
+      "messages": [],
+      "total_additions": 712,
+      "total_deletions": 141,
+      "accepted_lines": 626,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/e46f7c0742d2aca6d4cdb27acd66e823b10a8944db229d46c9b429f8ae9a85fc"
+    },
+    "c5ab3195aca124d7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c39f-2036-7923-bf95-3b2614cdc2f7",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiuban",
+      "messages": [],
+      "total_additions": 25,
+      "total_deletions": 5,
+      "accepted_lines": 25,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/b8dc2a6a047f8dcea83bbc7fccb7c879b21b5505f475a68068434f0b4337f81b"
+    },
+    "d5d8567f396cea29": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0efed-feae-7611-b12d-896351355499",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiuban",
+      "messages": [],
+      "total_additions": 75,
+      "total_deletions": 230,
+      "accepted_lines": 75,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/93f392c8341d90fb3d51b9e9b272c9ccce9fc162a5b811e6e65951a1b8e576a2"
+    },
+    "d8d4a7107effb11f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6699010a-38e3-4220-bd52-85bd64e41733",
+        "model": "glm-5.3"
+      },
+      "human_author": "jiuban",
+      "messages": [],
+      "total_additions": 1654,
+      "total_deletions": 351,
+      "accepted_lines": 1073,
+      "overriden_lines": 2,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/4b881ab76f1f1b771be8ec500e37def0276dc46b00b751427dfaaf1d065ee22a"
+    }
+  }
+}
