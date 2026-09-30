@@ -1,0 +1,50 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "73c1244b1838d14182466fb602b8bb694a6202b3",
+  "prompts": {
+    "473fe3f5a7fe4111": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a083f7-1bb9-7fd2-91bb-8709e3aded49",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiuban",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 321,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/e46f7c0742d2aca6d4cdb27acd66e823b10a8944db229d46c9b429f8ae9a85fc"
+    },
+    "d5d8567f396cea29": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0efed-feae-7611-b12d-896351355499",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiuban",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 414,
+      "accepted_lines": 0,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/da4c1d2c2f6b31ca7c74abd20dbfacd00b54ad8d5041cd79ae40948ee3b720bd"
+    },
+    "d8d4a7107effb11f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6699010a-38e3-4220-bd52-85bd64e41733",
+        "model": "glm-5.3"
+      },
+      "human_author": "jiuban",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 157,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/4b881ab76f1f1b771be8ec500e37def0276dc46b00b751427dfaaf1d065ee22a"
+    }
+  }
+}
