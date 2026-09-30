@@ -187,6 +187,17 @@
         targetElement = resolveTargetElement();
         if (targetElement?.error) return targetElement;
 
+        const frameNodes = targetElement.querySelectorAll('iframe');
+        result.frames = Array.from(frameNodes).slice(0, 3).map((frame, index) => {
+          let readable = 'in-page';
+          // A source is only a bridge candidate; target availability is not known here.
+          try {
+            if (!frame.contentDocument) readable = frame.src ? 'via-bridge' : 'no';
+          } catch (_) { readable = frame.src ? 'via-bridge' : 'no'; }
+          return { index, title: (frame.getAttribute('title') || '').slice(0, 80), readable };
+        });
+        result.iframeCount = frameNodes.length;
+        result.framesOmitted = Math.max(0, frameNodes.length - result.frames.length);
         result.metadata = getMetadata();
         const structured = buildStructuredContent(targetElement);
 
@@ -209,6 +220,15 @@
         return { error: e.message };
       }
     })()`
+  }
+
+  // Both reads use one page evaluation; a text failure does not discard the summary.
+  function buildInspectWithTextExpression(options) {
+    const inspect = buildInspectPageExpression(options)
+    if (!options.includeText) return inspect
+    const text = buildPageContentExpression({ mode: 'text', selector: options.selector,
+      maxLength: options.textMaxLength, offset: 0, includeMetadata: false })
+    return `(()=>{const snapshot=${inspect};if(!snapshot.error)snapshot.text=${text};return snapshot;})()`
   }
 
   function buildPageContentExpression({ mode, selector, maxLength, offset = 0, includeMetadata }) {
@@ -813,6 +833,7 @@
 
   global.GhostBridgeDom = {
     buildInspectPageExpression,
+    buildInspectWithTextExpression,
     buildPageContentExpression,
     buildInteractiveSnapshotExpression,
     buildInstallLocatorRuntimeExpression,

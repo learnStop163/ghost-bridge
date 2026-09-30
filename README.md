@@ -32,7 +32,7 @@ ghost-bridge init
 
 `ghost-bridge init` currently writes config for:
 
-- Claude Code: `~/.claude/settings.json` or `~/.claude.json`
+- Claude Code: `~/.claude.json`
 - Codex: `~/.codex/config.toml`
 - Cursor: `~/.cursor/mcp.json`
 - Antigravity: `~/.gemini/antigravity/mcp.json`
@@ -76,10 +76,10 @@ ghost-bridge extension --open
 
 ### 3. Connect
 
-1. Click the Ghost Bridge extension icon
-2. Click `Connect`
+1. Open your configured MCP client, or run `ghost-bridge start`, to start the service
+2. Click the Ghost Bridge extension icon and click `Connect`
 3. Wait until the status becomes `ON`
-4. Open your MCP client and start working on the current page
+4. Start working on the current page from your MCP client
 
 Typical prompts:
 
@@ -92,7 +92,8 @@ Typical prompts:
 
 | Tool | Purpose |
 |------|---------|
-| `inspect_page` | Default entry point for page analysis |
+| `inspect_page` | Compact page analysis, actionable refs, and shallow iframe summaries |
+| `get_server_info` | Check client and daemon versions, paths, and connection status |
 | `capture_screenshot` | Visual inspection and UI debugging |
 | `get_page_content` | Text, HTML, and structured DOM extraction |
 | `get_interactive_snapshot` | Find clickable and editable elements |
@@ -112,6 +113,8 @@ Typical prompts:
 | `get_last_error` | Inspect recent console, exception, and network error events |
 | `get_script_source` | Extract page scripts |
 | `find_by_string` | Search within bundled script content |
+| `symbolic_hints` | Collect resource and runtime clues for debugging |
+| `clear_network_requests` | Clear captured network request records |
 | `coverage_snapshot` | Identify active scripts quickly |
 | `perf_metrics` | Collect Web Vitals and engine metrics |
 
@@ -164,7 +167,7 @@ Locator fields are `css`, `testId`, `role` + `name`, `label`, `placeholder`, `te
 - `networkIdle`: optional `idleMs`
 - `expression`: a truthy JavaScript expression, including a returned Promise
 
-Polling happens inside the extension at a short interval, so it does not create repeated model/tool turns. Each condition defaults to 10 seconds and is capped at 30 seconds. The whole batch has a hard deadline of at most 60 seconds; once reached, remaining actions are not executed. Fixed `waitMs` remains for compatibility but defaults to zero.
+Polling happens inside the extension at a short interval, so it does not create repeated model/tool turns. Each condition defaults to 10 seconds and is capped at 30 seconds. The batch execution budget is capped at 60 seconds; deadline checks prevent subsequent actions from starting after it expires. An in-flight CDP command is not necessarily interrupted at that deadline. Fixed `waitMs` remains for compatibility but defaults to zero.
 
 For API calls that need the page's login state, prefer `page_request`. If custom asynchronous JavaScript is still needed, return the promise from `eval_script` instead of storing a result on `window` and polling it in another tool call:
 
@@ -179,9 +182,9 @@ For API calls that need the page's login state, prefer `page_request`. If custom
 Notes:
 
 - Use `bind_tab` when a workflow spans multiple pages. For example, bind a checklist page as `cases` and a business page as `app`, then call tools with `target: "cases"` or `target: "app"`.
-- All browser tools accept an optional `target` parameter. When named targets are bound, `dispatch_action` requires `target` so refs from one page are not accidentally used on another page.
-- Semantic locators traverse open Shadow DOM and readable same-origin iframes. Cross-origin iframe DOM is not accessible and is skipped explicitly.
-- `get_page_content` reports iframe counters and uses contiguous `offset`/`maxLength` slices, so pagination does not duplicate or skip the hidden middle of a head/tail truncation.
+- Page-scoped inspection and action tools accept an optional `target` parameter; tab listing, binding, and pinning tools manage targets separately. When named targets are bound, `dispatch_action` requires `target` so refs from one page are not accidentally used on another page.
+- Semantic locators traverse open Shadow DOM and readable same-origin iframes. They do not traverse cross-origin iframe DOM. Text extraction can separately attempt bridge-based access as described below.
+- `get_page_content` uses contiguous `offset`/`maxLength` slices for the main document and collected same-origin text. Cross-origin supplements are not part of that pagination stream.
 - Use `pin_current_tab` when you are debugging a page and need to switch to other tabs without changing the AI target. Use `unpin_tab` to restore the original follow-focused-tab behavior.
 - `list_network_requests` and `get_network_detail` automatically summarize `data:` URLs and very long URLs so inline images or oversized query strings do not overwhelm model context
 
@@ -193,13 +196,83 @@ Bind the tab whose title contains "Orders" as app.
 Read the next case from target cases, operate target app, then mark the case passed or failed back on target cases.
 ```
 
+## Iframe Summaries and Content Budgets
+
+The compact `inspect_page` response shares an 8000-character budget across the page summary, iframe summaries, and interactive entries. It includes at most three iframe summaries in the selected scope, without reading their bodies by default. `framesOmitted` counts frames beyond that limit; `elementsOmitted` counts interactive entries removed to fit the budget. `detail:true` returns the full result without this compact budget. Character counts are not token counts.
+
+When both structure and body text are needed for the same scope, request them together:
+
+```json
+{
+  "target": "app",
+  "includeText": true,
+  "textMaxLength": 1500,
+  "includeInteractive": false
+}
+```
+
+This is an `inspect_page` call; bind `app` first or omit `target` to use the current target.
+`includeText` defaults to false. When enabled, `text` contains the text result and iframe
+budget fields, using the same selector as the summary. `textMaxLength` defaults to 1500
+characters and is capped at 3000. Both reads share one page evaluation; cross-origin
+supplements may require additional internal CDP calls. The compact response still shares
+the 8000-character output budget and drops interactive entries first when necessary.
+For longer text or pagination, use `get_page_content`. If the summary is needed to decide
+which scope to read, keep those calls separate. Combining reads reduces external tool
+calls; it does not change client approval settings or guarantee lower approval latency.
+
+The iframe `readable` field is a string:
+
+| Value | Meaning | Next step |
+|-------|---------|-----------|
+| `in-page` | `contentDocument` is accessible | Read through the page context |
+| `via-bridge` | Inaccessible in-page, but has a source URL | Try `get_page_content`; bridge access is not guaranteed |
+| `no` | Currently inaccessible and has no source URL | Check loading state before retrying |
+
+Compare these strings explicitly: all three are truthy in JavaScript. An accessible blank iframe is still `in-page`. The index is the current DOM order within the selected scope, not a stable handle or a tool input for selecting a frame.
+
+In text mode, `get_page_content` collects same-origin iframe text and attempts to append up to five discovered cross-origin iframe targets. Access depends on Chrome support and a target that can be attached. A `via-bridge` summary alone does not prove this target exists.
+
+Cross-origin supplements use only the remaining `maxLength` budget, including `[跨域 iframe N]` labels and separators. When no space remains, the tool skips further reads:
+
+- `crossOriginMerged`: frames whose body text was actually retained.
+- `crossOriginBudgetSkipped`: candidate frames skipped because the budget was exhausted.
+- `crossOriginTruncated`: a returned frame body was incomplete.
+- `crossOriginFailed`: attempted frame reads that failed.
+
+Supplements appear only at `offset=0`. `contentLength`, `offset`, and `hasMore` describe the main document and same-origin text stream, not cross-origin pagination. Cross-origin candidates come from tab-level debugger state and are not correlated with the supplied CSS `selector`; the tool does not currently provide a cross-origin frame selector. In particular, a long main document may leave no room for a supplement.
+
+## Performance Diagnostics
+
+Reduce repeated calls by using the action batches, `waitFor`, and `snapshotAfter` shown above. Prefer `page_request` for page-context requests, and reserve `eval_script` for logic the dedicated tools cannot express. Tool annotations describe capabilities; they do not grant permission or guarantee that a client skips approval.
+
+With `GHOST_BRIDGE_DIAGNOSTICS=1`, the MCP session process writes `[ghost-timing]` JSON lines to stderr containing a request ID, command name, bridge duration, result character count, and failure status. These diagnostic lines do not contain scripts, page bodies, or authentication tokens. They are emitted on responses; a transport timeout may have no corresponding timing line.
+
+With the updated extension, the `extension` field also reports `commandMs` and the extension version. Commands that attach include `attachSessionMs`, `lockMs`, and `resolveMs`; `eval_script` additionally includes `evaluateMs`. `attachSessionMs` includes lock waiting and target resolution: do not add them together. Older extensions omit these fields.
+
+Bridge timing starts in the Ghost client when it dispatches a command. It does not measure preceding model generation or client approval. Compare it with caller-side elapsed time before deciding which part to optimize.
+
+From a source checkout, run the local MCP benchmark:
+
+```bash
+npm run build
+node scripts/benchmark-mcp.js /absolute/path/to/dist/server.js TAB_ID 5
+```
+
+Use a tab ID from `list_tabs`. The script creates an independent MCP session, binds that tab, and measures service status, a small read-only expression, and page inspection without interactive scanning. It reports client connection time, versions, sample durations, and result character counts, without page content. Use the same port, token, and temporary-directory environment as the real MCP client. A disconnected extension or stale tab ID causes the benchmark to fail.
+
+This measures the local MCP path, not the client's approval system. The server entry can start a daemon if none is found. Reload the updated extension before collecting extension-stage timings; building Node files alone does not reload it.
+
 ## Configuration
 
 | Setting | Default | Notes |
 |---------|---------|-------|
 | Port | `33333` | Set `GHOST_BRIDGE_PORT` to override |
-| Token | Monthly UUID | Set `GHOST_BRIDGE_TOKEN` to override |
-| Auto detach | `false` | Keeps debugger attached for ongoing capture |
+| Token | `ghost-bridge-local` | `GHOST_BRIDGE_TOKEN` overrides the server token; the extension must use the same value |
+| Auto detach | `false` | Extension configuration; keeps debugger attached for ongoing capture |
+| Diagnostics | Off | Set `GHOST_BRIDGE_DIAGNOSTICS=1` in the MCP session process environment |
+
+The extension token is currently set in `extension/background.js` (`CONFIG.token`); there is no popup token setting. Changing only the server environment will cause authentication failures.
 
 ## Architecture
 
@@ -225,14 +298,16 @@ The WebSocket service runs as a detached daemon, independent of any MCP session:
 
 ## Troubleshooting
 
-If the popup shows `No Bridge` / `Not Found`, it means the Chrome extension could not find a Ghost Bridge WebSocket service on the configured port. With the resident daemon this normally only happens before the first MCP session of the day starts, or after `ghost-bridge stop`. Starting any MCP session (or reconnecting the extension) brings the service back within seconds.
+If the popup shows `No Bridge` / `Not Found`, the extension could not find a service on its configured port. Start a configured MCP client or run `ghost-bridge start`, then reconnect the extension. Reconnecting the extension alone does not start the Node daemon.
 
 Run `ghost-bridge status` and check:
 
 - `Active WebSocket Service`: the running server path should match the CLI/package you expect
 - `Chrome Extension > Sync`: the installed extension should match the current package
 
-If either is out of sync, run `ghost-bridge init`, reload the Chrome extension, and restart the MCP client so the browser, extension copy, and server process all point at the same build.
+If either is out of sync, run `ghost-bridge init` from the intended installation and reload the Chrome extension. If the resident daemon still reports an older version/path, close connected MCP clients, run `ghost-bridge stop`, then `ghost-bridge start` from that installation and reopen the clients. Restarting a client alone can reconnect it to the old daemon.
+
+For a source checkout, build first. Building `dist/` does not update the extension copy already loaded by Chrome.
 
 ## Limitations
 

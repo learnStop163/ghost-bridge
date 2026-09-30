@@ -13,6 +13,7 @@ import { fileURLToPath } from "url"
 import { GHOST_BRIDGE_VERSION } from "../lib/version.js"
 import {
   boundedOut,
+  compactInspectOutput,
   calculateDispatchBudget,
   clampNumber,
   out,
@@ -22,6 +23,7 @@ import { DISPATCH_ACTION_TOOL } from "./tool-schemas.js"
 const BASE_PORT = Number(process.env.GHOST_BRIDGE_PORT || 33333)
 const DEFAULT_WS_TOKEN = "ghost-bridge-local"
 const WS_TOKEN = process.env.GHOST_BRIDGE_TOKEN || DEFAULT_WS_TOKEN
+const DIAGNOSTICS = process.env.GHOST_BRIDGE_DIAGNOSTICS === "1"
 const RESPONSE_TIMEOUT = 8000
 const DEFAULT_EVAL_OUTPUT_LENGTH = 8000
 const MAX_EVAL_OUTPUT_LENGTH = 50000
@@ -680,7 +682,12 @@ function handleIncoming(data) {
   }
   const { id, result, error } = payload
   if (!id || !pendingRequests.has(id)) return
-  const { resolve, reject, timer } = pendingRequests.get(id)
+  const { resolve, reject, timer, diagnostic } = pendingRequests.get(id)
+  if (diagnostic) console.error('[ghost-timing] ' + JSON.stringify({
+    id, command: diagnostic.command, bridgeMs: performance.now() - diagnostic.started,
+    extension: payload.diagnostics, failed: Boolean(error),
+    resultChars: JSON.stringify(result ?? null).length,
+  }))
   clearTimeout(timer)
   pendingRequests.delete(id)
   if (error) reject(new Error(error))
@@ -722,17 +729,18 @@ async function askChrome(command, params = {}, options = {}) {
     )
   }
   const id = crypto.randomUUID()
-  const payload = { id, command, params, clientId: LOCAL_CLIENT_ID }
+  const payload = { id, command, params: { ...params, ...(DIAGNOSTICS ? { _diagnostics: true } : {}) }, clientId: LOCAL_CLIENT_ID }
   if (WS_TOKEN) payload.token = WS_TOKEN
   const timeoutMs = options.timeoutMs || RESPONSE_TIMEOUT
 
+  const diagnostic = DIAGNOSTICS ? { command, started: performance.now() } : undefined
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       pendingRequests.delete(id)
       reject(new Error(`请求超时(${timeoutMs}ms)：${command}`))
     }, timeoutMs)
 
-    pendingRequests.set(id, { resolve, reject, timer })
+    pendingRequests.set(id, { resolve, reject, timer, diagnostic })
 
     activeConnection.send(JSON.stringify(payload), (err) => {
       if (err) {
@@ -840,7 +848,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "inspect_page",
       description:
-        "页面分析入口：一次返回元数据、结构计数和少量可直接操作的元素 ref，通常无需再调用 get_interactive_snapshot。detail:true 返回完整结构。",
+        "页面分析入口：一次返回元数据、结构计数和少量可直接操作的元素 ref，附带最多3个iframe摘要；includeText:true同次读取限长正文，省去额外调用。via-bridge表示可用get_page_content尝试跨域读取。已有locator直接用dispatch_action。detail:true返回完整结构。",
       inputSchema: {
         type: "object",
         properties: {
@@ -861,6 +869,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "boolean",
             description: "紧凑模式是否附带可操作元素，默认 true",
           },
+          includeText: { type: "boolean", description: "同次读取正文，默认false；需要根据摘要选择范围时分步读取" },
+          textMaxLength: { type: "integer", minimum: 1, maximum: 3000, description: "正文字符预算，默认1500；更多内容用get_page_content" },
           detail: {
             type: "boolean",
             description: "默认 false 只返回紧凑 summary；true 返回全量 page 与 interactive",
@@ -870,11 +880,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_server_info",
+      annotations: { readOnlyHint: true, destructiveHint: false },
       description: "服务器状态：WebSocket 端口、Chrome 连接与会话数。",
       inputSchema: { type: "object", properties: {} },
     },
     {
       name: "list_tabs",
+      annotations: { readOnlyHint: true, destructiveHint: false },
       description: "列出标签页与当前目标模式。URL 超长自动截断，fullUrl:true 输出完整。",
       inputSchema: {
         type: "object",
@@ -913,11 +925,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "list_targets",
+      annotations: { readOnlyHint: true, destructiveHint: false },
       description: "查看已绑定 targets 与默认目标状态。",
       inputSchema: { type: "object", properties: {} },
     },
     {
       name: "get_target_tab",
+      annotations: { readOnlyHint: true, destructiveHint: false },
       description: "查看当前操作目标（focused 跟随聚焦页 / pinned 锁定）。",
       inputSchema: { type: "object", properties: {} },
     },
@@ -1119,7 +1133,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_page_content",
-      description: "提取页面文本/HTML/结构化数据，比截图轻量。text 模式递归收集同源 iframe 文本（适合文档类页面）。默认上限 8000 字符；不够时调大 maxLength 或用 offset 翻页、selector 收窄。不反映 CSS。",
+      description: "提取页面文本/HTML/结构化数据，比截图轻量。text自动收集同源iframe，并尝试合并跨域正文（[跨域 iframe N]标记，需子target可附加）。默认maxLength=8000，预算不足明确报告省略；跨域补充仅offset=0，不参与分页。不反映CSS。",
       inputSchema: {
         type: "object",
         properties: {
@@ -1185,6 +1199,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         selector,
         includeInteractive,
         maxElements,
+        includeText: args.includeText === true,
+        textMaxLength: clampNumber(args.textMaxLength, 1500, 1, 3000),
       })
       const page = snapshot?.page
       const interactive = snapshot?.interactive ?? null
@@ -1206,6 +1222,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         buttons,
         forms,
         interactiveCount,
+        iframeCount: snapshot?.iframeCount,
+        frames: snapshot?.frames,
+        framesOmitted: snapshot?.framesOmitted,
       }
 
       const elements = includeElements && Array.isArray(interactive?.elements)
@@ -1217,10 +1236,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: out(
+            text: (detail ? out : compactInspectOutput)(
               detail
                 ? {
                     summary,
+                    text: snapshot?.text,
                     page,
                     interactive,
                     nextStepHint:
@@ -1228,6 +1248,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   }
                 : {
                     summary,
+                    text: snapshot?.text,
                     interactive: elements
                       ? { viewport: interactive?.viewport, elements }
                       : undefined,

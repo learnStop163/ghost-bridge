@@ -565,13 +565,17 @@ function withTimeout(promise, ms, label) {
 }
 
 async function ensureAttachedSession(params = {}) {
+  const started = performance.now()
   let _release
   const _prev = _attachLock
   _attachLock = new Promise(r => _release = r)
   await _prev
+  if (params._timing) params._timing.lockMs = performance.now() - started
+  const resolving = performance.now()
   try {
     if (!state.enabled) throw new Error("扩展已暂停，点击图标开启后再试")
     const tab = await resolveTargetTab(params)
+    if (params._timing) params._timing.resolveMs = performance.now() - resolving
     const client = getClientSession(params.clientId)
     const isFocusedDefaultTarget = !params.target && params.tabId === undefined && client.targetMode === 'focused'
     if (isFocusedDefaultTarget && focusedTabId !== null && focusedTabId !== tab.id && !isTabReferenced(focusedTabId)) {
@@ -601,12 +605,18 @@ async function ensureAttachedSession(params = {}) {
       resetDebuggerState(session)
       try {
         await withTimeout((async () => {
-          await chrome.debugger.sendCommand({ tabId: session.tabId }, "Runtime.enable")
-          await chrome.debugger.sendCommand({ tabId: session.tabId }, "Log.enable")
-          await chrome.debugger.sendCommand({ tabId: session.tabId }, "Console.enable").catch(() => {})
-          await chrome.debugger.sendCommand({ tabId: session.tabId }, "Debugger.enable")
-          await chrome.debugger.sendCommand({ tabId: session.tabId }, "Profiler.enable")
-          await chrome.debugger.sendCommand({ tabId: session.tabId }, "Network.enable").catch(() => {})
+          // These domains are independent. Enabling them in parallel removes several
+          // debugger round-trip latencies from the first command on a tab.
+          // Profiler is deliberately absent: not every browser exposes it over
+          // chrome.debugger (some backends return -32601), and only coverage_snapshot
+          // needs it, so it is enabled on demand there instead.
+          await Promise.all([
+            chrome.debugger.sendCommand({ tabId: session.tabId }, "Runtime.enable"),
+            chrome.debugger.sendCommand({ tabId: session.tabId }, "Log.enable"),
+            chrome.debugger.sendCommand({ tabId: session.tabId }, "Console.enable").catch(() => {}),
+            chrome.debugger.sendCommand({ tabId: session.tabId }, "Debugger.enable"),
+            chrome.debugger.sendCommand({ tabId: session.tabId }, "Network.enable").catch(() => {}),
+          ])
 
           // Enable auto-attach to sub-targets (iframes, workers) for comprehensive capture
           await chrome.debugger.sendCommand({ tabId: session.tabId }, "Target.setAutoAttach", {
@@ -623,6 +633,7 @@ async function ensureAttachedSession(params = {}) {
     }
     attachedTabId = session.tabId
     if (isFocusedDefaultTarget) focusedTabId = session.tabId
+    if (params._timing) params._timing.attachSessionMs = performance.now() - started
     return { target: { tabId: session.tabId }, session, tab }
   } finally {
     _release()
@@ -928,24 +939,12 @@ async function handleGetScriptSource(params = {}) {
 
 async function handleCoverageSnapshot(params = {}) {
   const target = await ensureAttached(params)
-  const durationMs = params.durationMs || 1500
-  await chrome.debugger.sendCommand(target, "Profiler.startPreciseCoverage", {
-    callCount: true,
-    detailed: true,
+  return GhostBridgeRuntime.collectCoverage({
+    sendCommand: chrome.debugger.sendCommand.bind(chrome.debugger),
+    target,
+    durationMs: params.durationMs || 1500,
+    sleep,
   })
-  await sleep(durationMs)
-  const { result } = await chrome.debugger.sendCommand(target, "Profiler.takePreciseCoverage")
-  await chrome.debugger.sendCommand(target, "Profiler.stopPreciseCoverage")
-
-  const simplified = result
-    .map((item) => {
-      const totalCount = item.functions.reduce((sum, f) => sum + (f.callCount || 0), 0)
-      return { url: item.url || "(inline)", scriptId: item.scriptId, totalCount }
-    })
-    .sort((a, b) => b.totalCount - a.totalCount)
-    .slice(0, 20)
-
-  return { topScripts: simplified, rawCount: result.length }
 }
 
 function findContexts(source, query, maxMatches) {
@@ -1015,14 +1014,19 @@ async function handleEval(params = {}) {
   const timeoutMs = Math.min(30000, Math.max(100, Number(params.timeoutMs) || 10000))
   // Runtime.evaluate.timeout is enforced inside V8. The outer transport timeout is only
   // a safety margin for an unresponsive tab and no longer leaves normal timed-out code running.
-  return GhostBridgeRuntime.evaluateScript({
+  const executing = performance.now()
+  try {
+    return await GhostBridgeRuntime.evaluateScript({
     sendCommand: chrome.debugger.sendCommand.bind(chrome.debugger),
     target,
     code: params.code,
     awaitPromise: params.awaitPromise !== false,
     timeoutMs,
     withTimeout,
-  })
+    })
+  } finally {
+    if (params._timing) params._timing.evaluateMs = performance.now() - executing
+  }
 }
 
 async function handlePageRequest(params = {}) {
@@ -1417,7 +1421,9 @@ async function handleCaptureScreenshot(params = {}) {
 async function handleInspectPageSnapshot(params = {}) {
   const { target, session } = await ensureAttachedSession(params)
   const { selector, includeInteractive = true, maxElements = 30 } = params
-  const expression = GhostBridgeDom.buildInspectPageExpression({ selector, includeInteractive, maxElements })
+  const textMaxLength = Math.min(3000, Math.max(1, Math.floor(Number(params.textMaxLength) || 1500)))
+  const expression = GhostBridgeDom.buildInspectWithTextExpression({ selector, includeInteractive, maxElements,
+    includeText: params.includeText === true, textMaxLength })
 
   const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
     expression,
@@ -1429,6 +1435,7 @@ async function handleInspectPageSnapshot(params = {}) {
   if (value) {
     value.target = describeCommandTarget(params, session)
     value.tabId = session.tabId
+    if (value.text && !value.text.error) await tryMergeCrossOriginFrames(session, value.text, textMaxLength)
   }
   return value
 }
@@ -1439,45 +1446,28 @@ async function handleInspectPageSnapshot(params = {}) {
 // crossOriginUnsupported 并放弃，不影响主流程
 async function tryMergeCrossOriginFrames(session, value, maxLength) {
   if (!value || !value.crossOriginSkipped) return
-  session.childTargets ||= new Map()
-  const frames = [...session.childTargets.entries()].filter(([, info]) => info.type === "iframe").slice(0, 5)
-  if (!frames.length) return
-
-  // 每个 iframe 的文本预算：主预算的一半、至少 1000 字符，避免追加内容让总量失控
-  const frameBudget = Math.max(1000, Math.floor(maxLength * 0.5))
-  const merged = []
-  let failed = 0
-  for (const [targetId] of frames) {
-    const childTarget = { targetId }
-    try {
-      await chrome.debugger.attach(childTarget, "1.3")
-    } catch (e) {
-      failed++
-      value.crossOriginUnsupported = String(e?.message || e)
-      return
-    }
-    try {
-      const { result: childResult } = await chrome.debugger.sendCommand(childTarget, "Runtime.evaluate", {
-        expression: `(function(){try{return {text:((document.body&&document.body.innerText)||"").replace(/\\n{3,}/g,"\\n\\n").trim().slice(0,${frameBudget}),url:location.href,title:document.title}}catch(e){return {error:String(e&&e.message||e)}}})()`,
-        returnByValue: true,
-      })
-      const childValue = childResult?.value
-      if (childValue && !childValue.error && childValue.text) {
-        merged.push(`[跨域 iframe ${childValue.url}]\n${childValue.text}`)
+  return GhostBridgeRuntime.mergeFrames({
+    value, maxLength,
+    frames: [...(session.childTargets || new Map()).entries()].filter(([, info]) => info.type === 'iframe').slice(0, 5),
+    read: async (targetId, budget) => {
+      const child = { targetId }
+      let abandoned = false
+      const attaching = chrome.debugger.attach(child, '1.3')
+      attaching.then(() => { if (abandoned) chrome.debugger.detach(child).catch(() => {}) }, () => {})
+      try { await withTimeout(attaching, 2000, 'iframe attach') }
+      catch (error) { abandoned = true; throw error }
+      try {
+        const { result, exceptionDetails } = await withTimeout(chrome.debugger.sendCommand(child, 'Runtime.evaluate', {
+          expression: `(()=>{const t=(document.body?.innerText||'').trim();return {text:t.slice(0,${budget}),truncated:t.length>${budget}}})()`,
+          returnByValue: true, timeout: 2000,
+        }), 2500, 'iframe evaluate')
+        if (exceptionDetails) throw new Error('iframe evaluation failed')
+        return result?.value
+      } finally {
+        await withTimeout(chrome.debugger.detach(child), 1000, 'iframe detach').catch(() => {})
       }
-    } catch (e) {
-      failed++
-    } finally {
-      try { await chrome.debugger.detach(childTarget) } catch (e) {}
-    }
-  }
-  if (merged.length) {
-    value.content = (value.content || "") + merged.map((t) => "\n\n" + t).join("")
-    value.crossOriginMerged = merged.length
-    value.crossOriginSkipped = Math.max(0, (value.crossOriginSkipped || 0) - merged.length)
-    value.includesIframes = true
-  }
-  if (failed) value.crossOriginFailed = failed
+    },
+  })
 }
 
 async function handleGetPageContent(params = {}) {
@@ -1916,7 +1906,10 @@ async function handleCommand(message) {
   }
   // 命令所属的 MCP 会话：pin/bind 的命名空间按它隔离
   const clientId = message.clientId
-  const params = { ...(message.params || {}), clientId }
+  const started = performance.now()
+  const timing = message.params?._diagnostics ? {} : undefined
+  const diagnostics = () => timing ? { ...timing, commandMs: performance.now() - started, extensionVersion: chrome.runtime.getManifest().version } : undefined
+  const params = { ...(message.params || {}), clientId, _timing: timing }
   try {
     let result
     if (command === "listTabs") result = await handleListTabs(params)
@@ -1945,9 +1938,9 @@ async function handleCommand(message) {
     else if (command === "dispatchAction") result = await handleDispatchAction(params)
     else throw new Error(`未知指令 ${command}`)
 
-    sendToServer({ id, result })
+    sendToServer({ id, result, diagnostics: diagnostics() })
   } catch (e) {
-    sendToServer({ id, error: e.message })
+    sendToServer({ id, error: e.message, diagnostics: diagnostics() })
   } finally {
     await maybeDetach()
   }

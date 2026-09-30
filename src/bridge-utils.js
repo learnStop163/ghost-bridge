@@ -108,3 +108,17 @@ export function calculateDispatchBudget(args = {}) {
     serverTimeoutMs: executionTimeoutMs + 5000,
   }
 }
+
+// Preserve actionable entries as objects, never truncate serialized JSON mid-entry.
+export function compactInspectOutput(value, limit = 8000) {
+  const copy = JSON.parse(JSON.stringify(value))
+  const elements = copy.interactive?.elements
+  for (const field of ['title', 'url', 'description']) {
+    if (typeof copy.summary?.[field] === 'string') copy.summary[field] = copy.summary[field].slice(0, 240)
+  }
+  while (elements?.length && out(copy).length > limit) {
+    elements.pop()
+    copy.elementsOmitted = (copy.elementsOmitted || 0) + 1
+  }
+  return boundedOut(copy, limit)
+}
