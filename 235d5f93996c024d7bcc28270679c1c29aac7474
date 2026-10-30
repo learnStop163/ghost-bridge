@@ -1,0 +1,54 @@
+extension/manifest.json
+  f297957a17775904 4
+package.json
+  f297957a17775904 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "235d5f93996c024d7bcc28270679c1c29aac7474",
+  "prompts": {
+    "473fe3f5a7fe4111": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a083f7-1bb9-7fd2-91bb-8709e3aded49",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiuban",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 321,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/e46f7c0742d2aca6d4cdb27acd66e823b10a8944db229d46c9b429f8ae9a85fc"
+    },
+    "d8d4a7107effb11f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6699010a-38e3-4220-bd52-85bd64e41733",
+        "model": "glm-5.3"
+      },
+      "human_author": "jiuban",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 157,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/4b881ab76f1f1b771be8ec500e37def0276dc46b00b751427dfaaf1d065ee22a"
+    },
+    "f297957a17775904": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a18b69-18e9-7352-b8c2-4163fad488a7",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "jiuban",
+      "messages": [],
+      "total_additions": 2,
+      "total_deletions": 2,
+      "accepted_lines": 2,
+      "overriden_lines": 0,
+      "messages_url": "https://tripartite-bff.tsign.cn/cas/66d408eb37859b134c45d8a9e28e11a4ed6c2bb470faee3fd332eb639c150fb3"
+    }
+  }
+}
