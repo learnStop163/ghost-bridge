@@ -272,7 +272,10 @@ disconnectBtn.addEventListener('click', async () => {
   }
 })
 
-fetchStatus()
+// Finish the popup's initial task before waking the background service worker
+// and querying tab state. Chrome can paint the shell first, so the panel does
+// not wait for the status round trip to become visible.
+setTimeout(fetchStatus, 0)
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === 'statusUpdate') {

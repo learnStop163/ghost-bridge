@@ -53,6 +53,13 @@ async function cleanupClientSession(clientId) {
 
 let state = { enabled: false, connected: false, port: null, currentPort: null, connectionStatus: 'disconnected', connectionError: '', serverInfo: null }
 
+// 连接生命周期代际：用户 Connect/Stop 都会推进一次。异步启动/清理流程完成后，
+// 必须确认自己仍属于当前代际，避免旧操作覆盖更新的用户意图。
+let connectionEpoch = 0
+// Stop 是用户意图，不只是一瞬间的状态变更。它必须持续到下一次显式 Connect，
+// 否则一个在 Stop 之后才读到旧 bridgeEnabled=true 的 restore 仍可能重新启用连接。
+let stopRequested = false
+
 // 待处理的请求（等待 offscreen 响应）
 const pendingRequests = new Map()
 
@@ -117,9 +124,20 @@ function log(msg) {
 // ========== Offscreen Document 管理 ==========
 
 let offscreenCreating = null
+let offscreenClosing = null
 
-async function setupOffscreenDocument() {
+async function waitForOffscreenClose() {
+  if (offscreenClosing) await offscreenClosing
+}
+
+async function setupOffscreenDocument(expectedEpoch = connectionEpoch) {
   const offscreenUrl = chrome.runtime.getURL('offscreen.html')
+  if (expectedEpoch !== connectionEpoch) return false
+
+  // Stop 和新的 Connect 可能交错执行。新的连接必须等旧 offscreen 完全关闭后
+  // 再检查/创建文档，否则 closeDocument 可能误关掉刚建立的新连接。
+  await waitForOffscreenClose()
+  if (expectedEpoch !== connectionEpoch) return false
 
   // 检查是否已存在
   const existingContexts = await chrome.runtime.getContexts({
@@ -127,37 +145,67 @@ async function setupOffscreenDocument() {
     documentUrls: [offscreenUrl]
   }).catch(() => [])
 
+  await waitForOffscreenClose()
+  if (expectedEpoch !== connectionEpoch) return false
+
   if (existingContexts.length > 0) {
-    return
+    return true
   }
 
   // 防止并发创建
   if (offscreenCreating) {
     await offscreenCreating
-    return
+    return expectedEpoch === connectionEpoch
   }
 
-  offscreenCreating = chrome.offscreen.createDocument({
+  if (expectedEpoch !== connectionEpoch) return false
+
+  const creating = chrome.offscreen.createDocument({
     url: 'offscreen.html',
     reasons: ['WORKERS'],  // 使用 WORKERS 作为理由
     justification: 'Maintain WebSocket connection to ghost-bridge server'
   })
-
-  await offscreenCreating
-  offscreenCreating = null
-  log('Offscreen document 已创建')
-}
-
-async function closeOffscreenDocument() {
+  offscreenCreating = creating
   try {
-    await chrome.offscreen.closeDocument()
-    log('Offscreen document 已关闭')
-  } catch {
-    // 可能已关闭
+    await creating
+    log('Offscreen document 已创建')
+    return expectedEpoch === connectionEpoch
+  } finally {
+    if (offscreenCreating === creating) offscreenCreating = null
   }
 }
 
-async function startBridgeConnection({ persist = false } = {}) {
+async function closeOffscreenDocument() {
+  if (offscreenClosing) {
+    await offscreenClosing
+    return
+  }
+
+  const closing = (async () => {
+    if (offscreenCreating) await offscreenCreating.catch(() => {})
+    try {
+      await chrome.offscreen.closeDocument()
+      log('Offscreen document 已关闭')
+    } catch {
+      // 可能已关闭
+    }
+  })()
+  offscreenClosing = closing
+  try {
+    await closing
+  } finally {
+    if (offscreenClosing === closing) offscreenClosing = null
+  }
+}
+
+async function startBridgeConnection({ persist = false, allowEnable = persist, userInitiated = false, expectedEpoch } = {}) {
+  const epoch = expectedEpoch ?? connectionEpoch
+  if (epoch !== connectionEpoch) return false
+  if (stopRequested && !userInitiated) return false
+  // 只有用户主动 Connect 或确认过 bridgeEnabled=true 的恢复流程可以从关闭状态启用。
+  // keepalive/唤醒探活只能恢复已有连接，不能撤销用户刚点击的 Stop。
+  if (!state.enabled && !allowEnable) return false
+
   state.enabled = true
   state.connected = false
   state.port = null
@@ -171,16 +219,41 @@ async function startBridgeConnection({ persist = false } = {}) {
     await chrome.storage.local.set({ bridgeEnabled: true, basePort: CONFIG.basePort })
   }
 
-  await setupOffscreenDocument()
+  if (epoch !== connectionEpoch || !state.enabled) {
+    // 旧启动流程可能在 Stop 的 storage.set(false) 之前/之后才完成。
+    // 仅在当前确实已关闭时回写 false；若已有更新的 Connect，则保留新连接的 true。
+    if (!state.enabled && persist) {
+      await chrome.storage.local.set({ bridgeEnabled: false }).catch(() => {})
+    }
+    return false
+  }
+
+  await setupOffscreenDocument(epoch)
+  if (epoch !== connectionEpoch || !state.enabled) return false
+
   await chrome.runtime.sendMessage({
     type: 'connect',
     basePort: CONFIG.basePort,
     token: CONFIG.token,
   }).catch(() => {})
+
+  if (epoch !== connectionEpoch || !state.enabled) return false
   broadcastStatus()
+  return true
 }
 
 async function stopBridgeConnection({ persist = false } = {}) {
+  const epoch = ++connectionEpoch
+  stopRequested = true
+  const superseded = async () => {
+    if (epoch === connectionEpoch) return false
+    // 若 Stop 期间用户又点击了 Connect，修正 Stop 早先发出的 false，
+    // 避免并发 storage.set 的完成顺序让下次启动错误地恢复为关闭状态。
+    if (state.enabled && persist) {
+      await chrome.storage.local.set({ bridgeEnabled: true, basePort: CONFIG.basePort }).catch(() => {})
+    }
+    return true
+  }
   state.enabled = false
   state.connected = false
   state.port = null
@@ -193,29 +266,40 @@ async function stopBridgeConnection({ persist = false } = {}) {
   setBadgeState('off')
 
   if (persist) {
-    await chrome.storage.local.set({ bridgeEnabled: false })
+    await chrome.storage.local.set({ bridgeEnabled: false }).catch((e) => {
+      log(`保存停止状态失败：${e.message}`)
+    })
   }
 
+  // 如果用户在 Stop 完成前又点击了 Connect，新一代连接拥有清理权；
+  // 旧 Stop 不应继续关闭新连接或清理新连接刚建立的调试会话。
+  if (await superseded()) return false
+
   await detachAllTargets().catch(() => {})
+  if (await superseded()) return false
   await chrome.runtime.sendMessage({ type: 'disconnect' }).catch(() => {})
+  if (await superseded()) return false
   await closeOffscreenDocument().catch(() => {})
   broadcastStatus()
+  return true
 }
 
 async function restoreBridgeConnection() {
+  const epoch = connectionEpoch
   try {
     const result = await chrome.storage.local.get(['basePort', 'bridgeEnabled'])
+    if (epoch !== connectionEpoch) return
     if (result.basePort) {
       CONFIG.basePort = result.basePort
     }
-    if (result.bridgeEnabled) {
-      await startBridgeConnection()
+    if (result.bridgeEnabled && !stopRequested) {
+      await startBridgeConnection({ allowEnable: true, expectedEpoch: epoch })
     } else {
       setBadgeState('off')
     }
   } catch (e) {
     log(`恢复连接状态失败：${e.message}`)
-    setBadgeState('off')
+    if (epoch === connectionEpoch) setBadgeState('off')
   }
 }
 
@@ -407,6 +491,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
     if (!state.enabled) return
     if (reason === "canceled_by_user") {
       log("调试被用户取消，已关闭")
+      connectionEpoch++
       state.enabled = false
       state.connected = false
       setBadgeState("off")
@@ -700,7 +785,7 @@ async function detachAllTargets() {
 
 // ========== 命令处理 ==========
 
-async function buildTargetInfo(clientId) {
+async function buildTargetInfo(clientId, { includeTargets = true } = {}) {
   const client = getClientSession(clientId)
   const viewingTab = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
     .then(([tab]) => tab || null)
@@ -710,14 +795,16 @@ async function buildTargetInfo(clientId) {
   let targetError = ''
   const targetTabId = client.targetMode === 'pinned' ? client.pinnedTabId : (viewingTab?.id ?? attachedTabId)
 
-  if (targetTabId !== null && targetTabId !== undefined) {
+  if (client.targetMode === 'focused' && viewingTab) {
+    // The focused tab already came from tabs.query(). Avoid a second
+    // tabs.get() round trip every time the popup asks for status.
+    targetTab = viewingTab
+  } else if (targetTabId !== null && targetTabId !== undefined) {
     try {
       targetTab = await chrome.tabs.get(targetTabId)
     } catch (e) {
       targetError = e.message
     }
-  } else if (client.targetMode === 'focused') {
-    targetTab = viewingTab
   }
 
   return {
@@ -729,7 +816,7 @@ async function buildTargetInfo(clientId) {
     attachedTabIds: [...sessionsByTabId.values()].filter((session) => session.attached).map((session) => session.tabId),
     targetTab: summarizeTab(targetTab),
     viewingTab: summarizeTab(viewingTab),
-    targets: await summarizeNamedTargets(),
+    targets: includeTargets ? await summarizeNamedTargets() : [],
     targetError,
   }
 }
@@ -1967,7 +2054,9 @@ function getConnectionStatus() {
 
 async function buildPopupState() {
   const status = getConnectionStatus()
-  const targetInfo = await buildTargetInfo()
+  // The popup does not render the named-target list. Skipping that scan keeps
+  // opening the panel independent of the number of bound targets.
+  const targetInfo = await buildTargetInfo(undefined, { includeTargets: false })
   const targetTab = targetInfo.targetTab
   const viewingTab = targetInfo.viewingTab
   return {
@@ -2066,6 +2155,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // 来自 offscreen 的状态更新
   if (message.type === 'status' && isFromOffscreen) {
+    // Stop 后，旧 offscreen 可能仍有排队中的 status 消息；这些消息不能把
+    // 已暂停的扩展重新标成 connected，也不能触发重新 attach。
+    if (!state.enabled) return
+
     if (message.status === 'connected') {
       state.connected = true
       state.port = message.port
@@ -2157,7 +2250,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       CONFIG.basePort = message.port
     }
 
-    startBridgeConnection({ persist: true })
+    stopRequested = false
+    const epoch = ++connectionEpoch
+    startBridgeConnection({ persist: true, userInitiated: true, expectedEpoch: epoch })
       .then(() => sendResponse({ ok: true }))
       .catch((e) => sendResponse({ ok: false, error: e.message }))
     return true
@@ -2181,11 +2276,13 @@ chrome.alarms.create('ghost-bridge-keepalive', { delayInMinutes: 1, periodInMinu
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== 'ghost-bridge-keepalive') return
   if (!state.enabled) return
+  const epoch = connectionEpoch
   try {
     const status = await chrome.runtime.sendMessage({ type: 'getOffscreenStatus' }).catch(() => null)
+    if (epoch !== connectionEpoch || !state.enabled) return
     if (!status || !status.connected) {
       log('定时兜底：连接未建立，重新触发连接流程')
-      await startBridgeConnection()
+      await startBridgeConnection({ expectedEpoch: epoch })
     }
   } catch (e) {
     log(`定时兜底重连失败：${e.message}`)
@@ -2198,17 +2295,23 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 chrome.idle.onStateChanged.addListener(async (idleState) => {
   if (idleState !== 'active') return
   if (!state.enabled) return
+  const epoch = connectionEpoch
   log('系统唤醒，触发连接探活...')
   try {
-    await setupOffscreenDocument()
+    await setupOffscreenDocument(epoch)
+    if (epoch !== connectionEpoch || !state.enabled) {
+      return
+    }
     const alive = await chrome.runtime.sendMessage({ type: 'healthCheck' }).catch(() => null)
+    if (epoch !== connectionEpoch || !state.enabled) return
     // alive === false 说明 offscreen 已自行触发重连，无需干预；
     // 仅当 offscreen 完全无响应（可能被回收）时才走完整连接流程兜底
     if (alive !== true && alive !== false) {
       const status = await chrome.runtime.sendMessage({ type: 'getOffscreenStatus' }).catch(() => null)
+      if (epoch !== connectionEpoch || !state.enabled) return
       if (!status || !status.connected) {
         log('唤醒探活无响应，重新建立连接...')
-        await startBridgeConnection()
+        await startBridgeConnection({ expectedEpoch: epoch })
       }
     }
   } catch (e) {
